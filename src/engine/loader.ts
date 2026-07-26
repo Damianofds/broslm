@@ -1,0 +1,743 @@
+export type AttentionKind = "global" | "local";
+
+export interface ModelConfig {
+  architecture: "gpt_neo";
+  vocabularySize: number;
+  hiddenSize: number;
+  intermediateSize: number;
+  numberOfLayers: number;
+  numberOfHeads: number;
+  headDimension: number;
+  maximumSequenceLength: number;
+  layerNormEpsilon: number;
+  activation: "gelu_new";
+  tiedWordEmbeddings: boolean;
+  attentionLayers: AttentionKind[];
+  attentionTypes?: unknown;
+  windowSize: number;
+  bosTokenId: number;
+  eosTokenId: number;
+  padTokenId: number | null;
+}
+
+export interface TensorDescriptor {
+  shape: number[];
+  byteOffset: number;
+  byteLength: number;
+}
+
+export interface WeightsIndex {
+  dtype: "float32";
+  byteOrder: "little-endian";
+  totalByteLength: number;
+  tensorCount: number;
+  tensors: Record<string, TensorDescriptor>;
+}
+
+export interface TensorView {
+  name: string;
+  shape: readonly number[];
+  byteOffset: number;
+  byteLength: number;
+  data: Float32Array;
+}
+
+export interface LayerNormWeights {
+  weight: TensorView;
+  bias: TensorView;
+}
+
+export interface AttentionWeights {
+  kind: AttentionKind;
+  kProjWeight: TensorView;
+  vProjWeight: TensorView;
+  qProjWeight: TensorView;
+  outProjWeight: TensorView;
+  outProjBias: TensorView;
+}
+
+export interface MlpWeights {
+  cFcWeight: TensorView;
+  cFcBias: TensorView;
+  cProjWeight: TensorView;
+  cProjBias: TensorView;
+}
+
+export interface TransformerLayerWeights {
+  index: number;
+  ln1: LayerNormWeights;
+  attention: AttentionWeights;
+  ln2: LayerNormWeights;
+  mlp: MlpWeights;
+}
+
+export interface BoundModelWeights {
+  tokenEmbedding: TensorView;
+  positionEmbedding: TensorView;
+  layers: TransformerLayerWeights[];
+  finalLayerNorm: LayerNormWeights;
+  lmHead: TensorView;
+}
+
+export interface RuntimeScratch {
+  sequenceLength: number;
+  hiddenState: Float32Array;
+  residual: Float32Array;
+  normed: Float32Array;
+  q: Float32Array;
+  k: Float32Array;
+  v: Float32Array;
+  attentionOutput: Float32Array;
+  attentionScores: Float32Array;
+  mlpIntermediate: Float32Array;
+  logits: Float32Array;
+}
+
+export interface LoadedModel {
+  config: ModelConfig;
+  weightsIndex: WeightsIndex;
+  weightsBuffer: ArrayBuffer;
+  tensors: ReadonlyMap<string, TensorView>;
+  weights: BoundModelWeights;
+  scratch: RuntimeScratch;
+}
+
+export interface LoadModelOptions {
+  baseUrl: string;
+  configPath?: string;
+  weightsIndexPath?: string;
+  weightsBinaryPath?: string;
+  scratchSequenceLength?: number;
+  fetchImpl?: typeof fetch;
+  onProgress?: (progress: LoaderProgress) => void;
+}
+
+export type LoaderWorkerRequest =
+  | {
+      type: "load-model";
+      requestId?: string;
+      baseUrl: string;
+      configPath?: string;
+      weightsIndexPath?: string;
+      weightsBinaryPath?: string;
+      scratchSequenceLength?: number;
+    };
+
+export type LoaderWorkerResponse =
+  | {
+      type: "model-progress";
+      requestId?: string;
+      progress: LoaderProgress;
+    }
+  | {
+      type: "model-ready";
+      requestId?: string;
+      summary: LoadedModelSummary;
+    }
+  | {
+      type: "model-error";
+      requestId?: string;
+      error: string;
+    };
+
+export interface LoadedModelSummary {
+  architecture: string;
+  dtype: string;
+  tensorCount: number;
+  totalByteLength: number;
+  layers: number;
+  hiddenSize: number;
+  vocabularySize: number;
+  maximumSequenceLength: number;
+  scratchSequenceLength: number;
+}
+
+export interface LoaderProgress {
+  stage:
+    | "descriptors-download-started"
+    | "descriptors-downloaded"
+    | "descriptors-validated"
+    | "weights-download-started"
+    | "weights-download-progress"
+    | "weights-downloaded"
+    | "weights-validated"
+    | "tensor-views-created"
+    | "weights-bound"
+    | "scratch-allocated"
+    | "ready";
+  message: string;
+  loadedBytes?: number;
+  totalBytes?: number;
+}
+
+interface LoaderWorkerScope {
+  addEventListener(
+    type: "message",
+    listener: (event: MessageEvent<LoaderWorkerRequest>) => void,
+  ): void;
+  postMessage(message: LoaderWorkerResponse): void;
+}
+
+const FLOAT32_BYTES = 4;
+
+let workerLoadedModel: LoadedModel | null = null;
+
+export async function loadModel(options: LoadModelOptions): Promise<LoadedModel> {
+  const fetcher = options.fetchImpl ?? fetch;
+  const report = options.onProgress ?? (() => undefined);
+  const configUrl = resolveModelUrl(options.baseUrl, options.configPath ?? "config.json");
+  const weightsIndexUrl = resolveModelUrl(
+    options.baseUrl,
+    options.weightsIndexPath ?? "weights.json",
+  );
+
+  report({
+    stage: "descriptors-download-started",
+    message: "Downloading config.json and weights.json",
+  });
+  const [config, weightsIndex] = await Promise.all([
+    fetchJson<ModelConfig>(fetcher, configUrl),
+    fetchJson<WeightsIndex>(fetcher, weightsIndexUrl),
+  ]);
+
+  report({
+    stage: "descriptors-downloaded",
+    message: "Downloaded model descriptors",
+  });
+  validateConfig(config);
+  validateWeightsIndex(config, weightsIndex);
+  report({
+    stage: "descriptors-validated",
+    message: `Validated ${weightsIndex.tensorCount} tensor descriptors`,
+    totalBytes: weightsIndex.totalByteLength,
+  });
+
+  const weightsBinaryUrl = resolveModelUrl(
+    options.baseUrl,
+    options.weightsBinaryPath ?? "weights.bin",
+  );
+  report({
+    stage: "weights-download-started",
+    message: "Downloading weights.bin",
+    totalBytes: weightsIndex.totalByteLength,
+  });
+  const weightsBuffer = await fetchArrayBuffer(fetcher, weightsBinaryUrl, (loadedBytes, totalBytes) => {
+    report({
+      stage: "weights-download-progress",
+      message: "Downloading weights.bin",
+      loadedBytes,
+      totalBytes: totalBytes ?? weightsIndex.totalByteLength,
+    });
+  });
+
+  report({
+    stage: "weights-downloaded",
+    message: "Downloaded weights.bin",
+    loadedBytes: weightsBuffer.byteLength,
+    totalBytes: weightsIndex.totalByteLength,
+  });
+  validateWeightsBuffer(weightsBuffer, weightsIndex);
+  report({
+    stage: "weights-validated",
+    message: "Validated weights.bin length and tensor boundaries",
+    loadedBytes: weightsBuffer.byteLength,
+    totalBytes: weightsIndex.totalByteLength,
+  });
+  const tensors = createTensorViews(weightsBuffer, weightsIndex);
+  report({
+    stage: "tensor-views-created",
+    message: "Created zero-copy Float32Array tensor views",
+  });
+  const weights = bindModelWeights(config, tensors);
+  report({
+    stage: "weights-bound",
+    message: "Bound raw tensor names into typed GPT-Neo layers",
+  });
+  const scratch = allocateRuntimeScratch(
+    config,
+    options.scratchSequenceLength ?? Math.min(config.maximumSequenceLength, 256),
+  );
+  report({
+    stage: "scratch-allocated",
+    message: "Allocated runtime scratch buffers",
+  });
+
+  const loadedModel = {
+    config,
+    weightsIndex,
+    weightsBuffer,
+    tensors,
+    weights,
+    scratch,
+  };
+
+  report({
+    stage: "ready",
+    message: "Model is ready inside the inference worker",
+  });
+
+  return loadedModel;
+}
+
+export function installLoaderWorker(
+  selfScope: LoaderWorkerScope = globalThis as unknown as LoaderWorkerScope,
+): void {
+  selfScope.addEventListener("message", (event: MessageEvent<LoaderWorkerRequest>) => {
+    const message = event.data;
+    if (!message || message.type !== "load-model") {
+      return;
+    }
+
+    void loadModel({
+      ...message,
+      onProgress: (progress) => {
+        selfScope.postMessage({
+          type: "model-progress",
+          requestId: message.requestId,
+          progress,
+        });
+      },
+    })
+      .then((loadedModel) => {
+        workerLoadedModel = loadedModel;
+        selfScope.postMessage({
+          type: "model-ready",
+          requestId: message.requestId,
+          summary: summarizeLoadedModel(loadedModel),
+        } satisfies LoaderWorkerResponse);
+      })
+      .catch((error: unknown) => {
+        selfScope.postMessage({
+          type: "model-error",
+          requestId: message.requestId,
+          error: error instanceof Error ? error.message : String(error),
+        } satisfies LoaderWorkerResponse);
+      });
+  });
+}
+
+export function getWorkerLoadedModel(): LoadedModel | null {
+  return workerLoadedModel;
+}
+
+export function summarizeLoadedModel(model: LoadedModel): LoadedModelSummary {
+  return {
+    architecture: model.config.architecture,
+    dtype: model.weightsIndex.dtype,
+    tensorCount: model.weightsIndex.tensorCount,
+    totalByteLength: model.weightsIndex.totalByteLength,
+    layers: model.config.numberOfLayers,
+    hiddenSize: model.config.hiddenSize,
+    vocabularySize: model.config.vocabularySize,
+    maximumSequenceLength: model.config.maximumSequenceLength,
+    scratchSequenceLength: model.scratch.sequenceLength,
+  };
+}
+
+export function allocateRuntimeScratch(
+  config: ModelConfig,
+  sequenceLength: number,
+): RuntimeScratch {
+  if (!Number.isInteger(sequenceLength) || sequenceLength < 1) {
+    throw new Error(`scratchSequenceLength must be a positive integer, got ${sequenceLength}`);
+  }
+  if (sequenceLength > config.maximumSequenceLength) {
+    throw new Error(
+      `scratchSequenceLength ${sequenceLength} exceeds maximumSequenceLength ${config.maximumSequenceLength}`,
+    );
+  }
+
+  const hiddenElements = sequenceLength * config.hiddenSize;
+  const qkvElements = sequenceLength * config.numberOfHeads * config.headDimension;
+  const scoreElements = config.numberOfHeads * sequenceLength * sequenceLength;
+
+  return {
+    sequenceLength,
+    hiddenState: new Float32Array(hiddenElements),
+    residual: new Float32Array(hiddenElements),
+    normed: new Float32Array(hiddenElements),
+    q: new Float32Array(qkvElements),
+    k: new Float32Array(qkvElements),
+    v: new Float32Array(qkvElements),
+    attentionOutput: new Float32Array(hiddenElements),
+    attentionScores: new Float32Array(scoreElements),
+    mlpIntermediate: new Float32Array(sequenceLength * config.intermediateSize),
+    logits: new Float32Array(sequenceLength * config.vocabularySize),
+  };
+}
+
+export function ensureScratchCapacity(model: LoadedModel, sequenceLength: number): RuntimeScratch {
+  if (sequenceLength <= model.scratch.sequenceLength) {
+    return model.scratch;
+  }
+
+  model.scratch = allocateRuntimeScratch(model.config, sequenceLength);
+  return model.scratch;
+}
+
+export function validateConfig(config: ModelConfig): void {
+  assertObject(config, "config");
+  assertEqual(config.architecture, "gpt_neo", "config.architecture");
+  assertEqual(config.activation, "gelu_new", "config.activation");
+  assertPositiveInteger(config.vocabularySize, "config.vocabularySize");
+  assertPositiveInteger(config.hiddenSize, "config.hiddenSize");
+  assertPositiveInteger(config.intermediateSize, "config.intermediateSize");
+  assertPositiveInteger(config.numberOfLayers, "config.numberOfLayers");
+  assertPositiveInteger(config.numberOfHeads, "config.numberOfHeads");
+  assertPositiveInteger(config.headDimension, "config.headDimension");
+  assertPositiveInteger(config.maximumSequenceLength, "config.maximumSequenceLength");
+  assertPositiveNumber(config.layerNormEpsilon, "config.layerNormEpsilon");
+  assertPositiveInteger(config.windowSize, "config.windowSize");
+  assertNonNegativeInteger(config.bosTokenId, "config.bosTokenId");
+  assertNonNegativeInteger(config.eosTokenId, "config.eosTokenId");
+
+  if (config.padTokenId !== null) {
+    assertNonNegativeInteger(config.padTokenId, "config.padTokenId");
+  }
+  if (config.hiddenSize !== config.numberOfHeads * config.headDimension) {
+    throw new Error(
+      `hiddenSize ${config.hiddenSize} must equal numberOfHeads * headDimension ` +
+        `${config.numberOfHeads * config.headDimension}`,
+    );
+  }
+  if (!Array.isArray(config.attentionLayers)) {
+    throw new Error("config.attentionLayers must be an array");
+  }
+  if (config.attentionLayers.length !== config.numberOfLayers) {
+    throw new Error(
+      `attentionLayers has ${config.attentionLayers.length} entries, expected ${config.numberOfLayers}`,
+    );
+  }
+  for (let i = 0; i < config.attentionLayers.length; i += 1) {
+    const attentionKind = config.attentionLayers[i];
+    if (attentionKind !== "global" && attentionKind !== "local") {
+      throw new Error(`attentionLayers[${i}] must be "global" or "local", got ${attentionKind}`);
+    }
+  }
+}
+
+export function validateWeightsIndex(config: ModelConfig, weightsIndex: WeightsIndex): void {
+  assertObject(weightsIndex, "weightsIndex");
+  assertEqual(weightsIndex.dtype, "float32", "weightsIndex.dtype");
+  assertEqual(weightsIndex.byteOrder, "little-endian", "weightsIndex.byteOrder");
+  assertPositiveInteger(weightsIndex.totalByteLength, "weightsIndex.totalByteLength");
+  assertPositiveInteger(weightsIndex.tensorCount, "weightsIndex.tensorCount");
+  assertObject(weightsIndex.tensors, "weightsIndex.tensors");
+
+  const tensorNames = Object.keys(weightsIndex.tensors);
+  if (tensorNames.length !== weightsIndex.tensorCount) {
+    throw new Error(
+      `tensorCount is ${weightsIndex.tensorCount}, but tensors contains ${tensorNames.length} entries`,
+    );
+  }
+
+  const expectedShapes = getExpectedTensorShapes(config);
+  const expectedNames = new Set(expectedShapes.keys());
+  const actualNames = new Set(tensorNames);
+  const missing = [...expectedNames].filter((name) => !actualNames.has(name));
+  const extra = [...actualNames].filter((name) => !expectedNames.has(name));
+
+  if (missing.length > 0) {
+    throw new Error(`weights.json is missing expected tensors: ${missing.join(", ")}`);
+  }
+  if (extra.length > 0) {
+    throw new Error(`weights.json contains unexpected tensors: ${extra.join(", ")}`);
+  }
+
+  const spans: Array<{ name: string; start: number; end: number }> = [];
+  for (const name of tensorNames) {
+    const descriptor = weightsIndex.tensors[name];
+    validateTensorDescriptor(name, descriptor);
+
+    const expectedShape = expectedShapes.get(name);
+    if (!expectedShape) {
+      throw new Error(`No expected shape registered for tensor ${name}`);
+    }
+    assertShape(name, descriptor.shape, expectedShape);
+
+    const elementCount = product(descriptor.shape);
+    const expectedByteLength = elementCount * FLOAT32_BYTES;
+    if (descriptor.byteLength !== expectedByteLength) {
+      throw new Error(
+        `${name} byteLength is ${descriptor.byteLength}, expected ${expectedByteLength}`,
+      );
+    }
+
+    spans.push({
+      name,
+      start: descriptor.byteOffset,
+      end: descriptor.byteOffset + descriptor.byteLength,
+    });
+  }
+
+  validateTensorSpans(spans, weightsIndex.totalByteLength);
+}
+
+export function validateWeightsBuffer(buffer: ArrayBuffer, weightsIndex: WeightsIndex): void {
+  if (buffer.byteLength !== weightsIndex.totalByteLength) {
+    throw new Error(
+      `weights.bin is ${buffer.byteLength} bytes, weights.json says ${weightsIndex.totalByteLength}`,
+    );
+  }
+}
+
+export function createTensorViews(
+  weightsBuffer: ArrayBuffer,
+  weightsIndex: WeightsIndex,
+): ReadonlyMap<string, TensorView> {
+  const tensors = new Map<string, TensorView>();
+
+  for (const [name, descriptor] of Object.entries(weightsIndex.tensors)) {
+    tensors.set(name, {
+      name,
+      shape: Object.freeze([...descriptor.shape]),
+      byteOffset: descriptor.byteOffset,
+      byteLength: descriptor.byteLength,
+      data: new Float32Array(
+        weightsBuffer,
+        descriptor.byteOffset,
+        descriptor.byteLength / FLOAT32_BYTES,
+      ),
+    });
+  }
+
+  return tensors;
+}
+
+export function bindModelWeights(
+  config: ModelConfig,
+  tensors: ReadonlyMap<string, TensorView>,
+): BoundModelWeights {
+  const layers: TransformerLayerWeights[] = [];
+
+  for (let layer = 0; layer < config.numberOfLayers; layer += 1) {
+    const prefix = `transformer.h.${layer}`;
+    layers.push({
+      index: layer,
+      ln1: {
+        weight: requireTensor(tensors, `${prefix}.ln_1.weight`),
+        bias: requireTensor(tensors, `${prefix}.ln_1.bias`),
+      },
+      attention: {
+        kind: config.attentionLayers[layer],
+        kProjWeight: requireTensor(tensors, `${prefix}.attn.attention.k_proj.weight`),
+        vProjWeight: requireTensor(tensors, `${prefix}.attn.attention.v_proj.weight`),
+        qProjWeight: requireTensor(tensors, `${prefix}.attn.attention.q_proj.weight`),
+        outProjWeight: requireTensor(tensors, `${prefix}.attn.attention.out_proj.weight`),
+        outProjBias: requireTensor(tensors, `${prefix}.attn.attention.out_proj.bias`),
+      },
+      ln2: {
+        weight: requireTensor(tensors, `${prefix}.ln_2.weight`),
+        bias: requireTensor(tensors, `${prefix}.ln_2.bias`),
+      },
+      mlp: {
+        cFcWeight: requireTensor(tensors, `${prefix}.mlp.c_fc.weight`),
+        cFcBias: requireTensor(tensors, `${prefix}.mlp.c_fc.bias`),
+        cProjWeight: requireTensor(tensors, `${prefix}.mlp.c_proj.weight`),
+        cProjBias: requireTensor(tensors, `${prefix}.mlp.c_proj.bias`),
+      },
+    });
+  }
+
+  return {
+    tokenEmbedding: requireTensor(tensors, "transformer.wte.weight"),
+    positionEmbedding: requireTensor(tensors, "transformer.wpe.weight"),
+    layers,
+    finalLayerNorm: {
+      weight: requireTensor(tensors, "transformer.ln_f.weight"),
+      bias: requireTensor(tensors, "transformer.ln_f.bias"),
+    },
+    lmHead: requireTensor(tensors, "lm_head.weight"),
+  };
+}
+
+export function getExpectedTensorShapes(config: ModelConfig): Map<string, number[]> {
+  const shapes = new Map<string, number[]>();
+  const hidden = config.hiddenSize;
+  const intermediate = config.intermediateSize;
+
+  shapes.set("transformer.wte.weight", [config.vocabularySize, hidden]);
+  shapes.set("transformer.wpe.weight", [config.maximumSequenceLength, hidden]);
+
+  for (let layer = 0; layer < config.numberOfLayers; layer += 1) {
+    const prefix = `transformer.h.${layer}`;
+    shapes.set(`${prefix}.ln_1.weight`, [hidden]);
+    shapes.set(`${prefix}.ln_1.bias`, [hidden]);
+    shapes.set(`${prefix}.attn.attention.k_proj.weight`, [hidden, hidden]);
+    shapes.set(`${prefix}.attn.attention.v_proj.weight`, [hidden, hidden]);
+    shapes.set(`${prefix}.attn.attention.q_proj.weight`, [hidden, hidden]);
+    shapes.set(`${prefix}.attn.attention.out_proj.weight`, [hidden, hidden]);
+    shapes.set(`${prefix}.attn.attention.out_proj.bias`, [hidden]);
+    shapes.set(`${prefix}.ln_2.weight`, [hidden]);
+    shapes.set(`${prefix}.ln_2.bias`, [hidden]);
+    shapes.set(`${prefix}.mlp.c_fc.weight`, [intermediate, hidden]);
+    shapes.set(`${prefix}.mlp.c_fc.bias`, [intermediate]);
+    shapes.set(`${prefix}.mlp.c_proj.weight`, [hidden, intermediate]);
+    shapes.set(`${prefix}.mlp.c_proj.bias`, [hidden]);
+  }
+
+  shapes.set("transformer.ln_f.weight", [hidden]);
+  shapes.set("transformer.ln_f.bias", [hidden]);
+  shapes.set("lm_head.weight", [config.vocabularySize, hidden]);
+  return shapes;
+}
+
+async function fetchJson<T>(fetcher: typeof fetch, url: string): Promise<T> {
+  const response = await fetcher(url);
+  if (!response.ok) {
+    throw new Error(`Failed to download ${url}: HTTP ${response.status}`);
+  }
+  return (await response.json()) as T;
+}
+
+async function fetchArrayBuffer(
+  fetcher: typeof fetch,
+  url: string,
+  onProgress?: (loadedBytes: number, totalBytes?: number) => void,
+): Promise<ArrayBuffer> {
+  const response = await fetcher(url);
+  if (!response.ok) {
+    throw new Error(`Failed to download ${url}: HTTP ${response.status}`);
+  }
+  if (!response.body) {
+    const buffer = await response.arrayBuffer();
+    onProgress?.(buffer.byteLength, getContentLength(response));
+    return buffer;
+  }
+
+  const totalBytes = getContentLength(response);
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let loadedBytes = 0;
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    chunks.push(value);
+    loadedBytes += value.byteLength;
+    onProgress?.(loadedBytes, totalBytes);
+  }
+
+  const bytes = new Uint8Array(loadedBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  onProgress?.(loadedBytes, totalBytes);
+  return bytes.buffer;
+}
+
+function getContentLength(response: Response): number | undefined {
+  const header = response.headers.get("content-length");
+  if (!header) {
+    return undefined;
+  }
+  const parsed = Number(header);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+function resolveModelUrl(baseUrl: string, path: string): string {
+  const normalizedBase = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+  const absoluteBase = new URL(normalizedBase, globalThis.location?.href).toString();
+  return new URL(path, absoluteBase).toString();
+}
+
+function validateTensorDescriptor(name: string, descriptor: TensorDescriptor): void {
+  assertObject(descriptor, name);
+  if (!Array.isArray(descriptor.shape)) {
+    throw new Error(`${name}.shape must be an array`);
+  }
+  for (let index = 0; index < descriptor.shape.length; index += 1) {
+    assertPositiveInteger(descriptor.shape[index], `${name}.shape[${index}]`);
+  }
+  assertNonNegativeInteger(descriptor.byteOffset, `${name}.byteOffset`);
+  assertNonNegativeInteger(descriptor.byteLength, `${name}.byteLength`);
+  if (descriptor.byteOffset % FLOAT32_BYTES !== 0) {
+    throw new Error(`${name}.byteOffset must be ${FLOAT32_BYTES}-byte aligned`);
+  }
+  if (descriptor.byteLength % FLOAT32_BYTES !== 0) {
+    throw new Error(`${name}.byteLength must be a multiple of ${FLOAT32_BYTES}`);
+  }
+}
+
+function validateTensorSpans(
+  spans: Array<{ name: string; start: number; end: number }>,
+  totalByteLength: number,
+): void {
+  spans.sort((left, right) => left.start - right.start);
+
+  let cursor = 0;
+  for (const span of spans) {
+    if (span.start !== cursor) {
+      throw new Error(
+        `${span.name} starts at byte ${span.start}, expected contiguous offset ${cursor}`,
+      );
+    }
+    if (span.end > totalByteLength) {
+      throw new Error(`${span.name} ends at byte ${span.end}, past total ${totalByteLength}`);
+    }
+    cursor = span.end;
+  }
+
+  if (cursor !== totalByteLength) {
+    throw new Error(`Tensor data ends at byte ${cursor}, expected total ${totalByteLength}`);
+  }
+}
+
+function requireTensor(tensors: ReadonlyMap<string, TensorView>, name: string): TensorView {
+  const tensor = tensors.get(name);
+  if (!tensor) {
+    throw new Error(`Missing tensor ${name}`);
+  }
+  return tensor;
+}
+
+function assertShape(name: string, actual: readonly number[], expected: readonly number[]): void {
+  if (actual.length !== expected.length) {
+    throw new Error(`${name} rank is ${actual.length}, expected ${expected.length}`);
+  }
+  for (let i = 0; i < expected.length; i += 1) {
+    if (actual[i] !== expected[i]) {
+      throw new Error(`${name} shape is [${actual.join(", ")}], expected [${expected.join(", ")}]`);
+    }
+  }
+}
+
+function product(values: readonly number[]): number {
+  return values.reduce((result, value) => result * value, 1);
+}
+
+function assertObject(value: unknown, name: string): asserts value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`${name} must be an object`);
+  }
+}
+
+function assertEqual<T>(actual: T, expected: T, name: string): void {
+  if (actual !== expected) {
+    throw new Error(`${name} must be ${String(expected)}, got ${String(actual)}`);
+  }
+}
+
+function assertPositiveInteger(value: unknown, name: string): asserts value is number {
+  if (!Number.isInteger(value) || (value as number) <= 0) {
+    throw new Error(`${name} must be a positive integer, got ${String(value)}`);
+  }
+}
+
+function assertNonNegativeInteger(value: unknown, name: string): asserts value is number {
+  if (!Number.isInteger(value) || (value as number) < 0) {
+    throw new Error(`${name} must be a non-negative integer, got ${String(value)}`);
+  }
+}
+
+function assertPositiveNumber(value: unknown, name: string): asserts value is number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw new Error(`${name} must be a positive number, got ${String(value)}`);
+  }
+}

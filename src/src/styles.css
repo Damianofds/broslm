@@ -1,0 +1,273 @@
+:root {
+  color: #161616;
+  background: #f4f2ec;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+}
+
+button {
+  font: inherit;
+}
+
+.page-shell {
+  min-height: 100vh;
+  background:
+    linear-gradient(135deg, rgba(244, 242, 236, 0.94), rgba(244, 242, 236, 0.72)),
+    radial-gradient(circle at 18% 24%, rgba(36, 70, 135, 0.18), transparent 30%),
+    radial-gradient(circle at 82% 8%, rgba(197, 76, 54, 0.2), transparent 28%),
+    #f4f2ec;
+}
+
+.intro-band {
+  min-height: 68vh;
+  display: grid;
+  align-items: center;
+  padding: 56px clamp(20px, 6vw, 80px) 36px;
+  border-bottom: 1px solid rgba(22, 22, 22, 0.12);
+}
+
+.intro-copy {
+  width: min(980px, 100%);
+}
+
+.eyebrow,
+.section-label {
+  margin: 0 0 14px;
+  color: #9b3527;
+  font-size: 0.82rem;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+h1 {
+  margin: 0;
+  color: #111;
+  font-size: clamp(5rem, 17vw, 13rem);
+  line-height: 0.82;
+  letter-spacing: 0;
+}
+
+.subtitle {
+  margin: 20px 0 0;
+  color: #244687;
+  font-size: clamp(1.6rem, 4vw, 3.6rem);
+  font-weight: 800;
+  line-height: 1;
+}
+
+.description {
+  width: min(720px, 100%);
+  margin: 28px 0 0;
+  color: #3c3a35;
+  font-size: clamp(1rem, 1.7vw, 1.25rem);
+  line-height: 1.55;
+}
+
+.load-button {
+  margin-top: 36px;
+  min-height: 72px;
+  padding: 0 42px;
+  border: 0;
+  border-radius: 8px;
+  color: #fff;
+  background: #111;
+  font-size: clamp(1.15rem, 2vw, 1.55rem);
+  font-weight: 850;
+  cursor: pointer;
+  box-shadow: 0 18px 42px rgba(17, 17, 17, 0.22);
+  transition:
+    transform 160ms ease,
+    background 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.load-button:hover:not(:disabled) {
+  transform: translateY(-2px);
+  background: #244687;
+  box-shadow: 0 22px 48px rgba(36, 70, 135, 0.28);
+}
+
+.load-button:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
+.status-band {
+  padding: 34px clamp(20px, 6vw, 80px) 58px;
+  background: #fffdf8;
+}
+
+.status-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+h2 {
+  margin: 0;
+  font-size: clamp(1.55rem, 3vw, 2.6rem);
+  line-height: 1.1;
+  letter-spacing: 0;
+}
+
+.download-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 36px;
+  padding: 0 14px;
+  border: 1px solid rgba(36, 70, 135, 0.22);
+  border-radius: 999px;
+  color: #244687;
+  background: #eef3ff;
+  font-size: 0.9rem;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.progress-track {
+  height: 12px;
+  margin-top: 26px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e7e1d4;
+}
+
+.progress-fill {
+  height: 100%;
+  width: 0;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #244687, #c54c36);
+  transition: width 180ms ease;
+}
+
+.current-message,
+.error-message {
+  margin: 18px 0 0;
+  color: #3c3a35;
+  font-weight: 700;
+}
+
+.error-message {
+  color: #a4241a;
+}
+
+.step-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+  margin: 28px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.step-list li {
+  display: grid;
+  grid-template-columns: 16px 1fr;
+  gap: 12px;
+  align-items: start;
+  min-height: 54px;
+  padding: 15px;
+  border: 1px solid rgba(22, 22, 22, 0.12);
+  border-radius: 8px;
+  color: #666158;
+  background: #fbf8f0;
+  font-size: 0.95rem;
+  line-height: 1.35;
+}
+
+.step-list li.done {
+  border-color: rgba(36, 70, 135, 0.28);
+  color: #151515;
+  background: #f0f4ff;
+}
+
+.step-list li.active {
+  border-color: rgba(197, 76, 54, 0.4);
+  color: #151515;
+  background: #fff0ec;
+}
+
+.step-marker {
+  width: 12px;
+  height: 12px;
+  margin-top: 3px;
+  border: 2px solid currentColor;
+  border-radius: 50%;
+}
+
+.step-list li.done .step-marker {
+  border-color: #244687;
+  background: #244687;
+}
+
+.step-list li.active .step-marker {
+  border-color: #c54c36;
+  background: #c54c36;
+}
+
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin-top: 28px;
+}
+
+.summary-item {
+  min-height: 82px;
+  padding: 16px;
+  border: 1px solid rgba(22, 22, 22, 0.12);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.summary-item span,
+.summary-item strong {
+  display: block;
+}
+
+.summary-item span {
+  color: #666158;
+  font-size: 0.82rem;
+  font-weight: 750;
+}
+
+.summary-item strong {
+  margin-top: 8px;
+  color: #111;
+  font-size: 1.1rem;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 700px) {
+  .intro-band {
+    min-height: 62vh;
+    padding-top: 42px;
+  }
+
+  .load-button {
+    width: 100%;
+  }
+
+  .status-header {
+    display: block;
+  }
+
+  .download-pill {
+    margin-top: 18px;
+  }
+}

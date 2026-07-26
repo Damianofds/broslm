@@ -1,0 +1,822 @@
+{
+  "dtype": "float32",
+  "byteOrder": "little-endian",
+  "totalByteLength": 58845184,
+  "tensorCount": 109,
+  "tensors": {
+    "transformer.wte.weight": {
+      "shape": [
+        50257,
+        128
+      ],
+      "byteOffset": 0,
+      "byteLength": 25731584
+    },
+    "transformer.wpe.weight": {
+      "shape": [
+        2048,
+        128
+      ],
+      "byteOffset": 25731584,
+      "byteLength": 1048576
+    },
+    "transformer.h.0.ln_1.weight": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 26780160,
+      "byteLength": 512
+    },
+    "transformer.h.0.ln_1.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 26780672,
+      "byteLength": 512
+    },
+    "transformer.h.0.attn.attention.k_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 26781184,
+      "byteLength": 65536
+    },
+    "transformer.h.0.attn.attention.v_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 26846720,
+      "byteLength": 65536
+    },
+    "transformer.h.0.attn.attention.q_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 26912256,
+      "byteLength": 65536
+    },
+    "transformer.h.0.attn.attention.out_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 26977792,
+      "byteLength": 65536
+    },
+    "transformer.h.0.attn.attention.out_proj.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 27043328,
+      "byteLength": 512
+    },
+    "transformer.h.0.ln_2.weight": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 27043840,
+      "byteLength": 512
+    },
+    "transformer.h.0.ln_2.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 27044352,
+      "byteLength": 512
+    },
+    "transformer.h.0.mlp.c_fc.weight": {
+      "shape": [
+        512,
+        128
+      ],
+      "byteOffset": 27044864,
+      "byteLength": 262144
+    },
+    "transformer.h.0.mlp.c_fc.bias": {
+      "shape": [
+        512
+      ],
+      "byteOffset": 27307008,
+      "byteLength": 2048
+    },
+    "transformer.h.0.mlp.c_proj.weight": {
+      "shape": [
+        128,
+        512
+      ],
+      "byteOffset": 27309056,
+      "byteLength": 262144
+    },
+    "transformer.h.0.mlp.c_proj.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 27571200,
+      "byteLength": 512
+    },
+    "transformer.h.1.ln_1.weight": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 27571712,
+      "byteLength": 512
+    },
+    "transformer.h.1.ln_1.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 27572224,
+      "byteLength": 512
+    },
+    "transformer.h.1.attn.attention.k_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 27572736,
+      "byteLength": 65536
+    },
+    "transformer.h.1.attn.attention.v_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 27638272,
+      "byteLength": 65536
+    },
+    "transformer.h.1.attn.attention.q_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 27703808,
+      "byteLength": 65536
+    },
+    "transformer.h.1.attn.attention.out_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 27769344,
+      "byteLength": 65536
+    },
+    "transformer.h.1.attn.attention.out_proj.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 27834880,
+      "byteLength": 512
+    },
+    "transformer.h.1.ln_2.weight": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 27835392,
+      "byteLength": 512
+    },
+    "transformer.h.1.ln_2.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 27835904,
+      "byteLength": 512
+    },
+    "transformer.h.1.mlp.c_fc.weight": {
+      "shape": [
+        512,
+        128
+      ],
+      "byteOffset": 27836416,
+      "byteLength": 262144
+    },
+    "transformer.h.1.mlp.c_fc.bias": {
+      "shape": [
+        512
+      ],
+      "byteOffset": 28098560,
+      "byteLength": 2048
+    },
+    "transformer.h.1.mlp.c_proj.weight": {
+      "shape": [
+        128,
+        512
+      ],
+      "byteOffset": 28100608,
+      "byteLength": 262144
+    },
+    "transformer.h.1.mlp.c_proj.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 28362752,
+      "byteLength": 512
+    },
+    "transformer.h.2.ln_1.weight": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 28363264,
+      "byteLength": 512
+    },
+    "transformer.h.2.ln_1.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 28363776,
+      "byteLength": 512
+    },
+    "transformer.h.2.attn.attention.k_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 28364288,
+      "byteLength": 65536
+    },
+    "transformer.h.2.attn.attention.v_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 28429824,
+      "byteLength": 65536
+    },
+    "transformer.h.2.attn.attention.q_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 28495360,
+      "byteLength": 65536
+    },
+    "transformer.h.2.attn.attention.out_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 28560896,
+      "byteLength": 65536
+    },
+    "transformer.h.2.attn.attention.out_proj.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 28626432,
+      "byteLength": 512
+    },
+    "transformer.h.2.ln_2.weight": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 28626944,
+      "byteLength": 512
+    },
+    "transformer.h.2.ln_2.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 28627456,
+      "byteLength": 512
+    },
+    "transformer.h.2.mlp.c_fc.weight": {
+      "shape": [
+        512,
+        128
+      ],
+      "byteOffset": 28627968,
+      "byteLength": 262144
+    },
+    "transformer.h.2.mlp.c_fc.bias": {
+      "shape": [
+        512
+      ],
+      "byteOffset": 28890112,
+      "byteLength": 2048
+    },
+    "transformer.h.2.mlp.c_proj.weight": {
+      "shape": [
+        128,
+        512
+      ],
+      "byteOffset": 28892160,
+      "byteLength": 262144
+    },
+    "transformer.h.2.mlp.c_proj.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 29154304,
+      "byteLength": 512
+    },
+    "transformer.h.3.ln_1.weight": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 29154816,
+      "byteLength": 512
+    },
+    "transformer.h.3.ln_1.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 29155328,
+      "byteLength": 512
+    },
+    "transformer.h.3.attn.attention.k_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 29155840,
+      "byteLength": 65536
+    },
+    "transformer.h.3.attn.attention.v_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 29221376,
+      "byteLength": 65536
+    },
+    "transformer.h.3.attn.attention.q_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 29286912,
+      "byteLength": 65536
+    },
+    "transformer.h.3.attn.attention.out_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 29352448,
+      "byteLength": 65536
+    },
+    "transformer.h.3.attn.attention.out_proj.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 29417984,
+      "byteLength": 512
+    },
+    "transformer.h.3.ln_2.weight": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 29418496,
+      "byteLength": 512
+    },
+    "transformer.h.3.ln_2.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 29419008,
+      "byteLength": 512
+    },
+    "transformer.h.3.mlp.c_fc.weight": {
+      "shape": [
+        512,
+        128
+      ],
+      "byteOffset": 29419520,
+      "byteLength": 262144
+    },
+    "transformer.h.3.mlp.c_fc.bias": {
+      "shape": [
+        512
+      ],
+      "byteOffset": 29681664,
+      "byteLength": 2048
+    },
+    "transformer.h.3.mlp.c_proj.weight": {
+      "shape": [
+        128,
+        512
+      ],
+      "byteOffset": 29683712,
+      "byteLength": 262144
+    },
+    "transformer.h.3.mlp.c_proj.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 29945856,
+      "byteLength": 512
+    },
+    "transformer.h.4.ln_1.weight": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 29946368,
+      "byteLength": 512
+    },
+    "transformer.h.4.ln_1.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 29946880,
+      "byteLength": 512
+    },
+    "transformer.h.4.attn.attention.k_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 29947392,
+      "byteLength": 65536
+    },
+    "transformer.h.4.attn.attention.v_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 30012928,
+      "byteLength": 65536
+    },
+    "transformer.h.4.attn.attention.q_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 30078464,
+      "byteLength": 65536
+    },
+    "transformer.h.4.attn.attention.out_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 30144000,
+      "byteLength": 65536
+    },
+    "transformer.h.4.attn.attention.out_proj.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 30209536,
+      "byteLength": 512
+    },
+    "transformer.h.4.ln_2.weight": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 30210048,
+      "byteLength": 512
+    },
+    "transformer.h.4.ln_2.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 30210560,
+      "byteLength": 512
+    },
+    "transformer.h.4.mlp.c_fc.weight": {
+      "shape": [
+        512,
+        128
+      ],
+      "byteOffset": 30211072,
+      "byteLength": 262144
+    },
+    "transformer.h.4.mlp.c_fc.bias": {
+      "shape": [
+        512
+      ],
+      "byteOffset": 30473216,
+      "byteLength": 2048
+    },
+    "transformer.h.4.mlp.c_proj.weight": {
+      "shape": [
+        128,
+        512
+      ],
+      "byteOffset": 30475264,
+      "byteLength": 262144
+    },
+    "transformer.h.4.mlp.c_proj.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 30737408,
+      "byteLength": 512
+    },
+    "transformer.h.5.ln_1.weight": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 30737920,
+      "byteLength": 512
+    },
+    "transformer.h.5.ln_1.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 30738432,
+      "byteLength": 512
+    },
+    "transformer.h.5.attn.attention.k_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 30738944,
+      "byteLength": 65536
+    },
+    "transformer.h.5.attn.attention.v_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 30804480,
+      "byteLength": 65536
+    },
+    "transformer.h.5.attn.attention.q_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 30870016,
+      "byteLength": 65536
+    },
+    "transformer.h.5.attn.attention.out_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 30935552,
+      "byteLength": 65536
+    },
+    "transformer.h.5.attn.attention.out_proj.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 31001088,
+      "byteLength": 512
+    },
+    "transformer.h.5.ln_2.weight": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 31001600,
+      "byteLength": 512
+    },
+    "transformer.h.5.ln_2.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 31002112,
+      "byteLength": 512
+    },
+    "transformer.h.5.mlp.c_fc.weight": {
+      "shape": [
+        512,
+        128
+      ],
+      "byteOffset": 31002624,
+      "byteLength": 262144
+    },
+    "transformer.h.5.mlp.c_fc.bias": {
+      "shape": [
+        512
+      ],
+      "byteOffset": 31264768,
+      "byteLength": 2048
+    },
+    "transformer.h.5.mlp.c_proj.weight": {
+      "shape": [
+        128,
+        512
+      ],
+      "byteOffset": 31266816,
+      "byteLength": 262144
+    },
+    "transformer.h.5.mlp.c_proj.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 31528960,
+      "byteLength": 512
+    },
+    "transformer.h.6.ln_1.weight": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 31529472,
+      "byteLength": 512
+    },
+    "transformer.h.6.ln_1.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 31529984,
+      "byteLength": 512
+    },
+    "transformer.h.6.attn.attention.k_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 31530496,
+      "byteLength": 65536
+    },
+    "transformer.h.6.attn.attention.v_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 31596032,
+      "byteLength": 65536
+    },
+    "transformer.h.6.attn.attention.q_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 31661568,
+      "byteLength": 65536
+    },
+    "transformer.h.6.attn.attention.out_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 31727104,
+      "byteLength": 65536
+    },
+    "transformer.h.6.attn.attention.out_proj.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 31792640,
+      "byteLength": 512
+    },
+    "transformer.h.6.ln_2.weight": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 31793152,
+      "byteLength": 512
+    },
+    "transformer.h.6.ln_2.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 31793664,
+      "byteLength": 512
+    },
+    "transformer.h.6.mlp.c_fc.weight": {
+      "shape": [
+        512,
+        128
+      ],
+      "byteOffset": 31794176,
+      "byteLength": 262144
+    },
+    "transformer.h.6.mlp.c_fc.bias": {
+      "shape": [
+        512
+      ],
+      "byteOffset": 32056320,
+      "byteLength": 2048
+    },
+    "transformer.h.6.mlp.c_proj.weight": {
+      "shape": [
+        128,
+        512
+      ],
+      "byteOffset": 32058368,
+      "byteLength": 262144
+    },
+    "transformer.h.6.mlp.c_proj.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 32320512,
+      "byteLength": 512
+    },
+    "transformer.h.7.ln_1.weight": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 32321024,
+      "byteLength": 512
+    },
+    "transformer.h.7.ln_1.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 32321536,
+      "byteLength": 512
+    },
+    "transformer.h.7.attn.attention.k_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 32322048,
+      "byteLength": 65536
+    },
+    "transformer.h.7.attn.attention.v_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 32387584,
+      "byteLength": 65536
+    },
+    "transformer.h.7.attn.attention.q_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 32453120,
+      "byteLength": 65536
+    },
+    "transformer.h.7.attn.attention.out_proj.weight": {
+      "shape": [
+        128,
+        128
+      ],
+      "byteOffset": 32518656,
+      "byteLength": 65536
+    },
+    "transformer.h.7.attn.attention.out_proj.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 32584192,
+      "byteLength": 512
+    },
+    "transformer.h.7.ln_2.weight": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 32584704,
+      "byteLength": 512
+    },
+    "transformer.h.7.ln_2.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 32585216,
+      "byteLength": 512
+    },
+    "transformer.h.7.mlp.c_fc.weight": {
+      "shape": [
+        512,
+        128
+      ],
+      "byteOffset": 32585728,
+      "byteLength": 262144
+    },
+    "transformer.h.7.mlp.c_fc.bias": {
+      "shape": [
+        512
+      ],
+      "byteOffset": 32847872,
+      "byteLength": 2048
+    },
+    "transformer.h.7.mlp.c_proj.weight": {
+      "shape": [
+        128,
+        512
+      ],
+      "byteOffset": 32849920,
+      "byteLength": 262144
+    },
+    "transformer.h.7.mlp.c_proj.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 33112064,
+      "byteLength": 512
+    },
+    "transformer.ln_f.weight": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 33112576,
+      "byteLength": 512
+    },
+    "transformer.ln_f.bias": {
+      "shape": [
+        128
+      ],
+      "byteOffset": 33113088,
+      "byteLength": 512
+    },
+    "lm_head.weight": {
+      "shape": [
+        50257,
+        128
+      ],
+      "byteOffset": 33113600,
+      "byteLength": 25731584
+    }
+  }
+}
