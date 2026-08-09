@@ -48,6 +48,14 @@ To run TypeScript's project type check separately:
 npm run typecheck
 ```
 
+## Unit Tests
+
+```bash
+npm test
+```
+
+The unit test suite uses Vitest and currently covers the pure TypeScript engine primitives under `engine/src/primitives/`. Tests live in the mirrored `engine/test/primitives/` tree.
+
 ## Preview
 
 ```bash
@@ -57,6 +65,6 @@ npm run preview
 ## Notes
 
 - The UI thread only starts and observes the load.
-- The model is retained inside `src/modelWorker.ts`, which imports `engine/loader.ts`.
+- The model is retained inside `src/modelWorker.ts`, which imports `engine/src/loader.ts`.
 - The active model export is configured in `src/modelExport.ts`.
 - Vite serves the local `../models` directory at `/models` during development and copies the selected export during production builds.

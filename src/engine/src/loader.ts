@@ -150,6 +150,22 @@ export interface LoadedModelSummary {
   vocabularySize: number;
   maximumSequenceLength: number;
   scratchSequenceLength: number;
+  config: ModelConfig;
+  tensors: TensorVisualization[];
+}
+
+export interface TensorVisualization {
+  name: string;
+  description: string;
+  shape: readonly number[];
+  byteOffset: number;
+  byteLength: number;
+  elementCount: number;
+  min: number;
+  max: number;
+  mean: number;
+  meanAbsolute: number;
+  sample: number[];
 }
 
 export interface LoaderProgress {
@@ -331,7 +347,121 @@ export function summarizeLoadedModel(model: LoadedModel): LoadedModelSummary {
     vocabularySize: model.config.vocabularySize,
     maximumSequenceLength: model.config.maximumSequenceLength,
     scratchSequenceLength: model.scratch.sequenceLength,
+    config: model.config,
+    tensors: summarizeTensors(model.tensors),
   };
+}
+
+export function summarizeTensors(tensors: ReadonlyMap<string, TensorView>): TensorVisualization[] {
+  return [...tensors.values()].map((tensor) => summarizeTensor(tensor));
+}
+
+function summarizeTensor(tensor: TensorView): TensorVisualization {
+  const sampleLimit = 96;
+  const statsLimit = 4096;
+  const sample: number[] = [];
+  const data = tensor.data;
+  const sampleStride = Math.max(1, Math.floor(data.length / sampleLimit));
+  const statsStride = Math.max(1, Math.floor(data.length / statsLimit));
+
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+  let sum = 0;
+  let absoluteSum = 0;
+  let count = 0;
+
+  for (let index = 0; index < data.length; index += statsStride) {
+    const value = data[index] ?? 0;
+    min = Math.min(min, value);
+    max = Math.max(max, value);
+    sum += value;
+    absoluteSum += Math.abs(value);
+    count += 1;
+  }
+
+  for (let index = 0; index < data.length && sample.length < sampleLimit; index += sampleStride) {
+    sample.push(data[index] ?? 0);
+  }
+
+  return {
+    name: tensor.name,
+    description: describeTensor(tensor),
+    shape: tensor.shape,
+    byteOffset: tensor.byteOffset,
+    byteLength: tensor.byteLength,
+    elementCount: tensor.data.length,
+    min: count > 0 ? min : 0,
+    max: count > 0 ? max : 0,
+    mean: count > 0 ? sum / count : 0,
+    meanAbsolute: count > 0 ? absoluteSum / count : 0,
+    sample,
+  };
+}
+
+function describeTensor(tensor: TensorView): string {
+  const { name, shape } = tensor;
+
+  if (name === "transformer.wte.weight") {
+    return "Token embedding table that maps vocabulary IDs into hidden-state vectors.";
+  }
+  if (name === "transformer.wpe.weight") {
+    return "Position embedding table that adds sequence-position information to token states.";
+  }
+  if (name === "transformer.ln_f.weight") {
+    return "Scale vector for the final layer normalization before logits are produced.";
+  }
+  if (name === "transformer.ln_f.bias") {
+    return "Bias vector for the final layer normalization before logits are produced.";
+  }
+  if (name === "lm_head.weight") {
+    return "Language-model output projection that maps hidden states back to vocabulary logits.";
+  }
+
+  const layerMatch = /^transformer\.h\.(\d+)\.(.+)$/.exec(name);
+  if (layerMatch) {
+    const layer = Number(layerMatch[1]);
+    const suffix = layerMatch[2];
+    const layerLabel = `Layer ${layer}`;
+
+    switch (suffix) {
+      case "ln_1.weight":
+        return `${layerLabel} input layer-normalization scale vector before attention.`;
+      case "ln_1.bias":
+        return `${layerLabel} input layer-normalization bias vector before attention.`;
+      case "attn.attention.k_proj.weight":
+        return `${layerLabel} attention key projection matrix.`;
+      case "attn.attention.v_proj.weight":
+        return `${layerLabel} attention value projection matrix.`;
+      case "attn.attention.q_proj.weight":
+        return `${layerLabel} attention query projection matrix.`;
+      case "attn.attention.out_proj.weight":
+        return `${layerLabel} attention output projection matrix back into hidden size.`;
+      case "attn.attention.out_proj.bias":
+        return `${layerLabel} attention output projection bias vector.`;
+      case "ln_2.weight":
+        return `${layerLabel} post-attention layer-normalization scale vector before the MLP.`;
+      case "ln_2.bias":
+        return `${layerLabel} post-attention layer-normalization bias vector before the MLP.`;
+      case "mlp.c_fc.weight":
+        return `${layerLabel} MLP expansion matrix from hidden size to intermediate size.`;
+      case "mlp.c_fc.bias":
+        return `${layerLabel} MLP expansion bias vector.`;
+      case "mlp.c_proj.weight":
+        return `${layerLabel} MLP projection matrix from intermediate size back to hidden size.`;
+      case "mlp.c_proj.bias":
+        return `${layerLabel} MLP projection bias vector.`;
+      default:
+        break;
+    }
+  }
+
+  if (shape.length === 2) {
+    return `Matrix tensor with ${shape[0]} rows and ${shape[1]} columns.`;
+  }
+  if (shape.length === 1) {
+    return `Vector tensor with ${shape[0]} elements.`;
+  }
+  return `Rank-${shape.length} tensor derived from the exported model weights.`;
 }
 
 export function allocateRuntimeScratch(

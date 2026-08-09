@@ -1,3 +1,3 @@
-import { installLoaderWorker } from "../engine/loader";
+import { installLoaderWorker } from "../engine/src/loader";
 
 installLoaderWorker();
