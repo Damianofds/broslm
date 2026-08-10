@@ -103,6 +103,10 @@ export default function App() {
         return;
       }
 
+      if (message.type === "next-token-result") {
+        return;
+      }
+
       setError(message.error);
       setLoadState("error");
     };

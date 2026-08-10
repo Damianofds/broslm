@@ -1,3 +1,5 @@
+import { nextToken } from "./model";
+
 export type AttentionKind = "global" | "local";
 
 export interface ModelConfig {
@@ -121,6 +123,11 @@ export type LoaderWorkerRequest =
       weightsIndexPath?: string;
       weightsBinaryPath?: string;
       scratchSequenceLength?: number;
+    }
+  | {
+      type: "next-token";
+      requestId?: string;
+      inputIds: number[];
     };
 
 export type LoaderWorkerResponse =
@@ -133,6 +140,11 @@ export type LoaderWorkerResponse =
       type: "model-ready";
       requestId?: string;
       summary: LoadedModelSummary;
+    }
+  | {
+      type: "next-token-result";
+      requestId?: string;
+      tokenId: number;
     }
   | {
       type: "model-error";
@@ -300,7 +312,33 @@ export function installLoaderWorker(
 ): void {
   selfScope.addEventListener("message", (event: MessageEvent<LoaderWorkerRequest>) => {
     const message = event.data;
-    if (!message || message.type !== "load-model") {
+    if (!message) {
+      return;
+    }
+
+    if (message.type === "next-token") {
+      try {
+        if (!workerLoadedModel) {
+          throw new Error("Model must be loaded before running next-token inference");
+        }
+
+        const result = nextToken(workerLoadedModel, message.inputIds);
+        selfScope.postMessage({
+          type: "next-token-result",
+          requestId: message.requestId,
+          tokenId: result.tokenId,
+        } satisfies LoaderWorkerResponse);
+      } catch (error: unknown) {
+        selfScope.postMessage({
+          type: "model-error",
+          requestId: message.requestId,
+          error: error instanceof Error ? error.message : String(error),
+        } satisfies LoaderWorkerResponse);
+      }
+      return;
+    }
+
+    if (message.type !== "load-model") {
       return;
     }
 
