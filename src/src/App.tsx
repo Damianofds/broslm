@@ -1,80 +1,141 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   LoadedModelSummary,
   LoaderProgress,
   LoaderWorkerRequest,
   LoaderWorkerResponse,
-  ModelConfig,
-  TensorVisualization,
 } from "../engine/src/loader";
-import { modelBaseUrl } from "./modelExport";
+import { modelBaseUrl, tokenizerUrl } from "./modelExport";
+import {
+  loadByteLevelBpeTokenizer,
+  type ByteLevelBpeTokenizer,
+} from "./tokenizer";
 
 type LoadState = "idle" | "loading" | "ready" | "error";
+type TokenizerState = "idle" | "loading" | "ready" | "error";
+type GenerationState = "idle" | "generating" | "done" | "error";
+type LoadFrame = "start" | "loading" | "config";
+
+interface PendingNextTokenRequest {
+  resolve: (tokenId: number) => void;
+  reject: (error: Error) => void;
+}
 
 interface Step {
   stage: LoaderProgress["stage"];
   label: string;
 }
 
-const steps: Step[] = [
+const steps: readonly Step[] = [
   { stage: "descriptors-download-started", label: "Start descriptor downloads" },
-  { stage: "descriptors-downloaded", label: "Download config.json and weights.json" },
-  { stage: "descriptors-validated", label: "Validate architecture, dtype, tensor names and sizes" },
-  { stage: "weights-download-started", label: "Download weights.bin into one ArrayBuffer" },
-  { stage: "weights-validated", label: "Validate binary length and tensor boundaries" },
-  { stage: "tensor-views-created", label: "Create zero-copy Float32Array tensor views" },
-  { stage: "weights-bound", label: "Bind raw tensors into typed GPT-Neo layers" },
-  { stage: "scratch-allocated", label: "Allocate runtime scratch buffers separately" },
-  { stage: "ready", label: "Keep model alive in the worker and notify the page" },
+  { stage: "descriptors-downloaded", label: "Receive config and tensor index" },
+  { stage: "descriptors-validated", label: "Validate architecture and tensor metadata" },
+  { stage: "weights-download-started", label: "Download raw FP32 weights" },
+  { stage: "weights-validated", label: "Validate weight buffer boundaries" },
+  { stage: "tensor-views-created", label: "Create zero-copy tensor views" },
+  { stage: "weights-bound", label: "Bind tensors into GPT-Neo layers" },
+  { stage: "scratch-allocated", label: "Allocate inference scratch buffers" },
+  { stage: "ready", label: "Keep model resident in the worker" },
 ];
 
 export default function App() {
   const workerRef = useRef<Worker | null>(null);
+  const tokenizerRef = useRef<ByteLevelBpeTokenizer | null>(null);
+  const pendingNextTokenRequestsRef = useRef<Map<string, PendingNextTokenRequest>>(new Map());
+  const generationRunRef = useRef(0);
+  const chatTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+
   const [loadState, setLoadState] = useState<LoadState>("idle");
+  const [tokenizerState, setTokenizerState] = useState<TokenizerState>("idle");
   const [progress, setProgress] = useState<LoaderProgress | null>(null);
-  const [completedStages, setCompletedStages] = useState<Set<LoaderProgress["stage"]>>(
-    () => new Set(),
-  );
+  const [actualStepIndex, setActualStepIndex] = useState(-1);
+  const [visibleStepIndex, setVisibleStepIndex] = useState(-1);
   const [summary, setSummary] = useState<LoadedModelSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [tensorFilter, setTensorFilter] = useState("");
-  const [selectedTensorName, setSelectedTensorName] = useState<string | null>(null);
+  const [tokenizerError, setTokenizerError] = useState<string | null>(null);
+  const [chatText, setChatText] = useState("Once upon a time");
+  const [maxNewTokens, setMaxNewTokens] = useState(40);
+  const [temperature, setTemperature] = useState(0.8);
+  const [topK, setTopK] = useState(40);
+  const [generationState, setGenerationState] = useState<GenerationState>("idle");
+  const [generationError, setGenerationError] = useState<string | null>(null);
+  const [inputTokenCount, setInputTokenCount] = useState<number | null>(null);
+  const [generatedTokenIds, setGeneratedTokenIds] = useState<number[]>([]);
 
-  const percent = useMemo(() => {
-    if (!progress?.loadedBytes || !progress.totalBytes) {
+  useEffect(() => {
+    return () => {
+      generationRunRef.current += 1;
+      rejectPendingNextTokenRequests(
+        pendingNextTokenRequestsRef.current,
+        new Error("Component unmounted"),
+      );
+      workerRef.current?.terminate();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (visibleStepIndex >= actualStepIndex) {
+      return;
+    }
+
+    const delayMs = visibleStepIndex < 0 ? 0 : 500;
+    const timeout = window.setTimeout(() => {
+      setVisibleStepIndex((current) => Math.min(current + 1, actualStepIndex));
+    }, delayMs);
+
+    return () => window.clearTimeout(timeout);
+  }, [actualStepIndex, visibleStepIndex]);
+
+  useEffect(() => {
+    const textarea = chatTextareaRef.current;
+    if (!textarea) {
+      return;
+    }
+    textarea.style.height = "auto";
+    textarea.style.height = `${textarea.scrollHeight}px`;
+  }, [chatText]);
+
+  const chatTokenPreview = useMemo(() => {
+    if (!tokenizerRef.current || chatText.length === 0) {
       return null;
     }
-    return Math.max(0, Math.min(100, (progress.loadedBytes / progress.totalBytes) * 100));
-  }, [progress]);
 
-  const filteredTensors = useMemo(() => {
-    const normalizedFilter = tensorFilter.trim().toLowerCase();
-    const tensors = summary?.tensors ?? [];
-    if (!normalizedFilter) {
-      return tensors;
+    try {
+      return tokenizerRef.current.encode(chatText).length;
+    } catch {
+      return null;
     }
+  }, [chatText, tokenizerState]);
 
-    return tensors.filter((tensor) => tensor.name.toLowerCase().includes(normalizedFilter));
-  }, [summary?.tensors, tensorFilter]);
+  const canGenerate =
+    loadState === "ready" &&
+    tokenizerState === "ready" &&
+    generationState !== "generating" &&
+    chatText.length > 0;
 
-  const selectedTensor = useMemo(() => {
-    return (
-      filteredTensors.find((tensor) => tensor.name === selectedTensorName) ??
-      filteredTensors[0] ??
-      null
-    );
-  }, [filteredTensors, selectedTensorName]);
+  const loadFrame = resolveLoadFrame(loadState, summary, visibleStepIndex);
 
   function loadModel() {
     if (loadState === "loading") {
       return;
     }
 
+    generationRunRef.current += 1;
+    rejectPendingNextTokenRequests(
+      pendingNextTokenRequestsRef.current,
+      new Error("Model is reloading"),
+    );
     setLoadState("loading");
     setProgress(null);
-    setCompletedStages(new Set());
+    setActualStepIndex(-1);
+    setVisibleStepIndex(-1);
     setSummary(null);
     setError(null);
+    setGenerationState("idle");
+    setGenerationError(null);
+    setGeneratedTokenIds([]);
+    setInputTokenCount(null);
+    void ensureTokenizerLoaded();
 
     workerRef.current?.terminate();
     const worker = new Worker(new URL("./modelWorker.ts", import.meta.url), {
@@ -88,23 +149,37 @@ export default function App() {
 
       if (message.type === "model-progress") {
         setProgress(message.progress);
-        setCompletedStages((current) => {
-          const next = new Set(current);
-          next.add(message.progress.stage);
-          return next;
-        });
+        setActualStepIndex((current) =>
+          Math.max(current, stepIndexForStage(message.progress.stage)),
+        );
         return;
       }
 
       if (message.type === "model-ready") {
         setSummary(message.summary);
-        setSelectedTensorName(message.summary.tensors[0]?.name ?? null);
+        setActualStepIndex(steps.length - 1);
         setLoadState("ready");
         return;
       }
 
       if (message.type === "next-token-result") {
+        const pending = message.requestId
+          ? pendingNextTokenRequestsRef.current.get(message.requestId)
+          : undefined;
+        if (pending && message.requestId) {
+          pendingNextTokenRequestsRef.current.delete(message.requestId);
+          pending.resolve(message.tokenId);
+        }
         return;
+      }
+
+      if (message.requestId) {
+        const pending = pendingNextTokenRequestsRef.current.get(message.requestId);
+        if (pending) {
+          pendingNextTokenRequestsRef.current.delete(message.requestId);
+          pending.reject(new Error(message.error));
+          return;
+        }
       }
 
       setError(message.error);
@@ -112,134 +187,327 @@ export default function App() {
     };
 
     worker.onerror = (event) => {
-      setError(event.message || "The inference worker failed while loading the model.");
+      const message = event.message || "The inference worker failed while loading the model.";
+      rejectPendingNextTokenRequests(pendingNextTokenRequestsRef.current, new Error(message));
+      setError(message);
       setLoadState("error");
     };
 
-    const request: LoaderWorkerRequest = {
+    worker.postMessage({
       type: "load-model",
       requestId: crypto.randomUUID(),
       baseUrl: new URL(modelBaseUrl, window.location.href).toString(),
       scratchSequenceLength: 256,
+    } satisfies LoaderWorkerRequest);
+  }
+
+  async function ensureTokenizerLoaded() {
+    if (tokenizerRef.current || tokenizerState === "loading") {
+      return;
+    }
+
+    setTokenizerState("loading");
+    setTokenizerError(null);
+    try {
+      tokenizerRef.current = await loadByteLevelBpeTokenizer(tokenizerUrl);
+      setTokenizerState("ready");
+    } catch (loadError: unknown) {
+      tokenizerRef.current = null;
+      setTokenizerState("error");
+      setTokenizerError(loadError instanceof Error ? loadError.message : String(loadError));
+    }
+  }
+
+  async function generateCompletion() {
+    const tokenizer = tokenizerRef.current;
+    if (!tokenizer || loadState !== "ready" || !summary) {
+      setGenerationState("error");
+      setGenerationError("Model and tokenizer must be ready before generation.");
+      return;
+    }
+
+    if (chatText.length === 0) {
+      setGenerationState("error");
+      setGenerationError("Prompt is empty.");
+      return;
+    }
+
+    const baseText = chatText;
+    const inputIds = tokenizer.encode(baseText);
+    const availableNewTokens = summary.config.maximumSequenceLength - inputIds.length;
+    if (availableNewTokens <= 0) {
+      setGenerationState("error");
+      setGenerationError("Prompt is longer than the model context window.");
+      return;
+    }
+
+    const runId = generationRunRef.current + 1;
+    generationRunRef.current = runId;
+    const nextInputIds = [...inputIds];
+    const nextGeneratedTokenIds: number[] = [];
+    const targetNewTokens = Math.min(maxNewTokens, availableNewTokens);
+
+    setInputTokenCount(inputIds.length);
+    setGeneratedTokenIds([]);
+    setGenerationError(null);
+    setGenerationState("generating");
+
+    try {
+      for (let tokenIndex = 0; tokenIndex < targetNewTokens; tokenIndex += 1) {
+        const tokenId = await requestNextToken(nextInputIds, {
+          temperature,
+          topK,
+        });
+        if (generationRunRef.current !== runId) {
+          return;
+        }
+        if (tokenId === summary.config.eosTokenId || tokenId === tokenizer.eosTokenId) {
+          break;
+        }
+
+        nextInputIds.push(tokenId);
+        nextGeneratedTokenIds.push(tokenId);
+        setGeneratedTokenIds([...nextGeneratedTokenIds]);
+        setChatText(baseText + tokenizer.decode(nextGeneratedTokenIds));
+      }
+
+      if (generationRunRef.current === runId) {
+        setGenerationState("done");
+      }
+    } catch (generationError: unknown) {
+      if (generationRunRef.current !== runId) {
+        return;
+      }
+      setGenerationState("error");
+      setGenerationError(
+        generationError instanceof Error ? generationError.message : String(generationError),
+      );
+    }
+  }
+
+  function stopGeneration() {
+    generationRunRef.current += 1;
+    rejectPendingNextTokenRequests(
+      pendingNextTokenRequestsRef.current,
+      new Error("Generation stopped"),
+    );
+    setGenerationState("done");
+  }
+
+  function requestNextToken(
+    inputIds: number[],
+    options: { temperature: number; topK: number },
+  ): Promise<number> {
+    const worker = workerRef.current;
+    if (!worker) {
+      return Promise.reject(new Error("Inference worker is not running."));
+    }
+
+    const requestId = crypto.randomUUID();
+    const request: LoaderWorkerRequest = {
+      type: "next-token",
+      requestId,
+      inputIds,
+      temperature: options.temperature,
+      topK: options.topK,
     };
-    worker.postMessage(request);
+
+    return new Promise((resolve, reject) => {
+      pendingNextTokenRequestsRef.current.set(requestId, { resolve, reject });
+      worker.postMessage(request);
+    });
   }
 
   return (
     <main className="page-shell">
-      <section className="intro-band">
-        <div className="intro-copy">
-          <p className="eyebrow">TinyStories GPT-Neo export</p>
-          <h1>broSLM</h1>
-          <p className="subtitle">browser small language model</p>
-          <p className="description">
-            This page loads the TinyStories raw binary model in a dedicated inference Web
-            Worker. The UI stays on the main thread while the worker validates descriptors,
-            downloads weights, creates zero-copy tensor views, and keeps the model resident.
-          </p>
-          <button className="load-button" onClick={loadModel} disabled={loadState === "loading"}>
-            {loadState === "loading" ? "Loading model" : loadState === "ready" ? "Reload model" : "Load model"}
-          </button>
-        </div>
-      </section>
+      <OverviewSection />
 
-      <section className="status-band" aria-live="polite">
-        <div className="status-header">
-          <div>
-            <p className="section-label">Loader state</p>
-            <h2>{statusTitle(loadState)}</h2>
-          </div>
-          {percent !== null && (
-            <span className="download-pill">{formatBytes(progress?.loadedBytes ?? 0)} / {formatBytes(progress?.totalBytes ?? 0)}</span>
-          )}
-        </div>
+      <LoadModelSection
+        error={error}
+        frame={loadFrame}
+        loadState={loadState}
+        progress={progress}
+        summary={summary}
+        tokenizerError={tokenizerError}
+        visibleStepIndex={visibleStepIndex}
+        onLoadModel={loadModel}
+      />
 
-        <div className="progress-track">
-          <div
-            className="progress-fill"
-            style={{ width: `${percent ?? stagePercent(completedStages)}%` }}
-          />
-        </div>
-
-        {progress && <p className="current-message">{progress.message}</p>}
-        {error && <p className="error-message">{error}</p>}
-
-        <ol className="step-list">
-          {steps.map((step) => {
-            const done = isStepDone(step.stage, completedStages);
-            const active = isStepActive(step.stage, progress?.stage, loadState);
-            return (
-              <li className={done ? "done" : active ? "active" : ""} key={step.stage}>
-                <span className="step-marker" />
-                <span>{step.label}</span>
-              </li>
-            );
-          })}
-        </ol>
-
-        {summary && (
-          <>
-            <div className="summary-grid">
-              <SummaryItem label="Architecture" value={summary.architecture} />
-              <SummaryItem label="Tensors" value={String(summary.tensorCount)} />
-              <SummaryItem label="Weights" value={formatBytes(summary.totalByteLength)} />
-              <SummaryItem label="Layers" value={String(summary.layers)} />
-              <SummaryItem label="Hidden size" value={String(summary.hiddenSize)} />
-              <SummaryItem label="Vocabulary" value={String(summary.vocabularySize)} />
-            </div>
-
-            <ModelDetails
-              config={summary.config}
-              tensors={filteredTensors}
-              totalTensors={summary.tensors.length}
-              selectedTensor={selectedTensor}
-              tensorFilter={tensorFilter}
-              onTensorFilterChange={setTensorFilter}
-              onSelectTensor={setSelectedTensorName}
-            />
-          </>
-        )}
-      </section>
+      <ChatSection
+        canGenerate={canGenerate}
+        chatText={chatText}
+        generatedTokenCount={generatedTokenIds.length}
+        generationError={generationError}
+        generationState={generationState}
+        loadState={loadState}
+        maxNewTokens={maxNewTokens}
+        temperature={temperature}
+        textareaRef={chatTextareaRef}
+        tokenCount={chatTokenPreview ?? inputTokenCount}
+        tokenizerState={tokenizerState}
+        topK={topK}
+        onChatTextChange={setChatText}
+        onGenerate={() => {
+          void generateCompletion();
+        }}
+        onMaxNewTokensChange={setMaxNewTokens}
+        onTemperatureChange={setTemperature}
+        onStop={stopGeneration}
+        onTopKChange={setTopK}
+      />
     </main>
   );
 }
 
-function ModelDetails({
-  config,
-  tensors,
-  totalTensors,
-  selectedTensor,
-  tensorFilter,
-  onTensorFilterChange,
-  onSelectTensor,
+function OverviewSection() {
+  return (
+    <section className="landing-section overview-section" id="overview">
+      <div className="section-inner overview-inner">
+        <h1>
+          broSLM
+          <span>browser small language model</span>
+        </h1>
+        <p className="overview-copy">
+          A raw neural model running locally in the browser. Scroll down, load the weights,
+          and try the experience without a server-side inference API.
+        </p>
+        <a className="scroll-cta" href="#load-model">
+          Scroll to try
+        </a>
+      </div>
+    </section>
+  );
+}
+
+function LoadModelSection({
+  error,
+  frame,
+  loadState,
+  progress,
+  summary,
+  tokenizerError,
+  visibleStepIndex,
+  onLoadModel,
 }: {
-  config: ModelConfig;
-  tensors: TensorVisualization[];
-  totalTensors: number;
-  selectedTensor: TensorVisualization | null;
-  tensorFilter: string;
-  onTensorFilterChange: (value: string) => void;
-  onSelectTensor: (name: string) => void;
+  error: string | null;
+  frame: LoadFrame;
+  loadState: LoadState;
+  progress: LoaderProgress | null;
+  summary: LoadedModelSummary | null;
+  tokenizerError: string | null;
+  visibleStepIndex: number;
+  onLoadModel: () => void;
 }) {
   return (
-    <div className="details-layout">
-      <section className="detail-panel">
-        <div className="panel-heading">
-          <div>
-            <p className="section-label">Model config</p>
-            <h3>Parsed architecture</h3>
-          </div>
+    <section className="landing-section load-section" id="load-model">
+      <div className="section-inner load-inner">
+        <h2>{loadFrameTitle(frame, loadState)}</h2>
+        <div className={`load-frame ${frame}-frame`}>
+          {frame === "start" && (
+            <StartLoadFrame
+              error={error}
+              loadState={loadState}
+              tokenizerError={tokenizerError}
+              onLoadModel={onLoadModel}
+            />
+          )}
+          {frame === "loading" && (
+            <LoadingFrame
+              loadState={loadState}
+              progress={progress}
+              visibleStepIndex={visibleStepIndex}
+            />
+          )}
+          {frame === "config" && summary && <ConfigFrame summary={summary} onLoadModel={onLoadModel} />}
         </div>
+      </div>
+    </section>
+  );
+}
+
+function StartLoadFrame({
+  error,
+  loadState,
+  tokenizerError,
+  onLoadModel,
+}: {
+  error: string | null;
+  loadState: LoadState;
+  tokenizerError: string | null;
+  onLoadModel: () => void;
+}) {
+  return (
+    <div className="start-load-frame">
+      <button
+        className="load-button"
+        disabled={loadState === "loading"}
+        onClick={onLoadModel}
+        type="button"
+      >
+        Load model
+      </button>
+      <p className="frame-copy">
+        The browser will fetch the model files, validate them, and keep the network quiet after
+        the worker is ready.
+      </p>
+      {error && <p className="error-message">{error}</p>}
+      {tokenizerError && <p className="error-message">{tokenizerError}</p>}
+    </div>
+  );
+}
+
+function LoadingFrame({
+  loadState,
+  progress,
+  visibleStepIndex,
+}: {
+  loadState: LoadState;
+  progress: LoaderProgress | null;
+  visibleStepIndex: number;
+}) {
+  return (
+    <div className="loading-frame-inner">
+      <div className="progress-track" aria-label="Model loading progress">
+        <div className="progress-fill" style={{ width: `${stepPercent(visibleStepIndex)}%` }} />
+      </div>
+
+      <p className="current-message">
+        {currentStepMessage(visibleStepIndex, loadState)}
+        {progress?.loadedBytes && progress.totalBytes
+          ? ` / ${formatBytes(progress.loadedBytes)} of ${formatBytes(progress.totalBytes)}`
+          : ""}
+      </p>
+
+      <ol className="step-list">
+        {steps.map((step, index) => (
+          <li className={stepClassName(index, visibleStepIndex)} key={step.stage}>
+            <span className="step-index">{String(index + 1).padStart(2, "0")}</span>
+            <span>{step.label}</span>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
+function ConfigFrame({
+  summary,
+  onLoadModel,
+}: {
+  summary: LoadedModelSummary;
+  onLoadModel: () => void;
+}) {
+  return (
+    <div className="config-frame-inner">
+      <section className="config-panel">
+        <h3>Model config</h3>
         <div className="config-grid">
-          {configRows(config).map((row) => (
-            <div className="config-row" key={row.label}>
-              <span>{row.label}</span>
-              <strong>{row.value}</strong>
-            </div>
+          {modelConfigRows(summary).map((row) => (
+            <ConfigItem key={row.label} label={row.label} value={row.value} />
           ))}
         </div>
         <div className="attention-strip" aria-label="Attention layer types">
-          {config.attentionLayers.map((kind, index) => (
+          {summary.config.attentionLayers.map((kind, index) => (
             <span className={kind} key={`${kind}-${index}`} title={`Layer ${index}: ${kind}`}>
               {index}
             </span>
@@ -247,138 +515,303 @@ function ModelDetails({
         </div>
       </section>
 
-      <section className="detail-panel tensor-panel">
-        <div className="panel-heading tensor-heading">
-          <div>
-            <p className="section-label">Tensor visualization</p>
-            <h3>Loaded tensor registry</h3>
-          </div>
-          <label className="tensor-filter">
-            <span>Filter</span>
-            <input
-              type="search"
-              value={tensorFilter}
-              onChange={(event) => onTensorFilterChange(event.target.value)}
-              placeholder="tensor name"
-            />
-          </label>
-        </div>
-
-        <p className="tensor-count">
-          Showing {tensors.length} of {totalTensors} tensors read from the loaded model.
-        </p>
-
-        <div className="tensor-browser">
-          <div className="tensor-list" role="listbox" aria-label="Loaded tensors">
-            {tensors.map((tensor) => (
-              <button
-                className={tensor.name === selectedTensor?.name ? "tensor-row selected" : "tensor-row"}
-                key={tensor.name}
-                onClick={() => onSelectTensor(tensor.name)}
-                type="button"
-              >
-                <span className="tensor-name">{tensor.name}</span>
-                <span className="tensor-shape">{formatShape(tensor.shape)}</span>
-                <span className="tensor-size">{formatBytes(tensor.byteLength)}</span>
-              </button>
-            ))}
-          </div>
-
-          {selectedTensor && <TensorInspector tensor={selectedTensor} />}
+      <section className="config-panel">
+        <h3>Tensor config</h3>
+        <div className="config-grid tensor-config-grid">
+          {tensorConfigRows(summary).map((row) => (
+            <ConfigItem key={row.label} label={row.label} value={row.value} />
+          ))}
         </div>
       </section>
+
+      <button className="reload-link" onClick={onLoadModel} type="button">
+        Reload model
+      </button>
     </div>
   );
 }
 
-function TensorInspector({ tensor }: { tensor: TensorVisualization }) {
+function ChatSection({
+  canGenerate,
+  chatText,
+  generatedTokenCount,
+  generationError,
+  generationState,
+  loadState,
+  maxNewTokens,
+  temperature,
+  textareaRef,
+  tokenCount,
+  tokenizerState,
+  topK,
+  onChatTextChange,
+  onGenerate,
+  onMaxNewTokensChange,
+  onTemperatureChange,
+  onStop,
+  onTopKChange,
+}: {
+  canGenerate: boolean;
+  chatText: string;
+  generatedTokenCount: number;
+  generationError: string | null;
+  generationState: GenerationState;
+  loadState: LoadState;
+  maxNewTokens: number;
+  temperature: number;
+  textareaRef: React.RefObject<HTMLTextAreaElement | null>;
+  tokenCount: number | null;
+  tokenizerState: TokenizerState;
+  topK: number;
+  onChatTextChange: (value: string) => void;
+  onGenerate: () => void;
+  onMaxNewTokensChange: (value: number) => void;
+  onTemperatureChange: (value: number) => void;
+  onStop: () => void;
+  onTopKChange: (value: number) => void;
+}) {
   return (
-    <div className="tensor-inspector">
-      <div>
-        <p className="selected-label">Selected tensor</p>
-        <h4>{tensor.name}</h4>
-        <p className="tensor-description">{tensor.description}</p>
+    <section className="landing-section chat-section" id="chat">
+      <div className="section-inner chat-inner">
+        <div className="chat-heading">
+          <h2>Try the chat demo</h2>
+          <div className="status-pills">
+            <span>{statusTitle(loadState)}</span>
+            <span>{tokenizerStatusTitle(tokenizerState)}</span>
+          </div>
+        </div>
+
+        <form
+          className="chat-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            onGenerate();
+          }}
+        >
+          <label className="chat-textarea-label">
+            <span>Prompt and completion</span>
+            <textarea
+              ref={textareaRef}
+              value={chatText}
+              onChange={(event) => onChatTextChange(event.target.value)}
+              spellCheck={false}
+            />
+          </label>
+
+          <div className="chat-controls">
+            <label className="token-limit-field">
+              <span>New tokens</span>
+              <input
+                max={120}
+                min={1}
+                onChange={(event) => onMaxNewTokensChange(clampTokenLimit(event.target.valueAsNumber))}
+                type="number"
+                value={maxNewTokens}
+              />
+            </label>
+            <label className="token-limit-field">
+              <span>Temperature</span>
+              <input
+                max={2}
+                min={0}
+                onChange={(event) => onTemperatureChange(clampTemperature(event.target.valueAsNumber))}
+                step={0.05}
+                type="number"
+                value={temperature}
+              />
+            </label>
+            <label className="token-limit-field">
+              <span>Top-k</span>
+              <input
+                max={200}
+                min={1}
+                onChange={(event) => onTopKChange(clampTopK(event.target.valueAsNumber))}
+                type="number"
+                value={topK}
+              />
+            </label>
+            <div className="token-stats">
+              <span>{tokenCount ?? "-"} tokens</span>
+              <span>{generatedTokenCount} generated</span>
+              <span>{generationTitle(generationState)}</span>
+            </div>
+            <div className="chat-actions">
+              <button className="generate-button" disabled={!canGenerate} type="submit">
+                Generate
+              </button>
+              <button
+                className="stop-button"
+                disabled={generationState !== "generating"}
+                onClick={onStop}
+                type="button"
+              >
+                Stop
+              </button>
+            </div>
+          </div>
+
+          {generationError && <p className="error-message">{generationError}</p>}
+        </form>
       </div>
-      <div className="tensor-metrics">
-        <SummaryItem label="Shape" value={formatShape(tensor.shape)} />
-        <SummaryItem label="Elements" value={formatInteger(tensor.elementCount)} />
-        <SummaryItem label="Offset" value={formatBytes(tensor.byteOffset)} />
-        <SummaryItem label="Mean abs" value={formatFloat(tensor.meanAbsolute)} />
-        <SummaryItem label="Min" value={formatFloat(tensor.min)} />
-        <SummaryItem label="Max" value={formatFloat(tensor.max)} />
-      </div>
-      <div className="sample-bars" aria-label="Sampled tensor values">
-        {tensor.sample.map((value, index) => (
-          <span
-            className={value >= 0 ? "positive" : "negative"}
-            key={`${index}-${value}`}
-            style={{ height: `${sampleBarHeight(value, tensor)}%` }}
-            title={formatFloat(value)}
-          />
-        ))}
-      </div>
-    </div>
+    </section>
   );
 }
 
-function SummaryItem({ label, value }: { label: string; value: string }) {
+function ConfigItem({ label, value }: { label: string; value: string }) {
   return (
-    <div className="summary-item">
+    <div className="config-row">
       <span>{label}</span>
       <strong>{value}</strong>
     </div>
   );
 }
 
+function resolveLoadFrame(
+  loadState: LoadState,
+  summary: LoadedModelSummary | null,
+  visibleStepIndex: number,
+): LoadFrame {
+  if (summary && visibleStepIndex >= steps.length - 1) {
+    return "config";
+  }
+  if (loadState === "loading" || summary) {
+    return "loading";
+  }
+  return "start";
+}
+
+function loadFrameTitle(frame: LoadFrame, loadState: LoadState): string {
+  if (frame === "config") {
+    return "Model loaded";
+  }
+  if (frame === "loading") {
+    return "Loading model";
+  }
+  if (loadState === "error") {
+    return "Load failed";
+  }
+  return "Load model";
+}
+
 function statusTitle(loadState: LoadState): string {
   switch (loadState) {
     case "loading":
-      return "Loading inside the inference worker";
+      return "Loading";
     case "ready":
       return "Model ready";
     case "error":
       return "Load failed";
     default:
-      return "Waiting to load";
+      return "Model idle";
   }
 }
 
-function stagePercent(completedStages: Set<LoaderProgress["stage"]>): number {
-  const visibleCompletedSteps = steps.filter((step) => isStepDone(step.stage, completedStages)).length;
-  if (visibleCompletedSteps === 0) {
+function tokenizerStatusTitle(tokenizerState: TokenizerState): string {
+  switch (tokenizerState) {
+    case "loading":
+      return "Tokenizer loading";
+    case "ready":
+      return "Tokenizer ready";
+    case "error":
+      return "Tokenizer failed";
+    default:
+      return "Tokenizer idle";
+  }
+}
+
+function generationTitle(generationState: GenerationState): string {
+  switch (generationState) {
+    case "generating":
+      return "Generating";
+    case "done":
+      return "Done";
+    case "error":
+      return "Error";
+    default:
+      return "Ready";
+  }
+}
+
+function clampTokenLimit(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 40;
+  }
+  return Math.max(1, Math.min(120, Math.round(value)));
+}
+
+function clampTemperature(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0.8;
+  }
+  return Math.max(0, Math.min(2, Math.round(value * 100) / 100));
+}
+
+function clampTopK(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 40;
+  }
+  return Math.max(1, Math.min(200, Math.round(value)));
+}
+
+function rejectPendingNextTokenRequests(
+  requests: Map<string, PendingNextTokenRequest>,
+  error: Error,
+): void {
+  for (const request of requests.values()) {
+    request.reject(error);
+  }
+  requests.clear();
+}
+
+function stepIndexForStage(stage: LoaderProgress["stage"]): number {
+  switch (stage) {
+    case "descriptors-download-started":
+      return 0;
+    case "descriptors-downloaded":
+      return 1;
+    case "descriptors-validated":
+      return 2;
+    case "weights-download-started":
+    case "weights-download-progress":
+    case "weights-downloaded":
+      return 3;
+    case "weights-validated":
+      return 4;
+    case "tensor-views-created":
+      return 5;
+    case "weights-bound":
+      return 6;
+    case "scratch-allocated":
+      return 7;
+    case "ready":
+      return 8;
+    default:
+      return 0;
+  }
+}
+
+function stepClassName(index: number, visibleStepIndex: number): string {
+  if (index < visibleStepIndex) {
+    return "done";
+  }
+  if (index === visibleStepIndex) {
+    return "active";
+  }
+  return "";
+}
+
+function stepPercent(visibleStepIndex: number): number {
+  if (visibleStepIndex < 0) {
     return 0;
   }
-  return Math.min(100, (visibleCompletedSteps / steps.length) * 100);
+  return Math.min(100, ((visibleStepIndex + 1) / steps.length) * 100);
 }
 
-function isStepDone(
-  stage: LoaderProgress["stage"],
-  completedStages: Set<LoaderProgress["stage"]>,
-): boolean {
-  if (stage === "weights-download-started") {
-    return (
-      completedStages.has("weights-download-started") ||
-      completedStages.has("weights-download-progress") ||
-      completedStages.has("weights-downloaded")
-    );
+function currentStepMessage(visibleStepIndex: number, loadState: LoadState): string {
+  if (visibleStepIndex >= 0) {
+    return steps[visibleStepIndex]?.label ?? statusTitle(loadState);
   }
-
-  return completedStages.has(stage);
-}
-
-function isStepActive(
-  stage: LoaderProgress["stage"],
-  currentStage: LoaderProgress["stage"] | undefined,
-  loadState: LoadState,
-): boolean {
-  if (loadState !== "loading") {
-    return false;
-  }
-  if (stage === "weights-download-started") {
-    return currentStage === "weights-download-started" || currentStage === "weights-download-progress";
-  }
-
-  return currentStage === stage;
+  return statusTitle(loadState);
 }
 
 function formatBytes(bytes: number): string {
@@ -397,22 +830,54 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
 }
 
-function configRows(config: ModelConfig): Array<{ label: string; value: string }> {
+function modelConfigRows(summary: LoadedModelSummary): Array<{ label: string; value: string }> {
+  const { config } = summary;
   return [
-    { label: "Architecture", value: config.architecture },
-    { label: "Activation", value: config.activation },
-    { label: "Vocabulary", value: formatInteger(config.vocabularySize) },
-    { label: "Hidden size", value: formatInteger(config.hiddenSize) },
+    { label: "Architecture", value: summary.architecture },
+    { label: "Dtype", value: summary.dtype },
+    { label: "Layers", value: formatInteger(summary.layers) },
+    { label: "Hidden size", value: formatInteger(summary.hiddenSize) },
+    { label: "Vocabulary", value: formatInteger(summary.vocabularySize) },
+    { label: "Max sequence", value: formatInteger(config.maximumSequenceLength) },
     { label: "Intermediate", value: formatInteger(config.intermediateSize) },
-    { label: "Layers", value: formatInteger(config.numberOfLayers) },
     { label: "Heads", value: formatInteger(config.numberOfHeads) },
     { label: "Head dim", value: formatInteger(config.headDimension) },
-    { label: "Max sequence", value: formatInteger(config.maximumSequenceLength) },
+    { label: "Activation", value: config.activation },
     { label: "Window size", value: formatInteger(config.windowSize) },
     { label: "Layer norm eps", value: String(config.layerNormEpsilon) },
     { label: "BOS / EOS / PAD", value: `${config.bosTokenId} / ${config.eosTokenId} / ${config.padTokenId ?? "null"}` },
     { label: "Tied embeddings", value: config.tiedWordEmbeddings ? "yes" : "no" },
   ];
+}
+
+function tensorConfigRows(summary: LoadedModelSummary): Array<{ label: string; value: string }> {
+  const tokenEmbedding = tensorByName(summary, "transformer.wte.weight");
+  const positionEmbedding = tensorByName(summary, "transformer.wpe.weight");
+  const lmHead = tensorByName(summary, "lm_head.weight");
+  const finalNorm = tensorByName(summary, "transformer.ln_f.weight");
+
+  return [
+    { label: "Tensor count", value: formatInteger(summary.tensorCount) },
+    { label: "Weight bytes", value: formatBytes(summary.totalByteLength) },
+    { label: "Scratch sequence", value: formatInteger(summary.scratchSequenceLength) },
+    { label: "Token embedding", value: tokenEmbedding ? formatShape(tokenEmbedding.shape) : "-" },
+    { label: "Position embedding", value: positionEmbedding ? formatShape(positionEmbedding.shape) : "-" },
+    { label: "LM head", value: lmHead ? formatShape(lmHead.shape) : "-" },
+    { label: "Final norm", value: finalNorm ? formatShape(finalNorm.shape) : "-" },
+    { label: "Largest tensor", value: largestTensorLabel(summary) },
+  ];
+}
+
+function tensorByName(summary: LoadedModelSummary, name: string) {
+  return summary.tensors.find((tensor) => tensor.name === name) ?? null;
+}
+
+function largestTensorLabel(summary: LoadedModelSummary): string {
+  const tensor = [...summary.tensors].sort((left, right) => right.byteLength - left.byteLength)[0];
+  if (!tensor) {
+    return "-";
+  }
+  return `${tensor.name} ${formatShape(tensor.shape)}`;
 }
 
 function formatShape(shape: readonly number[]): string {
@@ -421,19 +886,4 @@ function formatShape(shape: readonly number[]): string {
 
 function formatInteger(value: number): string {
   return new Intl.NumberFormat("en-US").format(value);
-}
-
-function formatFloat(value: number): string {
-  if (!Number.isFinite(value)) {
-    return String(value);
-  }
-  if (Math.abs(value) >= 1000 || Math.abs(value) < 0.001) {
-    return value.toExponential(3);
-  }
-  return value.toFixed(5);
-}
-
-function sampleBarHeight(value: number, tensor: TensorVisualization): number {
-  const scale = Math.max(Math.abs(tensor.min), Math.abs(tensor.max), 1e-8);
-  return Math.max(4, Math.min(100, (Math.abs(value) / scale) * 100));
 }

@@ -128,6 +128,8 @@ export type LoaderWorkerRequest =
       type: "next-token";
       requestId?: string;
       inputIds: number[];
+      temperature?: number;
+      topK?: number;
     };
 
 export type LoaderWorkerResponse =
@@ -322,7 +324,10 @@ export function installLoaderWorker(
           throw new Error("Model must be loaded before running next-token inference");
         }
 
-        const result = nextToken(workerLoadedModel, message.inputIds);
+        const result = nextToken(workerLoadedModel, message.inputIds, {
+          temperature: message.temperature,
+          topK: message.topK,
+        });
         selfScope.postMessage({
           type: "next-token-result",
           requestId: message.requestId,

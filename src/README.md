@@ -11,6 +11,7 @@ Vite is the build tool for the whole browser deliverable. It runs the dev server
   - `config.json`
   - `weights.json`
   - `weights.bin`
+- The browser prompt demo uses `public/tokenizer/tinystories-tokenizer.json`.
 
 ## Install
 
@@ -29,6 +30,10 @@ Open the local URL printed by Vite, usually:
 ```text
 http://localhost:5173/
 ```
+
+The page is a three-section scroll experience: overview, model loading and
+inspection, then the textarea chat demo. Click `Load model` in the second
+section, then generate from the final section after the model is ready.
 
 ## Build
 
