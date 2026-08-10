@@ -1,10 +1,11 @@
 :root {
-  --black: #0a100d;
-  --pink: #f79ad3;
-  --bone: #d6d5c9;
-  --brown: #8b6220;
-  color: var(--bone);
-  background: var(--black);
+  --bg: #0A100D;
+  --text: #FFEDDF;
+  --accent: #F62DAE;
+  --line: #CBEF43;
+  --shade: #222725;
+  color: var(--text);
+  background: var(--bg);
   font-family:
     Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-synthesis: none;
@@ -19,15 +20,15 @@
 
 html {
   min-height: 100%;
-  background: var(--black);
+  background: var(--bg);
   scroll-behavior: smooth;
-  scroll-snap-type: y mandatory;
+  scroll-snap-type: y proximity;
 }
 
 body {
   margin: 0;
   min-width: 320px;
-  background: var(--black);
+  background: var(--bg);
 }
 
 button,
@@ -38,12 +39,12 @@ textarea {
 
 button,
 a {
-  -webkit-tap-highlight-color: var(--pink);
+  -webkit-tap-highlight-color: var(--line);
 }
 
 .page-shell {
   min-height: 100svh;
-  background: var(--black);
+  background: var(--bg);
 }
 
 .landing-section {
@@ -51,10 +52,10 @@ a {
   display: grid;
   align-items: center;
   min-height: 100svh;
-  padding: clamp(28px, 5vw, 70px);
-  border-bottom: 1px solid var(--brown);
+  padding: clamp(18px, 3vw, 40px);
+  border-bottom: 1px solid var(--line);
   scroll-snap-align: start;
-  scroll-snap-stop: always;
+  scroll-snap-stop: normal;
 }
 
 .landing-section::before {
@@ -63,9 +64,9 @@ a {
   pointer-events: none;
   content: "";
   background:
-    linear-gradient(90deg, var(--black), var(--bone), var(--black)),
-    linear-gradient(180deg, var(--black), var(--bone), var(--black));
-  opacity: 0.06;
+    linear-gradient(150deg, var(--bg) 0%, var(--bg) 58%, var(--shade) 140%),
+    linear-gradient(180deg, var(--bg) 0%, var(--shade) 150%);
+  opacity: 0.18;
 }
 
 .section-inner {
@@ -84,7 +85,7 @@ p {
 }
 
 h1 {
-  color: var(--bone);
+  color: var(--text);
   font-size: clamp(5rem, 17vw, 15rem);
   font-weight: 950;
   letter-spacing: 0;
@@ -94,21 +95,21 @@ h1 {
 h1 span {
   display: block;
   margin-top: clamp(18px, 2.8vw, 34px);
-  color: var(--pink);
+  color: var(--accent);
   font-size: clamp(1.35rem, 4.3vw, 4.3rem);
   line-height: 0.95;
 }
 
 h2 {
-  color: var(--bone);
-  font-size: clamp(2.3rem, 6vw, 6.5rem);
+  color: var(--text);
+  font-size: clamp(2rem, 4.6vw, 4.7rem);
   font-weight: 940;
   letter-spacing: 0;
   line-height: 0.92;
 }
 
 h3 {
-  color: var(--bone);
+  color: var(--text);
   font-size: clamp(1.25rem, 2.4vw, 2rem);
   font-weight: 900;
   letter-spacing: 0;
@@ -122,8 +123,8 @@ h3 {
 .overview-copy,
 .frame-copy {
   width: min(760px, 100%);
-  margin-top: clamp(28px, 5vh, 56px);
-  color: var(--bone);
+  margin-top: clamp(22px, 4vh, 42px);
+  color: var(--text);
   font-size: clamp(1.05rem, 1.8vw, 1.42rem);
   line-height: 1.56;
 }
@@ -137,20 +138,27 @@ h3 {
   align-items: center;
   justify-content: center;
   min-height: 56px;
-  border: 1px solid var(--bone);
+  border: 1px solid var(--line);
   border-radius: 8px;
-  color: var(--bone);
-  background: var(--black);
+  color: var(--text);
+  background: var(--bg);
   font-weight: 950;
   letter-spacing: 0;
   text-decoration: none;
   cursor: pointer;
-  box-shadow: 0 0 5px var(--pink);
+  box-shadow: 0 8px 18px var(--shade);
   transition:
     transform 180ms ease,
     box-shadow 180ms ease,
     background 180ms ease,
     color 180ms ease;
+}
+
+.scroll-cta,
+.load-button,
+.generate-button {
+  color: var(--bg);
+  background: var(--line);
 }
 
 .scroll-cta {
@@ -164,24 +172,26 @@ h3 {
 .stop-button:hover:not(:disabled),
 .reload-link:hover {
   transform: translateY(-3px);
-  box-shadow: 0 0 9px var(--pink);
+  box-shadow:
+    0 0 0 1px var(--line),
+    0 12px 24px var(--shade);
 }
 
 .load-inner,
 .chat-inner {
   display: grid;
-  gap: clamp(20px, 4vh, 36px);
+  gap: clamp(14px, 2.5vh, 26px);
 }
 
 .load-frame,
 .chat-form {
   min-width: 0;
-  border: 1px solid var(--brown);
+  border: 1px solid var(--line);
   border-radius: 8px;
-  background: var(--black);
+  background: var(--bg);
   box-shadow:
-    0 0 0 1px var(--brown),
-    0 0 9px var(--brown);
+    0 0 0 1px var(--shade),
+    0 10px 32px var(--shade);
 }
 
 .load-frame {
@@ -191,15 +201,15 @@ h3 {
 .start-load-frame {
   display: grid;
   justify-items: start;
-  min-height: min(56svh, 520px);
+  min-height: min(48svh, 440px);
   align-content: center;
-  padding: clamp(24px, 5vw, 70px);
+  padding: clamp(20px, 4vw, 48px);
 }
 
 .load-button {
   width: min(760px, 100%);
-  min-height: clamp(96px, 17vh, 180px);
-  font-size: clamp(2.2rem, 7vw, 7rem);
+  min-height: clamp(84px, 14vh, 140px);
+  font-size: clamp(2rem, 6vw, 5.6rem);
   animation: loadButtonPulse 1700ms ease-in-out infinite;
 }
 
@@ -216,37 +226,37 @@ h3 {
 .progress-track {
   height: 16px;
   overflow: hidden;
-  border: 1px solid var(--bone);
+  border: 1px solid var(--line);
   border-radius: 999px;
-  background: var(--brown);
+  background: var(--shade);
 }
 
 .progress-fill {
   height: 100%;
   width: 0;
   border-radius: inherit;
-  background: var(--pink);
-  box-shadow: 0 0 5px var(--pink);
+  background: var(--line);
+  box-shadow: none;
   transition: width 420ms ease;
 }
 
 .current-message,
 .error-message {
   margin-top: 16px;
-  color: var(--bone);
+  color: var(--text);
   font-weight: 780;
   line-height: 1.4;
 }
 
 .error-message {
-  color: var(--bone);
+  color: var(--text);
 }
 
 .step-list {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
-  margin: 24px 0 0;
+  gap: 8px;
+  margin: 18px 0 0;
   padding: 0;
   list-style: none;
 }
@@ -256,13 +266,13 @@ h3 {
   grid-template-columns: 42px 1fr;
   gap: 12px;
   align-items: center;
-  min-height: 70px;
-  padding: 12px;
-  border: 1px solid var(--brown);
+  min-height: 54px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
   border-radius: 8px;
-  color: var(--bone);
-  background: var(--black);
-  font-size: 0.95rem;
+  color: var(--text);
+  background: var(--bg);
+  font-size: 0.86rem;
   line-height: 1.3;
   transition:
     border-color 220ms ease,
@@ -273,15 +283,15 @@ h3 {
 }
 
 .step-list li.done {
-  border-color: var(--brown);
-  background: var(--brown);
+  border-color: var(--line);
+  background: var(--shade);
 }
 
 .step-list li.active {
-  border-color: var(--pink);
-  color: var(--bone);
-  background: var(--black);
-  box-shadow: 0 0 6px var(--pink);
+  border-color: var(--line);
+  color: var(--text);
+  background: var(--bg);
+  box-shadow: 0 0 0 1px var(--line);
   transform: translateY(-4px);
   animation: stepGlow 850ms ease-in-out infinite;
 }
@@ -296,23 +306,23 @@ h3 {
 .config-frame-inner {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 0.85fr);
-  gap: 16px;
-  padding: clamp(16px, 2.6vw, 28px);
+  gap: 12px;
+  padding: clamp(12px, 1.8vw, 20px);
 }
 
 .config-panel {
   min-width: 0;
-  padding: clamp(14px, 2vw, 22px);
-  border: 1px solid var(--brown);
+  padding: clamp(12px, 1.6vw, 18px);
+  border: 1px solid var(--line);
   border-radius: 8px;
-  background: var(--black);
+  background: var(--bg);
 }
 
 .config-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
-  margin-top: 16px;
+  gap: 7px;
+  margin-top: 12px;
 }
 
 .tensor-config-grid {
@@ -321,18 +331,18 @@ h3 {
 
 .config-row {
   min-width: 0;
-  min-height: 70px;
-  padding: 10px 11px;
-  border: 1px solid var(--brown);
+  min-height: 52px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
   border-radius: 8px;
-  background: var(--black);
+  background: var(--bg);
 }
 
 .config-row span,
 .chat-textarea-label span,
 .token-limit-field span {
   display: block;
-  color: var(--bone);
+  color: var(--text);
   font-size: 0.75rem;
   font-weight: 900;
   letter-spacing: 0;
@@ -342,8 +352,8 @@ h3 {
 .config-row strong {
   display: block;
   margin-top: 8px;
-  color: var(--bone);
-  font-size: 0.94rem;
+  color: var(--text);
+  font-size: 0.84rem;
   line-height: 1.25;
   overflow-wrap: anywhere;
 }
@@ -351,24 +361,24 @@ h3 {
 .attention-strip {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(28px, 1fr));
-  gap: 6px;
-  margin-top: 14px;
+  gap: 5px;
+  margin-top: 10px;
 }
 
 .attention-strip span {
   display: grid;
-  min-height: 28px;
+  min-height: 24px;
   place-items: center;
   border-radius: 6px;
-  color: var(--bone);
-  background: var(--pink);
+  color: var(--text);
+  background: var(--shade);
   font-size: 0.78rem;
   font-weight: 950;
 }
 
 .attention-strip .local {
-  background: var(--brown);
-  color: var(--bone);
+  background: var(--shade);
+  color: var(--text);
 }
 
 .reload-link {
@@ -376,9 +386,9 @@ h3 {
   justify-self: start;
   min-height: 44px;
   padding: 0 18px;
-  color: var(--bone);
-  background: var(--brown);
-  box-shadow: 0 0 4px var(--brown);
+  color: var(--text);
+  background: var(--bg);
+  box-shadow: 0 0 4px var(--shade);
 }
 
 .chat-heading {
@@ -403,10 +413,10 @@ h3 {
   align-items: center;
   min-height: 34px;
   padding: 0 12px;
-  border: 1px solid var(--brown);
+  border: 1px solid var(--line);
   border-radius: 999px;
-  color: var(--bone);
-  background: var(--black);
+  color: var(--text);
+  background: var(--bg);
   font-size: 0.82rem;
   font-weight: 900;
   white-space: nowrap;
@@ -424,10 +434,10 @@ h3 {
 .chat-textarea-label textarea,
 .token-limit-field input {
   width: 100%;
-  border: 1px solid var(--brown);
+  border: 1px solid var(--line);
   border-radius: 8px;
-  color: var(--bone);
-  background: var(--black);
+  color: var(--text);
+  background: var(--bg);
   outline: none;
   transition:
     border-color 160ms ease,
@@ -436,12 +446,12 @@ h3 {
 
 .chat-textarea-label textarea:focus,
 .token-limit-field input:focus {
-  border-color: var(--pink);
-  box-shadow: 0 0 0 1px var(--pink);
+  border-color: var(--line);
+  box-shadow: 0 0 0 1px var(--line);
 }
 
 .chat-textarea-label textarea {
-  min-height: 300px;
+  min-height: 260px;
   resize: none;
   overflow: hidden;
   padding: 18px;
@@ -477,13 +487,14 @@ h3 {
 }
 
 .generate-button {
-  background: var(--black);
+  background: var(--line);
+  color: var(--bg);
 }
 
 .stop-button {
-  color: var(--bone);
-  background: var(--brown);
-  box-shadow: 0 0 4px var(--brown);
+  color: var(--text);
+  background: var(--bg);
+  box-shadow: 0 8px 18px var(--shade);
 }
 
 .generate-button:disabled,
@@ -508,24 +519,24 @@ h3 {
 @keyframes loadButtonPulse {
   0%,
   100% {
-    box-shadow: 0 0 5px var(--pink);
+    transform: translateY(0) scale(1);
+    box-shadow: 0 8px 18px var(--shade);
   }
   50% {
-    box-shadow:
-      0 0 8px var(--pink),
-      0 0 14px var(--brown);
+    transform: translateY(-2px) scale(1.01);
+    box-shadow: 0 14px 28px var(--shade);
   }
 }
 
 @keyframes stepGlow {
   0%,
   100% {
-    box-shadow: 0 0 4px var(--pink);
+    box-shadow: 0 0 0 1px var(--line);
   }
   50% {
     box-shadow:
-      0 0 7px var(--pink),
-      0 0 11px var(--brown);
+      0 0 0 2px var(--line),
+      0 10px 18px var(--shade);
   }
 }
 
