@@ -7,7 +7,7 @@ const modelsRoot = resolve(__dirname, "../models");
 const selectedModelRoot = resolve(modelsRoot, currentModelExportName);
 
 export default defineConfig({
-  base: process.env.GITHUB_PAGES === "true" ? "/broslm/" : "/",
+  base: process.env.GITHUB_PAGES === "true" ? "./" : "/",
   server: {
     port: 5173,
     strictPort: false,
