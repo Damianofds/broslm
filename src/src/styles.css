@@ -682,6 +682,97 @@ h3 {
   .load-button {
     min-height: 116px;
   }
+
+  .chat-section {
+    padding: 16px;
+  }
+
+  .chat-inner {
+    gap: 10px;
+  }
+
+  .chat-heading {
+    gap: 8px;
+  }
+
+  .chat-heading h2 {
+    font-size: clamp(1.65rem, 7.2vw, 1.95rem);
+  }
+
+  .status-pills,
+  .token-stats {
+    gap: 6px;
+  }
+
+  .status-pills span,
+  .token-stats span {
+    min-height: 28px;
+    padding: 0 8px;
+    font-size: 0.7rem;
+  }
+
+  .chat-form {
+    padding: 12px;
+  }
+
+  .chat-textarea-label {
+    gap: 6px;
+  }
+
+  .chat-textarea-label textarea {
+    min-height: clamp(150px, 28svh, 190px);
+    padding: 12px;
+    font-size: 0.9rem;
+    line-height: 1.45;
+  }
+
+  .chat-controls {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 10px;
+  }
+
+  .chat-textarea-label span,
+  .token-limit-field span {
+    font-size: 0.64rem;
+  }
+
+  .token-limit-field {
+    min-width: 0;
+    gap: 4px;
+  }
+
+  .token-limit-field input {
+    min-height: 38px;
+    padding: 0 8px;
+    font-size: 0.88rem;
+  }
+
+  .token-stats,
+  .chat-actions {
+    grid-column: 1 / -1;
+  }
+
+  .token-stats {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .token-stats span {
+    justify-content: center;
+    min-width: 0;
+    padding: 0 4px;
+  }
+
+  .chat-actions {
+    gap: 8px;
+  }
+
+  .generate-button,
+  .stop-button {
+    min-height: 40px;
+    padding: 0 12px;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
