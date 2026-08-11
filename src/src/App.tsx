@@ -118,6 +118,7 @@ export default function App() {
     chatText.length > 0;
 
   const loadFrame = resolveLoadFrame(loadState, summary, visibleStepIndex);
+  const canEnterChat = loadState === "ready" && tokenizerState === "ready" && summary !== null;
 
   function loadModel() {
     if (loadState === "loading") {
@@ -335,31 +336,34 @@ export default function App() {
         summary={summary}
         tokenizerError={tokenizerError}
         visibleStepIndex={visibleStepIndex}
+        canEnterChat={canEnterChat}
         onLoadModel={loadModel}
       />
 
-      <ChatSection
-        canGenerate={canGenerate}
-        chatText={chatText}
-        generatedTokenCount={generatedTokenIds.length}
-        generationError={generationError}
-        generationState={generationState}
-        loadState={loadState}
-        maxNewTokens={maxNewTokens}
-        temperature={temperature}
-        textareaRef={chatTextareaRef}
-        tokenCount={chatTokenPreview ?? inputTokenCount}
-        tokenizerState={tokenizerState}
-        topK={topK}
-        onChatTextChange={(nextText) => setChatText(normalizeLineBreaks(nextText))}
-        onGenerate={() => {
-          void generateCompletion();
-        }}
-        onMaxNewTokensChange={setMaxNewTokens}
-        onTemperatureChange={setTemperature}
-        onStop={stopGeneration}
-        onTopKChange={setTopK}
-      />
+      {canEnterChat && (
+        <ChatSection
+          canGenerate={canGenerate}
+          chatText={chatText}
+          generatedTokenCount={generatedTokenIds.length}
+          generationError={generationError}
+          generationState={generationState}
+          loadState={loadState}
+          maxNewTokens={maxNewTokens}
+          temperature={temperature}
+          textareaRef={chatTextareaRef}
+          tokenCount={chatTokenPreview ?? inputTokenCount}
+          tokenizerState={tokenizerState}
+          topK={topK}
+          onChatTextChange={(nextText) => setChatText(normalizeLineBreaks(nextText))}
+          onGenerate={() => {
+            void generateCompletion();
+          }}
+          onMaxNewTokensChange={setMaxNewTokens}
+          onTemperatureChange={setTemperature}
+          onStop={stopGeneration}
+          onTopKChange={setTopK}
+        />
+      )}
     </main>
   );
 }
@@ -376,10 +380,8 @@ function OverviewSection() {
           A raw neural model running locally in the browser. Scroll down, load the weights,
           and try the experience without a server-side inference API.
         </p>
-        <a className="scroll-cta" href="#load-model">
-          Scroll to try
-        </a>
       </div>
+      <ScrollCue href="#load-model" label="Discover more" />
     </section>
   );
 }
@@ -392,6 +394,7 @@ function LoadModelSection({
   summary,
   tokenizerError,
   visibleStepIndex,
+  canEnterChat,
   onLoadModel,
 }: {
   error: string | null;
@@ -401,6 +404,7 @@ function LoadModelSection({
   summary: LoadedModelSummary | null;
   tokenizerError: string | null;
   visibleStepIndex: number;
+  canEnterChat: boolean;
   onLoadModel: () => void;
 }) {
   return (
@@ -426,7 +430,17 @@ function LoadModelSection({
           {frame === "config" && summary && <ConfigFrame summary={summary} onLoadModel={onLoadModel} />}
         </div>
       </div>
+      {canEnterChat && <ScrollCue href="#chat" label="Try the chat demo" />}
     </section>
+  );
+}
+
+function ScrollCue({ href, label }: { href: string; label: string }) {
+  return (
+    <a className="scroll-cue" href={href}>
+      <span className="scroll-cue-label">{label}</span>
+      <span className="scroll-cue-arrow" aria-hidden="true" />
+    </a>
   );
 }
 

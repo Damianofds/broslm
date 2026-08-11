@@ -53,7 +53,6 @@ a {
   align-items: center;
   min-height: 100svh;
   padding: clamp(18px, 3vw, 40px);
-  border-bottom: 1px solid var(--line);
   scroll-snap-align: start;
   scroll-snap-stop: normal;
 }
@@ -67,6 +66,11 @@ a {
     linear-gradient(150deg, var(--bg) 0%, var(--bg) 58%, var(--shade) 140%),
     linear-gradient(180deg, var(--bg) 0%, var(--shade) 150%);
   opacity: 0.18;
+}
+
+.overview-section,
+.load-section {
+  padding-bottom: clamp(96px, 13vh, 136px);
 }
 
 .section-inner {
@@ -129,7 +133,6 @@ h3 {
   line-height: 1.56;
 }
 
-.scroll-cta,
 .load-button,
 .generate-button,
 .stop-button,
@@ -154,19 +157,12 @@ h3 {
     color 180ms ease;
 }
 
-.scroll-cta,
 .load-button,
 .generate-button {
   color: var(--bg);
   background: var(--line);
 }
 
-.scroll-cta {
-  margin-top: 36px;
-  padding: 0 24px;
-}
-
-.scroll-cta:hover,
 .load-button:hover:not(:disabled),
 .generate-button:hover:not(:disabled),
 .stop-button:hover:not(:disabled),
@@ -175,6 +171,55 @@ h3 {
   box-shadow:
     0 0 0 1px var(--line),
     0 12px 24px var(--shade);
+}
+
+.scroll-cue {
+  position: absolute;
+  bottom: clamp(18px, 4vh, 34px);
+  left: 50%;
+  z-index: 2;
+  display: grid;
+  justify-items: center;
+  gap: 10px;
+  min-width: min(260px, calc(100% - 36px));
+  color: var(--accent);
+  text-align: center;
+  text-decoration: none;
+  animation: scrollCueFloat 1500ms ease-in-out infinite;
+}
+
+.scroll-cue-label {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 42px;
+  padding: 0 18px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  color: var(--accent);
+  background: var(--bg);
+  font-size: 0.9rem;
+  font-weight: 950;
+  box-shadow: 0 8px 18px var(--shade);
+  transition:
+    background 180ms ease,
+    color 180ms ease,
+    box-shadow 180ms ease;
+}
+
+.scroll-cue-arrow {
+  display: block;
+  width: 18px;
+  height: 18px;
+  border-right: 2px solid var(--accent);
+  border-bottom: 2px solid var(--accent);
+  transform: rotate(45deg);
+}
+
+.scroll-cue:hover .scroll-cue-label {
+  color: var(--bg);
+  background: var(--accent);
+  box-shadow: 0 12px 24px var(--shade);
 }
 
 .load-inner,
@@ -525,6 +570,16 @@ h3 {
   50% {
     transform: translateY(-2px) scale(1.01);
     box-shadow: 0 14px 28px var(--shade);
+  }
+}
+
+@keyframes scrollCueFloat {
+  0%,
+  100% {
+    transform: translate(-50%, 0);
+  }
+  50% {
+    transform: translate(-50%, -8px);
   }
 }
 
