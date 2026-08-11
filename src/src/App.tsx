@@ -463,10 +463,10 @@ function StartLoadFrame({
         onClick={onLoadModel}
         type="button"
       >
-        Load model
+        Start
       </button>
       <p className="frame-copy">
-        The browser will fetch the model files, validate them, and keep the network quiet after
+        The browser will fetch the model weights, validate them, and keep the network quiet after
         the worker is ready.
       </p>
       {error && <p className="error-message">{error}</p>}
