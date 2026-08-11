@@ -121,7 +121,27 @@ h3 {
 }
 
 .overview-inner {
+  --overview-text-width: min(1040px, 100%);
+  display: grid;
+  justify-items: start;
   max-width: 1160px;
+}
+
+.overview-inner h1,
+.overview-inner h1 span,
+.overview-copy {
+  width: var(--overview-text-width);
+}
+
+.overview-inner h1 {
+  font-size: clamp(5.2rem, 15.4vw, 14.2rem);
+  white-space: nowrap;
+}
+
+.overview-inner h1 span {
+  font-size: clamp(1.52rem, 4.38vw, 4.18rem);
+  word-spacing: clamp(0.1rem, 0.74vw, 0.58rem);
+  white-space: nowrap;
 }
 
 .overview-copy,
@@ -131,6 +151,15 @@ h3 {
   color: var(--text);
   font-size: clamp(1.05rem, 1.8vw, 1.42rem);
   line-height: 1.56;
+}
+
+.overview-copy {
+  width: var(--overview-text-width);
+  max-width: none;
+  font-size: clamp(1rem, 1.45vw, 1.35rem);
+  line-height: 1.5;
+  text-wrap: balance;
+  word-spacing: clamp(0.02rem, 0.22vw, 0.2rem);
 }
 
 .load-button,
@@ -621,12 +650,19 @@ h3 {
 }
 
 @media (max-width: 620px) {
-  h1 {
+  .overview-inner h1 {
     font-size: clamp(4.4rem, 23vw, 7.4rem);
+    white-space: normal;
   }
 
-  h1 span {
+  .overview-inner h1 span {
     font-size: clamp(1.25rem, 8vw, 2.4rem);
+    white-space: normal;
+    word-spacing: 0.08rem;
+  }
+
+  .overview-copy {
+    word-spacing: 0;
   }
 
   .load-button {
