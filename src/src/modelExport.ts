@@ -1,3 +1,7 @@
-export const currentModelExportName = "output_20260726_105535";
-export const modelBaseUrl = `/models/${currentModelExportName}/`;
-export const tokenizerUrl = "/tokenizer/tinystories-tokenizer.json";
+import { currentModelExportName } from "./modelName";
+
+const publicBaseUrl = import.meta.env.BASE_URL;
+
+export { currentModelExportName };
+export const modelBaseUrl = `${publicBaseUrl}models/${currentModelExportName}/`;
+export const tokenizerUrl = `${publicBaseUrl}tokenizer/tinystories-tokenizer.json`;

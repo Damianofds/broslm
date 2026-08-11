@@ -1,12 +1,13 @@
 import { cpSync, createReadStream, existsSync, mkdirSync, statSync } from "node:fs";
 import { extname, join, resolve } from "node:path";
 import { defineConfig, type Plugin } from "vite";
-import { currentModelExportName } from "./src/modelExport";
+import { currentModelExportName } from "./src/modelName";
 
 const modelsRoot = resolve(__dirname, "../models");
 const selectedModelRoot = resolve(modelsRoot, currentModelExportName);
 
 export default defineConfig({
+  base: process.env.GITHUB_PAGES === "true" ? "/broslm/" : "/",
   server: {
     port: 5173,
     strictPort: false,
