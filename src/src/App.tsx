@@ -199,7 +199,7 @@ export default function App() {
 
     worker.postMessage({
       type: "load-model",
-      requestId: crypto.randomUUID(),
+      requestId: createRequestId(),
       baseUrl: new URL(modelBaseUrl, window.location.href).toString(),
       scratchSequenceLength: 256,
     } satisfies LoaderWorkerRequest);
@@ -308,7 +308,7 @@ export default function App() {
       return Promise.reject(new Error("Inference worker is not running."));
     }
 
-    const requestId = crypto.randomUUID();
+    const requestId = createRequestId();
     const request: LoaderWorkerRequest = {
       type: "next-token",
       requestId,
@@ -760,6 +760,21 @@ function clampTopK(value: number): number {
 
 function normalizeLineBreaks(value: string): string {
   return value.replace(/\r\n?/g, "\n").replace(/\n+/g, "\n");
+}
+
+function createRequestId(): string {
+  const cryptoApi = globalThis.crypto;
+  if (typeof cryptoApi?.randomUUID === "function") {
+    return cryptoApi.randomUUID();
+  }
+
+  if (typeof cryptoApi?.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    cryptoApi.getRandomValues(bytes);
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  return `request-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
 function rejectPendingNextTokenRequests(
