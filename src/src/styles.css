@@ -274,10 +274,11 @@ h3 {
 
 .start-load-frame {
   display: grid;
-  justify-items: start;
+  justify-items: center;
   min-height: min(48svh, 440px);
   align-content: center;
   padding: clamp(20px, 4vw, 48px);
+  text-align: center;
 }
 
 .load-button {
