@@ -38,6 +38,10 @@ const steps: readonly Step[] = [
   { stage: "ready", label: "Keep model resident in the worker" },
 ];
 
+const defaultMaxNewTokens = 120;
+const defaultTemperature = 0.95;
+const defaultTopK = 10;
+
 export default function App() {
   const workerRef = useRef<Worker | null>(null);
   const tokenizerRef = useRef<ByteLevelBpeTokenizer | null>(null);
@@ -54,9 +58,9 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [tokenizerError, setTokenizerError] = useState<string | null>(null);
   const [chatText, setChatText] = useState("Once upon a time");
-  const [maxNewTokens, setMaxNewTokens] = useState(40);
-  const [temperature, setTemperature] = useState(0.8);
-  const [topK, setTopK] = useState(40);
+  const [maxNewTokens, setMaxNewTokens] = useState(defaultMaxNewTokens);
+  const [temperature, setTemperature] = useState(defaultTemperature);
+  const [topK, setTopK] = useState(defaultTopK);
   const [generationState, setGenerationState] = useState<GenerationState>("idle");
   const [generationError, setGenerationError] = useState<string | null>(null);
   const [inputTokenCount, setInputTokenCount] = useState<number | null>(null);
@@ -232,7 +236,8 @@ export default function App() {
       return;
     }
 
-    const baseText = chatText;
+    const baseText = normalizeLineBreaks(chatText);
+    setChatText(baseText);
     const inputIds = tokenizer.encode(baseText);
     const availableNewTokens = summary.config.maximumSequenceLength - inputIds.length;
     if (availableNewTokens <= 0) {
@@ -268,7 +273,7 @@ export default function App() {
         nextInputIds.push(tokenId);
         nextGeneratedTokenIds.push(tokenId);
         setGeneratedTokenIds([...nextGeneratedTokenIds]);
-        setChatText(baseText + tokenizer.decode(nextGeneratedTokenIds));
+        setChatText(normalizeLineBreaks(baseText + tokenizer.decode(nextGeneratedTokenIds)));
       }
 
       if (generationRunRef.current === runId) {
@@ -346,7 +351,7 @@ export default function App() {
         tokenCount={chatTokenPreview ?? inputTokenCount}
         tokenizerState={tokenizerState}
         topK={topK}
-        onChatTextChange={setChatText}
+        onChatTextChange={(nextText) => setChatText(normalizeLineBreaks(nextText))}
         onGenerate={() => {
           void generateCompletion();
         }}
@@ -734,23 +739,27 @@ function generationTitle(generationState: GenerationState): string {
 
 function clampTokenLimit(value: number): number {
   if (!Number.isFinite(value)) {
-    return 40;
+    return defaultMaxNewTokens;
   }
   return Math.max(1, Math.min(120, Math.round(value)));
 }
 
 function clampTemperature(value: number): number {
   if (!Number.isFinite(value)) {
-    return 0.8;
+    return defaultTemperature;
   }
   return Math.max(0, Math.min(2, Math.round(value * 100) / 100));
 }
 
 function clampTopK(value: number): number {
   if (!Number.isFinite(value)) {
-    return 40;
+    return defaultTopK;
   }
   return Math.max(1, Math.min(200, Math.round(value)));
+}
+
+function normalizeLineBreaks(value: string): string {
+  return value.replace(/\r\n?/g, "\n").replace(/\n+/g, "\n");
 }
 
 function rejectPendingNextTokenRequests(
