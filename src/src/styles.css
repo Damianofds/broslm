@@ -70,7 +70,11 @@ a {
 
 .overview-section,
 .load-section {
-  padding-bottom: clamp(96px, 13vh, 136px);
+  padding-bottom: clamp(180px, 24vh, 260px);
+}
+
+.chat-section {
+  margin-top: clamp(84px, 12vh, 160px);
 }
 
 .section-inner {
@@ -204,7 +208,7 @@ h3 {
 
 .scroll-cue {
   position: absolute;
-  bottom: clamp(18px, 4vh, 34px);
+  bottom: clamp(72px, 10vh, 112px);
   left: 50%;
   z-index: 2;
   display: grid;
@@ -628,6 +632,15 @@ h3 {
 @media (max-width: 980px) {
   .landing-section {
     padding: clamp(24px, 5vw, 44px);
+  }
+
+  .overview-section,
+  .load-section {
+    padding-bottom: clamp(160px, 22vh, 220px);
+  }
+
+  .chat-section {
+    margin-top: clamp(72px, 10vh, 120px);
   }
 
   .step-list,
