@@ -18,5 +18,15 @@
     "noEmit": true,
     "jsx": "react-jsx"
   },
-  "include": ["src", "engine"]
+  "include": [
+    "App.tsx",
+    "main.tsx",
+    "modelExport.ts",
+    "modelName.ts",
+    "modelWorker.ts",
+    "tokenizer.ts",
+    "tokenizer.test.ts",
+    "vite-env.d.ts",
+    "engine"
+  ]
 }

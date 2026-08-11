@@ -1,7 +1,7 @@
 import { cpSync, createReadStream, existsSync, mkdirSync, statSync } from "node:fs";
 import { extname, join, resolve } from "node:path";
 import { defineConfig, type Plugin } from "vite";
-import { currentModelExportName } from "./src/modelName";
+import { currentModelExportName } from "./modelName";
 
 const modelsRoot = resolve(__dirname, "../models");
 const selectedModelRoot = resolve(modelsRoot, currentModelExportName);

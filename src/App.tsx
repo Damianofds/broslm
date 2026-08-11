@@ -4,7 +4,7 @@ import type {
   LoaderProgress,
   LoaderWorkerRequest,
   LoaderWorkerResponse,
-} from "../engine/src/loader";
+} from "./engine/src/loader";
 import { modelBaseUrl, tokenizerUrl } from "./modelExport";
 import {
   loadByteLevelBpeTokenizer,

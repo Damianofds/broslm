@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { createByteLevelBpeTokenizer } from "./tokenizer";
 
-const tokenizerJsonPath = new URL("../public/tokenizer/tinystories-tokenizer.json", import.meta.url);
+const tokenizerJsonPath = new URL("./public/tokenizer/tinystories-tokenizer.json", import.meta.url);
 
 describe("ByteLevel BPE tokenizer", () => {
   const tokenizer = createByteLevelBpeTokenizer(
