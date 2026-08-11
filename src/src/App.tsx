@@ -377,8 +377,8 @@ function OverviewSection() {
           <span>browser small language model</span>
         </h1>
         <p className="overview-copy">
-          A raw neural model running locally in the browser. Scroll down, load the weights,
-          and try the experience without a server-side inference API.
+          A raw neural model running locally in the browser. Load the weights, chat without a
+          server-side inference API.
         </p>
       </div>
       <ScrollCue href="#load-model" label="Discover more" />
