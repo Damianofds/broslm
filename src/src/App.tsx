@@ -118,7 +118,8 @@ export default function App() {
     chatText.length > 0;
 
   const loadFrame = resolveLoadFrame(loadState, summary, visibleStepIndex);
-  const canEnterChat = loadState === "ready" && tokenizerState === "ready" && summary !== null;
+  const canEnterChat =
+    loadFrame === "config" && loadState === "ready" && tokenizerState === "ready" && summary !== null;
 
   function loadModel() {
     if (loadState === "loading") {
