@@ -619,37 +619,33 @@ function ChatSection({
           </label>
 
           <div className="chat-controls">
-            <label className="token-limit-field">
-              <span>New tokens</span>
-              <input
-                max={120}
-                min={1}
-                onChange={(event) => onMaxNewTokensChange(clampTokenLimit(event.target.valueAsNumber))}
-                type="number"
-                value={maxNewTokens}
-              />
-            </label>
-            <label className="token-limit-field">
-              <span>Temperature</span>
-              <input
-                max={2}
-                min={0}
-                onChange={(event) => onTemperatureChange(clampTemperature(event.target.valueAsNumber))}
-                step={0.05}
-                type="number"
-                value={temperature}
-              />
-            </label>
-            <label className="token-limit-field">
-              <span>Top-k</span>
-              <input
-                max={200}
-                min={1}
-                onChange={(event) => onTopKChange(clampTopK(event.target.valueAsNumber))}
-                type="number"
-                value={topK}
-              />
-            </label>
+            <GenerationControl
+              label="New tokens"
+              max={120}
+              min={1}
+              onChange={(nextValue) => onMaxNewTokensChange(clampTokenLimit(nextValue))}
+              step={1}
+              value={maxNewTokens}
+              valueLabel={String(maxNewTokens)}
+            />
+            <GenerationControl
+              label="Temperature"
+              max={2}
+              min={0}
+              onChange={(nextValue) => onTemperatureChange(clampTemperature(nextValue))}
+              step={0.05}
+              value={temperature}
+              valueLabel={temperature.toFixed(2)}
+            />
+            <GenerationControl
+              label="Top-k"
+              max={200}
+              min={1}
+              onChange={(nextValue) => onTopKChange(clampTopK(nextValue))}
+              step={1}
+              value={topK}
+              valueLabel={String(topK)}
+            />
             <div className="token-stats">
               <span>{tokenCount ?? "-"} tokens</span>
               <span>{generatedTokenCount} generated</span>
@@ -674,6 +670,43 @@ function ChatSection({
         </form>
       </div>
     </section>
+  );
+}
+
+function GenerationControl({
+  label,
+  max,
+  min,
+  onChange,
+  step,
+  value,
+  valueLabel,
+}: {
+  label: string;
+  max: number;
+  min: number;
+  onChange: (value: number) => void;
+  step: number;
+  value: number;
+  valueLabel: string;
+}) {
+  return (
+    <label className="token-limit-field">
+      <span className="token-limit-header">
+        <span className="token-limit-label">{label}</span>
+        <strong>{valueLabel}</strong>
+      </span>
+      <input
+        aria-label={label}
+        aria-valuetext={valueLabel}
+        max={max}
+        min={min}
+        onChange={(event) => onChange(event.currentTarget.valueAsNumber)}
+        step={step}
+        type="range"
+        value={value}
+      />
+    </label>
   );
 }
 

@@ -399,13 +399,13 @@ h3 {
 
 .config-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(142px, 100%), 1fr));
   gap: 7px;
   margin-top: 12px;
 }
 
 .tensor-config-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(156px, 100%), 1fr));
 }
 
 .config-row {
@@ -418,8 +418,8 @@ h3 {
 }
 
 .config-row span,
-.chat-textarea-label span,
-.token-limit-field span {
+.chat-textarea-label > span,
+.token-limit-label {
   display: block;
   color: var(--text);
   font-size: 0.75rem;
@@ -510,8 +510,7 @@ h3 {
   gap: 10px;
 }
 
-.chat-textarea-label textarea,
-.token-limit-field input {
+.chat-textarea-label textarea {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -523,8 +522,7 @@ h3 {
     box-shadow 160ms ease;
 }
 
-.chat-textarea-label textarea:focus,
-.token-limit-field input:focus {
+.chat-textarea-label textarea:focus {
   border-color: var(--line);
   box-shadow: 0 0 0 1px var(--line);
 }
@@ -551,12 +549,73 @@ h3 {
 .token-limit-field {
   display: grid;
   gap: 8px;
+  min-width: 0;
 }
 
-.token-limit-field input {
-  min-height: 48px;
-  padding: 0 12px;
-  font-weight: 850;
+.token-limit-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.token-limit-header strong {
+  color: var(--accent);
+  font-size: 0.86rem;
+  font-weight: 950;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.token-limit-field input[type="range"] {
+  width: 100%;
+  min-height: 32px;
+  padding: 0;
+  accent-color: var(--line);
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+  outline: none;
+}
+
+.token-limit-field input[type="range"]:focus-visible {
+  border-radius: 999px;
+  box-shadow: 0 0 0 2px var(--line);
+}
+
+.token-limit-field input[type="range"]::-webkit-slider-runnable-track {
+  height: 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--shade);
+}
+
+.token-limit-field input[type="range"]::-webkit-slider-thumb {
+  width: 22px;
+  height: 22px;
+  margin-top: -8px;
+  border: 2px solid var(--bg);
+  border-radius: 999px;
+  background: var(--line);
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.token-limit-field input[type="range"]::-moz-range-track {
+  height: 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--shade);
+}
+
+.token-limit-field input[type="range"]::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--bg);
+  border-radius: 999px;
+  background: var(--line);
 }
 
 .generate-button,
@@ -645,8 +704,6 @@ h3 {
 
   .step-list,
   .config-frame-inner,
-  .config-grid,
-  .tensor-config-grid,
   .chat-heading,
   .chat-controls {
     grid-template-columns: 1fr;
@@ -732,20 +789,33 @@ h3 {
     margin-top: 10px;
   }
 
-  .chat-textarea-label span,
-  .token-limit-field span {
+  .chat-textarea-label > span,
+  .token-limit-label {
     font-size: 0.64rem;
   }
 
   .token-limit-field {
-    min-width: 0;
     gap: 4px;
   }
 
-  .token-limit-field input {
-    min-height: 38px;
-    padding: 0 8px;
-    font-size: 0.88rem;
+  .token-limit-header {
+    gap: 5px;
+  }
+
+  .token-limit-header strong {
+    font-size: 0.74rem;
+  }
+
+  .token-limit-field input[type="range"] {
+    min-height: 28px;
+  }
+
+  .config-grid {
+    grid-template-columns: repeat(auto-fit, minmax(min(118px, 100%), 1fr));
+  }
+
+  .tensor-config-grid {
+    grid-template-columns: repeat(auto-fit, minmax(min(130px, 100%), 1fr));
   }
 
   .token-stats,
