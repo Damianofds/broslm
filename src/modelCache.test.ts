@@ -1,4 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
+import {
+  modelAssetCacheHitHeaderValue,
+  modelAssetCacheStatusHeader,
+} from "./engine/src/modelAssetFetch";
 import { createModelCacheFetch } from "./modelCache";
 
 describe("createModelCacheFetch", () => {
@@ -13,6 +17,9 @@ describe("createModelCacheFetch", () => {
 
     await expect(firstResponse.text()).resolves.toBe("cached model bytes");
     await expect(secondResponse.text()).resolves.toBe("cached model bytes");
+    expect(secondResponse.headers.get(modelAssetCacheStatusHeader)).toBe(
+      modelAssetCacheHitHeaderValue,
+    );
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 

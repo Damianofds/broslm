@@ -1,4 +1,8 @@
 import { currentModelExportName } from "./modelExport";
+import {
+  modelAssetCacheHitHeaderValue,
+  modelAssetCacheStatusHeader,
+} from "./engine/src/modelAssetFetch";
 
 const cacheName = `broslm-model-${currentModelExportName}`;
 
@@ -24,7 +28,7 @@ export function createModelCacheFetch(options: ModelCacheFetchOptions = {}): typ
     const cache = await openModelCache(cacheStorage);
     const cachedResponse = cache ? await matchModelCache(cache, request) : undefined;
     if (cachedResponse) {
-      return cachedResponse;
+      return withCacheHitHeader(cachedResponse);
     }
 
     const response = await fetchImpl(request);
@@ -33,6 +37,16 @@ export function createModelCacheFetch(options: ModelCacheFetchOptions = {}): typ
     }
     return response;
   };
+}
+
+function withCacheHitHeader(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set(modelAssetCacheStatusHeader, modelAssetCacheHitHeaderValue);
+  return new Response(response.body, {
+    headers,
+    status: response.status,
+    statusText: response.statusText,
+  });
 }
 
 export async function clearModelCache(

@@ -54,6 +54,7 @@ export default function App() {
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [tokenizerState, setTokenizerState] = useState<TokenizerState>("idle");
   const [progress, setProgress] = useState<LoaderProgress | null>(null);
+  const [transientProgressMessage, setTransientProgressMessage] = useState<string | null>(null);
   const [actualStepIndex, setActualStepIndex] = useState(-1);
   const [visibleStepIndex, setVisibleStepIndex] = useState(-1);
   const [summary, setSummary] = useState<LoadedModelSummary | null>(null);
@@ -135,6 +136,7 @@ export default function App() {
     );
     setLoadState("loading");
     setProgress(null);
+    setTransientProgressMessage(null);
     setActualStepIndex(-1);
     setVisibleStepIndex(-1);
     setSummary(null);
@@ -157,6 +159,14 @@ export default function App() {
 
       if (message.type === "model-progress") {
         setProgress(message.progress);
+        if (message.progress.source === "cache") {
+          setTransientProgressMessage(message.progress.message);
+          window.setTimeout(() => {
+            setTransientProgressMessage((current) =>
+              current === message.progress.message ? null : current,
+            );
+          }, 1200);
+        }
         setActualStepIndex((current) =>
           Math.max(current, stepIndexForStage(message.progress.stage)),
         );
@@ -343,6 +353,7 @@ export default function App() {
         progress={progress}
         summary={summary}
         tokenizerError={tokenizerError}
+        transientProgressMessage={transientProgressMessage}
         visibleStepIndex={visibleStepIndex}
         canEnterChat={canEnterChat}
         onLoadModel={loadModel}
@@ -401,6 +412,7 @@ function LoadModelSection({
   progress,
   summary,
   tokenizerError,
+  transientProgressMessage,
   visibleStepIndex,
   canEnterChat,
   onLoadModel,
@@ -411,6 +423,7 @@ function LoadModelSection({
   progress: LoaderProgress | null;
   summary: LoadedModelSummary | null;
   tokenizerError: string | null;
+  transientProgressMessage: string | null;
   visibleStepIndex: number;
   canEnterChat: boolean;
   onLoadModel: () => void;
@@ -432,6 +445,7 @@ function LoadModelSection({
             <LoadingFrame
               loadState={loadState}
               progress={progress}
+              transientProgressMessage={transientProgressMessage}
               visibleStepIndex={visibleStepIndex}
             />
           )}
@@ -486,10 +500,12 @@ function StartLoadFrame({
 function LoadingFrame({
   loadState,
   progress,
+  transientProgressMessage,
   visibleStepIndex,
 }: {
   loadState: LoadState;
   progress: LoaderProgress | null;
+  transientProgressMessage: string | null;
   visibleStepIndex: number;
 }) {
   return (
@@ -499,8 +515,8 @@ function LoadingFrame({
       </div>
 
       <p className="current-message">
-        {currentStepMessage(visibleStepIndex, loadState)}
-        {progress?.loadedBytes && progress.totalBytes
+        {transientProgressMessage ?? currentStepMessage(visibleStepIndex, loadState)}
+        {!transientProgressMessage && progress?.loadedBytes && progress.totalBytes
           ? ` / ${formatBytes(progress.loadedBytes)} of ${formatBytes(progress.totalBytes)}`
           : ""}
       </p>

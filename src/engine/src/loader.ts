@@ -1,4 +1,5 @@
 import { nextToken } from "./model";
+import { isModelAssetCacheHit, type ModelAssetFetchSource } from "./modelAssetFetch";
 
 export type AttentionKind = "global" | "local";
 
@@ -196,6 +197,7 @@ export interface LoaderProgress {
     | "scratch-allocated"
     | "ready";
   message: string;
+  source?: "network" | "cache";
   loadedBytes?: number;
   totalBytes?: number;
 }
@@ -251,14 +253,20 @@ export async function loadModel(options: LoadModelOptions): Promise<LoadedModel>
     message: "Downloading weights.bin",
     totalBytes: weightsIndex.totalByteLength,
   });
-  const weightsBuffer = await fetchArrayBuffer(fetcher, weightsBinaryUrl, (loadedBytes, totalBytes) => {
-    report({
-      stage: "weights-download-progress",
-      message: "Downloading weights.bin",
-      loadedBytes,
-      totalBytes: totalBytes ?? weightsIndex.totalByteLength,
-    });
-  });
+  const weightsBuffer = await fetchArrayBuffer(
+    fetcher,
+    weightsBinaryUrl,
+    (loadedBytes, totalBytes, source) => {
+      report({
+        stage: "weights-download-progress",
+        message:
+          source === "cache" ? "Model weights found in browser cache" : "Downloading weights.bin",
+        source,
+        loadedBytes,
+        totalBytes: totalBytes ?? weightsIndex.totalByteLength,
+      });
+    },
+  );
 
   report({
     stage: "weights-downloaded",
@@ -768,15 +776,25 @@ async function fetchJson<T>(fetcher: typeof fetch, url: string): Promise<T> {
 async function fetchArrayBuffer(
   fetcher: typeof fetch,
   url: string,
-  onProgress?: (loadedBytes: number, totalBytes?: number) => void,
+  onProgress?: (
+    loadedBytes: number,
+    totalBytes: number | undefined,
+    source: ModelAssetFetchSource,
+  ) => void,
 ): Promise<ArrayBuffer> {
   const response = await fetcher(url);
   if (!response.ok) {
     throw new Error(`Failed to download ${url}: HTTP ${response.status}`);
   }
+  const source: ModelAssetFetchSource = isModelAssetCacheHit(response) ? "cache" : "network";
+  if (source === "cache") {
+    onProgress?.(0, getContentLength(response), "cache");
+  }
   if (!response.body) {
     const buffer = await response.arrayBuffer();
-    onProgress?.(buffer.byteLength, getContentLength(response));
+    if (source === "network") {
+      onProgress?.(buffer.byteLength, getContentLength(response), "network");
+    }
     return buffer;
   }
 
@@ -793,7 +811,9 @@ async function fetchArrayBuffer(
 
     chunks.push(value);
     loadedBytes += value.byteLength;
-    onProgress?.(loadedBytes, totalBytes);
+    if (source === "network") {
+      onProgress?.(loadedBytes, totalBytes, "network");
+    }
   }
 
   const bytes = new Uint8Array(loadedBytes);
@@ -803,7 +823,9 @@ async function fetchArrayBuffer(
     offset += chunk.byteLength;
   }
 
-  onProgress?.(loadedBytes, totalBytes);
+  if (source === "network") {
+    onProgress?.(loadedBytes, totalBytes, "network");
+  }
   return bytes.buffer;
 }
 
