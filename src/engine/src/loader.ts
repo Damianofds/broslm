@@ -311,6 +311,7 @@ export async function loadModel(options: LoadModelOptions): Promise<LoadedModel>
 
 export function installLoaderWorker(
   selfScope: LoaderWorkerScope = globalThis as unknown as LoaderWorkerScope,
+  fetchImpl?: typeof fetch,
 ): void {
   selfScope.addEventListener("message", (event: MessageEvent<LoaderWorkerRequest>) => {
     const message = event.data;
@@ -349,6 +350,7 @@ export function installLoaderWorker(
 
     void loadModel({
       ...message,
+      fetchImpl,
       onProgress: (progress) => {
         selfScope.postMessage({
           type: "model-progress",

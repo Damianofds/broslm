@@ -10,6 +10,7 @@ import {
   loadByteLevelBpeTokenizer,
   type ByteLevelBpeTokenizer,
 } from "./tokenizer";
+import { createModelCacheFetch } from "./modelCache";
 
 type LoadState = "idle" | "loading" | "ready" | "error";
 type TokenizerState = "idle" | "loading" | "ready" | "error";
@@ -45,6 +46,7 @@ const defaultTopK = 10;
 export default function App() {
   const workerRef = useRef<Worker | null>(null);
   const tokenizerRef = useRef<ByteLevelBpeTokenizer | null>(null);
+  const cachedFetchRef = useRef<typeof fetch | null>(null);
   const pendingNextTokenRequestsRef = useRef<Map<string, PendingNextTokenRequest>>(new Map());
   const generationRunRef = useRef(0);
   const chatTextareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -215,13 +217,18 @@ export default function App() {
     setTokenizerState("loading");
     setTokenizerError(null);
     try {
-      tokenizerRef.current = await loadByteLevelBpeTokenizer(tokenizerUrl);
+      tokenizerRef.current = await loadByteLevelBpeTokenizer(tokenizerUrl, getCachedFetch());
       setTokenizerState("ready");
     } catch (loadError: unknown) {
       tokenizerRef.current = null;
       setTokenizerState("error");
       setTokenizerError(loadError instanceof Error ? loadError.message : String(loadError));
     }
+  }
+
+  function getCachedFetch(): typeof fetch {
+    cachedFetchRef.current ??= createModelCacheFetch();
+    return cachedFetchRef.current;
   }
 
   async function generateCompletion() {

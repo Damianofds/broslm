@@ -22,6 +22,8 @@
     "App.tsx",
     "main.tsx",
     "modelExport.ts",
+    "modelCache.ts",
+    "modelCache.test.ts",
     "modelName.ts",
     "modelWorker.ts",
     "tokenizer.ts",
