@@ -399,7 +399,20 @@ export default function App() {
           onTopKChange={setTopK}
         />
       )}
+
+      <Footer />
     </main>
+  );
+}
+
+function Footer() {
+  return (
+    <footer className="site-footer">
+      Created by{" "}
+      <a href="https://damianofds.github.io/" rel="noreferrer" target="_blank">
+        fds
+      </a>
+    </footer>
   );
 }
 
