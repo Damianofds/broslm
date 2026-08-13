@@ -482,7 +482,7 @@ function LoadModelSection({
           {frame === "config" && summary && <ConfigFrame summary={summary} onLoadModel={onLoadModel} />}
         </div>
       </div>
-      {canEnterChat && <ScrollCue href="#chat" label="Try the chat demo" />}
+      {canEnterChat && <ScrollCue href="#chat" label="Let's chat!" />}
     </section>
   );
 }
@@ -660,7 +660,7 @@ function ChatSection({
     <section className="landing-section chat-section" id="chat">
       <div className="section-inner chat-inner">
         <div className="chat-heading">
-          <h2>Try the chat demo</h2>
+          <h2>Chat with broSLM</h2>
           <div className="status-pills">
             <span>{statusTitle(loadState)}</span>
             <span>{tokenizerStatusTitle(tokenizerState)}</span>
