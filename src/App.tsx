@@ -15,7 +15,7 @@ import { createModelCacheFetch } from "./modelCache";
 type LoadState = "idle" | "loading" | "ready" | "error";
 type TokenizerState = "idle" | "loading" | "ready" | "error";
 type GenerationState = "idle" | "generating" | "done" | "error";
-type LoadFrame = "start" | "loading" | "config";
+type LoadFrame = "start" | "loading" | "transition" | "config";
 
 interface PendingNextTokenRequest {
   resolve: (tokenId: number) => void;
@@ -42,6 +42,8 @@ const steps: readonly Step[] = [
 const defaultMaxNewTokens = 120;
 const defaultTemperature = 0.95;
 const defaultTopK = 10;
+const configTransitionMs = 800;
+const transitionTiles = Array.from({ length: 18 }, (_, index) => index);
 
 export default function App() {
   const workerRef = useRef<Worker | null>(null);
@@ -55,6 +57,7 @@ export default function App() {
   const [tokenizerState, setTokenizerState] = useState<TokenizerState>("idle");
   const [progress, setProgress] = useState<LoaderProgress | null>(null);
   const [transientProgressMessage, setTransientProgressMessage] = useState<string | null>(null);
+  const [configRevealReady, setConfigRevealReady] = useState(false);
   const [actualStepIndex, setActualStepIndex] = useState(-1);
   const [visibleStepIndex, setVisibleStepIndex] = useState(-1);
   const [summary, setSummary] = useState<LoadedModelSummary | null>(null);
@@ -94,6 +97,18 @@ export default function App() {
   }, [actualStepIndex, visibleStepIndex]);
 
   useEffect(() => {
+    if (!summary || visibleStepIndex < steps.length - 1 || configRevealReady) {
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      setConfigRevealReady(true);
+    }, configTransitionMs);
+
+    return () => window.clearTimeout(timeout);
+  }, [configRevealReady, summary, visibleStepIndex]);
+
+  useEffect(() => {
     const textarea = chatTextareaRef.current;
     if (!textarea) {
       return;
@@ -120,7 +135,7 @@ export default function App() {
     generationState !== "generating" &&
     chatText.length > 0;
 
-  const loadFrame = resolveLoadFrame(loadState, summary, visibleStepIndex);
+  const loadFrame = resolveLoadFrame(loadState, summary, visibleStepIndex, configRevealReady);
   const canEnterChat =
     loadFrame === "config" && loadState === "ready" && tokenizerState === "ready" && summary !== null;
 
@@ -137,6 +152,7 @@ export default function App() {
     setLoadState("loading");
     setProgress(null);
     setTransientProgressMessage(null);
+    setConfigRevealReady(false);
     setActualStepIndex(-1);
     setVisibleStepIndex(-1);
     setSummary(null);
@@ -449,6 +465,7 @@ function LoadModelSection({
               visibleStepIndex={visibleStepIndex}
             />
           )}
+          {frame === "transition" && <ConfigTransitionFrame />}
           {frame === "config" && summary && <ConfigFrame summary={summary} onLoadModel={onLoadModel} />}
         </div>
       </div>
@@ -529,6 +546,19 @@ function LoadingFrame({
           </li>
         ))}
       </ol>
+    </div>
+  );
+}
+
+function ConfigTransitionFrame() {
+  return (
+    <div className="config-transition-frame" aria-live="polite">
+      <div className="config-transition-grid" aria-hidden="true">
+        {transitionTiles.map((tile) => (
+          <span key={tile} style={{ animationDelay: `${tile * 35}ms` }} />
+        ))}
+      </div>
+      <p>Preparing model and tensor config</p>
     </div>
   );
 }
@@ -746,9 +776,10 @@ function resolveLoadFrame(
   loadState: LoadState,
   summary: LoadedModelSummary | null,
   visibleStepIndex: number,
+  configRevealReady: boolean,
 ): LoadFrame {
   if (summary && visibleStepIndex >= steps.length - 1) {
-    return "config";
+    return configRevealReady ? "config" : "transition";
   }
   if (loadState === "loading" || summary) {
     return "loading";
@@ -758,6 +789,9 @@ function resolveLoadFrame(
 
 function loadFrameTitle(frame: LoadFrame, loadState: LoadState): string {
   if (frame === "config") {
+    return "Model loaded";
+  }
+  if (frame === "transition") {
     return "Model loaded";
   }
   if (frame === "loading") {
