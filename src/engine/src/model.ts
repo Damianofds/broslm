@@ -1,7 +1,17 @@
+import {
+  allocateModelKvCache,
+  cachePrefixMatches,
+  resetModelKvCache,
+  type ModelKvCache,
+} from "./attentionCache";
 import type { LoadedModel, TensorView } from "./loader";
 import { layerNorm } from "./primitives/layerNorm";
 import { matrixVectorMultiply } from "./primitives/matrixVectorMultiply";
-import { transformerLayer } from "./transformerLayer";
+import {
+  transformerLayer,
+  transformerLayerIncremental,
+  transformerLayerPrefill,
+} from "./transformerLayer";
 
 export interface NextTokenResult {
   tokenId: number;
@@ -67,6 +77,40 @@ export function nextToken(
     tokenId: sampleTokenFromLogits(logits, options),
     logits,
   };
+}
+
+export function nextTokenWithCache(
+  model: LoadedModel,
+  inputIds: readonly number[],
+  cache: ModelKvCache,
+  options: SamplingOptions = {},
+): NextTokenResult {
+  const logits = lastTokenLogitsWithCache(model, inputIds, cache);
+  return {
+    tokenId: sampleTokenFromLogits(logits, options),
+    logits,
+  };
+}
+
+export function lastTokenLogitsWithCache(
+  model: LoadedModel,
+  inputIds: readonly number[],
+  cache: ModelKvCache = allocateModelKvCache(model.config),
+): Float32Array {
+  validateInputIds(model, inputIds);
+  validateModelKvCache(model, cache);
+
+  if (!cachePrefixMatches(cache.inputIds, inputIds) || cache.inputIds.length === inputIds.length) {
+    return prefillLogits(model, inputIds, cache);
+  }
+
+  let logits: Float32Array = new Float32Array(model.config.vocabularySize);
+  for (let position = cache.inputIds.length; position < inputIds.length; position += 1) {
+    logits = decodeTokenLogits(model, inputIds[position] ?? 0, position, cache);
+    cache.inputIds.push(inputIds[position] ?? 0);
+  }
+
+  return logits;
 }
 
 export function argmax(values: Float32Array): number {
@@ -207,6 +251,141 @@ function embedInputIds(model: LoadedModel, inputIds: readonly number[]): Float32
   }
 
   return output;
+}
+
+function prefillLogits(
+  model: LoadedModel,
+  inputIds: readonly number[],
+  cache: ModelKvCache,
+): Float32Array {
+  resetModelKvCache(cache);
+
+  const sequenceLength = inputIds.length;
+  const { hiddenSize } = model.config;
+  let hiddenState = embedInputIds(model, inputIds);
+
+  for (let layerIndex = 0; layerIndex < model.weights.layers.length; layerIndex += 1) {
+    const layerWeights = model.weights.layers[layerIndex];
+    const layerCache = cache.layers[layerIndex];
+    if (!layerWeights || !layerCache) {
+      throw new Error(`missing layer/cache at index ${layerIndex}`);
+    }
+    hiddenState = transformerLayerPrefill(
+      hiddenState,
+      sequenceLength,
+      model.config,
+      layerWeights,
+      layerCache,
+    );
+  }
+
+  const finalHidden = new Float32Array(hiddenSize);
+  const lastTokenOffset = (sequenceLength - 1) * hiddenSize;
+  layerNorm(
+    hiddenState,
+    model.weights.finalLayerNorm.weight,
+    model.weights.finalLayerNorm.bias,
+    finalHidden,
+    {
+      inputOffset: lastTokenOffset,
+      featureSize: hiddenSize,
+      epsilon: model.config.layerNormEpsilon,
+    },
+  );
+
+  const logits = new Float32Array(model.config.vocabularySize);
+  matrixVectorMultiply(model.weights.lmHead, finalHidden, logits);
+  cache.inputIds.push(...inputIds);
+  return logits;
+}
+
+function decodeTokenLogits(
+  model: LoadedModel,
+  tokenId: number,
+  position: number,
+  cache: ModelKvCache,
+): Float32Array {
+  const { hiddenSize } = model.config;
+  let hiddenState = embedTokenAtPosition(model, tokenId, position);
+
+  for (let layerIndex = 0; layerIndex < model.weights.layers.length; layerIndex += 1) {
+    const layerWeights = model.weights.layers[layerIndex];
+    const layerCache = cache.layers[layerIndex];
+    if (!layerWeights || !layerCache) {
+      throw new Error(`missing layer/cache at index ${layerIndex}`);
+    }
+    hiddenState = transformerLayerIncremental(
+      hiddenState,
+      position,
+      model.config,
+      layerWeights,
+      layerCache,
+    );
+  }
+
+  const finalHidden = new Float32Array(hiddenSize);
+  layerNorm(
+    hiddenState,
+    model.weights.finalLayerNorm.weight,
+    model.weights.finalLayerNorm.bias,
+    finalHidden,
+    {
+      featureSize: hiddenSize,
+      epsilon: model.config.layerNormEpsilon,
+    },
+  );
+
+  const logits = new Float32Array(model.config.vocabularySize);
+  matrixVectorMultiply(model.weights.lmHead, finalHidden, logits);
+  return logits;
+}
+
+function embedTokenAtPosition(
+  model: LoadedModel,
+  tokenId: number,
+  position: number,
+): Float32Array {
+  const { hiddenSize } = model.config;
+  const output = new Float32Array(hiddenSize);
+  const tokenEmbedding = requireMatrix(
+    model.weights.tokenEmbedding,
+    "tokenEmbedding",
+    model.config.vocabularySize,
+    hiddenSize,
+  );
+  const positionEmbedding = requireMatrix(
+    model.weights.positionEmbedding,
+    "positionEmbedding",
+    model.config.maximumSequenceLength,
+    hiddenSize,
+  );
+  const tokenOffset = tokenId * hiddenSize;
+  const positionOffset = position * hiddenSize;
+
+  for (let dimension = 0; dimension < hiddenSize; dimension += 1) {
+    output[dimension] =
+      (tokenEmbedding.data[tokenOffset + dimension] ?? 0) +
+      (positionEmbedding.data[positionOffset + dimension] ?? 0);
+  }
+
+  return output;
+}
+
+function validateModelKvCache(model: LoadedModel, cache: ModelKvCache): void {
+  if (cache.layers.length !== model.config.numberOfLayers) {
+    throw new Error(
+      `cache has ${cache.layers.length} layers, expected ${model.config.numberOfLayers}`,
+    );
+  }
+  if (cache.maximumSequenceLength !== model.config.maximumSequenceLength) {
+    throw new Error(
+      `cache maximumSequenceLength is ${cache.maximumSequenceLength}, expected ` +
+        `${model.config.maximumSequenceLength}`,
+    );
+  }
+  if (cache.hiddenSize !== model.config.hiddenSize) {
+    throw new Error(`cache hiddenSize is ${cache.hiddenSize}, expected ${model.config.hiddenSize}`);
+  }
 }
 
 function validateInputIds(model: LoadedModel, inputIds: readonly number[]): void {

@@ -1,4 +1,5 @@
-import { nextToken } from "./model";
+import { allocateModelKvCache, type ModelKvCache } from "./attentionCache";
+import { nextTokenWithCache } from "./model";
 import { isModelAssetCacheHit, type ModelAssetFetchSource } from "./modelAssetFetch";
 
 export type AttentionKind = "global" | "local";
@@ -213,6 +214,7 @@ interface LoaderWorkerScope {
 const FLOAT32_BYTES = 4;
 
 let workerLoadedModel: LoadedModel | null = null;
+let workerKvCache: ModelKvCache | null = null;
 
 export async function loadModel(options: LoadModelOptions): Promise<LoadedModel> {
   const fetcher = options.fetchImpl ?? fetch;
@@ -333,7 +335,11 @@ export function installLoaderWorker(
           throw new Error("Model must be loaded before running next-token inference");
         }
 
-        const result = nextToken(workerLoadedModel, message.inputIds, {
+        if (!workerKvCache) {
+          workerKvCache = allocateModelKvCache(workerLoadedModel.config);
+        }
+
+        const result = nextTokenWithCache(workerLoadedModel, message.inputIds, workerKvCache, {
           temperature: message.temperature,
           topK: message.topK,
         });
@@ -356,6 +362,9 @@ export function installLoaderWorker(
       return;
     }
 
+    workerLoadedModel = null;
+    workerKvCache = null;
+
     void loadModel({
       ...message,
       fetchImpl,
@@ -369,6 +378,7 @@ export function installLoaderWorker(
     })
       .then((loadedModel) => {
         workerLoadedModel = loadedModel;
+        workerKvCache = allocateModelKvCache(loadedModel.config);
         selfScope.postMessage({
           type: "model-ready",
           requestId: message.requestId,
@@ -376,6 +386,8 @@ export function installLoaderWorker(
         } satisfies LoaderWorkerResponse);
       })
       .catch((error: unknown) => {
+        workerLoadedModel = null;
+        workerKvCache = null;
         selfScope.postMessage({
           type: "model-error",
           requestId: message.requestId,
