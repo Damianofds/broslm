@@ -1,3 +1,4 @@
+import type { LayerKvCache } from "./attentionCache";
 import type {
   AttentionWeights as BoundAttentionWeights,
   LayerNormWeights,
@@ -51,6 +52,89 @@ export function causalSelfAttention(
   weights: CausalSelfAttentionWeights,
 ): Float32Array {
   return causalSelfAttentionWithDebug(input, sequenceLength, config, weights).output;
+}
+
+export function causalSelfAttentionPrefill(
+  input: Float32Array,
+  sequenceLength: number,
+  config: CausalSelfAttentionConfig,
+  weights: CausalSelfAttentionWeights,
+  cache: LayerKvCache,
+): Float32Array {
+  const result = causalSelfAttentionWithDebug(input, sequenceLength, config, weights);
+  writeProjectedKvToCache(result.debug.k, result.debug.v, sequenceLength, config, cache);
+  return result.output;
+}
+
+export function causalSelfAttentionIncremental(
+  input: Float32Array,
+  position: number,
+  config: CausalSelfAttentionConfig,
+  weights: CausalSelfAttentionWeights,
+  cache: LayerKvCache,
+): Float32Array {
+  validateAttentionConfig(config);
+  requireMatrixShape(weights.query, "query", config.hiddenSize, config.hiddenSize);
+  requireMatrixShape(weights.key, "key", config.hiddenSize, config.hiddenSize);
+  requireMatrixShape(weights.value, "value", config.hiddenSize, config.hiddenSize);
+  requireMatrixShape(weights.output, "output", config.hiddenSize, config.hiddenSize);
+  if (input.length !== config.hiddenSize) {
+    throw new Error(`input length is ${input.length}, expected ${config.hiddenSize}`);
+  }
+  if (cache.length !== position) {
+    throw new Error(`cache length is ${cache.length}, expected current position ${position}`);
+  }
+  validateCacheBuffers(cache, config);
+
+  const { hiddenSize, numberOfHeads, headDimension } = config;
+  const q = new Float32Array(hiddenSize);
+  const k = new Float32Array(hiddenSize);
+  const v = new Float32Array(hiddenSize);
+  const concatenated = new Float32Array(hiddenSize);
+  const projected = new Float32Array(hiddenSize);
+  const scores = new Float32Array(position + 1);
+  const probabilities = new Float32Array(position + 1);
+
+  matrixVectorMultiply(weights.query, input, q);
+  matrixVectorMultiply(weights.key, input, k);
+  matrixVectorMultiply(weights.value, input, v);
+
+  const cacheOffset = position * hiddenSize;
+  cache.keys.set(k, cacheOffset);
+  cache.values.set(v, cacheOffset);
+
+  const scale = 1 / Math.sqrt(headDimension);
+  for (let head = 0; head < numberOfHeads; head += 1) {
+    for (let keyPosition = 0; keyPosition <= position; keyPosition += 1) {
+      let score = 0;
+      for (let dimension = 0; dimension < headDimension; dimension += 1) {
+        score +=
+          (q[head * headDimension + dimension] ?? 0) *
+          (cache.keys[hiddenIndex(keyPosition, head, dimension, hiddenSize, headDimension)] ?? 0);
+      }
+      scores[keyPosition] = score * scale;
+    }
+
+    softmax(scores, probabilities, {
+      length: position + 1,
+    });
+
+    for (let dimension = 0; dimension < headDimension; dimension += 1) {
+      let value = 0;
+      for (let valuePosition = 0; valuePosition <= position; valuePosition += 1) {
+        value +=
+          (probabilities[valuePosition] ?? 0) *
+          (cache.values[hiddenIndex(valuePosition, head, dimension, hiddenSize, headDimension)] ?? 0);
+      }
+      concatenated[head * headDimension + dimension] = value;
+    }
+  }
+
+  matrixVectorMultiply(weights.output, concatenated, projected, {
+    bias: weights.outputBias,
+  });
+  cache.length = position + 1;
+  return projected;
 }
 
 export function causalSelfAttentionWithDebug(
@@ -177,6 +261,38 @@ function projectSequence(
       inputOffset: offset,
       outputOffset: offset,
     });
+  }
+}
+
+function writeProjectedKvToCache(
+  keys: Float32Array,
+  values: Float32Array,
+  sequenceLength: number,
+  config: CausalSelfAttentionConfig,
+  cache: LayerKvCache,
+): void {
+  validateCacheBuffers(cache, config);
+  const elements = sequenceLength * config.hiddenSize;
+  if (elements > cache.keys.length || elements > cache.values.length) {
+    throw new Error(
+      `cache cannot store ${sequenceLength} positions with hiddenSize ${config.hiddenSize}`,
+    );
+  }
+
+  cache.keys.set(keys.subarray(0, elements), 0);
+  cache.values.set(values.subarray(0, elements), 0);
+  cache.length = sequenceLength;
+}
+
+function validateCacheBuffers(cache: LayerKvCache, config: CausalSelfAttentionConfig): void {
+  if (cache.keys.length !== cache.values.length) {
+    throw new Error("cache key/value buffers must have the same length");
+  }
+  if (cache.keys.length < config.hiddenSize) {
+    throw new Error("cache key/value buffers are too small");
+  }
+  if (cache.keys.length % config.hiddenSize !== 0) {
+    throw new Error(`cache length ${cache.keys.length} must be a multiple of hiddenSize ${config.hiddenSize}`);
   }
 }
 
