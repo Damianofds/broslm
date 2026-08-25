@@ -1,3 +1,4 @@
+export { argmax } from "./argmax";
 export { embeddingLookup } from "./embeddingLookup";
 export { gelu } from "./gelu";
 export { layerNorm } from "./layerNorm";

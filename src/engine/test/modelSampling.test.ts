@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { sampleTokenFromLogits } from "../src/model";
+import { sampleTokenFromLogits } from "../src/sampling";
 
 describe("sampleTokenFromLogits", () => {
   it("falls back to argmax when temperature is zero", () => {
