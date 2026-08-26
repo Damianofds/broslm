@@ -92,6 +92,15 @@ export interface QwenLoadedModelSummary extends BaseAppLoadedModelSummary {
 
 export type AppLoadedModelSummary = TinyStoriesLoadedModelSummary | QwenLoadedModelSummary;
 
+export type AppInferencePhase = "prefill" | "decode";
+
+export interface AppInferencePerformance {
+  phase: AppInferencePhase;
+  tokenCount: number;
+  elapsedMs: number;
+  tokensPerSecond: number;
+}
+
 export type AppTokenizerPayload =
   | {
       kind: "qwen2-gguf";
@@ -120,6 +129,7 @@ export type AppWorkerRequest =
       inputIds: number[];
       temperature?: number;
       topK?: number;
+      resetCache?: boolean;
     };
 
 export type AppWorkerResponse =
@@ -142,6 +152,7 @@ export type AppWorkerResponse =
       requestId?: string;
       modelId: ModelId;
       tokenId: number;
+      performance?: AppInferencePerformance;
     }
   | {
       type: "model-error";

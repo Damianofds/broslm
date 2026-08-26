@@ -1,6 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { detectWebGpuSupport } from "./engine/src/runtime/webgpu";
 import {
+  qwen2WebGpuPrefillSafetyError,
+  qwen2WebGpuSafetyLimits,
+} from "./engine/src/qwen2/webgpuSafety";
+import {
   createQwen2ByteLevelBpeTokenizer,
   loadByteLevelBpeTokenizer,
   type ByteLevelBpeTokenizer,
@@ -14,6 +18,7 @@ import {
   modelOptions,
   stepIndexForProgressStage,
   visibleGeneratedTextForModel,
+  type AppInferencePerformance,
   type AppLoadedModelSummary,
   type AppLoaderProgress,
   type AppLoadStep,
@@ -34,6 +39,16 @@ interface PendingNextTokenRequest {
   reject: (error: Error) => void;
 }
 
+interface GenerationThroughput {
+  prefillTokensPerSecond: number | null;
+  decodeTokensPerSecond: number | null;
+}
+
+interface DecodeThroughputAccumulator {
+  tokenCount: number;
+  elapsedMs: number;
+}
+
 const defaultMaxNewTokens = 120;
 const defaultTemperature = 0.95;
 const defaultTopK = 10;
@@ -48,6 +63,8 @@ export default function App() {
   const cachedFetchRef = useRef<typeof fetch | null>(null);
   const pendingNextTokenRequestsRef = useRef<Map<string, PendingNextTokenRequest>>(new Map());
   const generationRunRef = useRef(0);
+  const qwenGenerationInFlightRef = useRef(false);
+  const decodeThroughputRef = useRef<DecodeThroughputAccumulator>({ tokenCount: 0, elapsedMs: 0 });
   const chatTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const [selectedModelId, setSelectedModelId] = useState<ModelId>(defaultModelId);
@@ -69,6 +86,10 @@ export default function App() {
   const [generationError, setGenerationError] = useState<string | null>(null);
   const [inputTokenCount, setInputTokenCount] = useState<number | null>(null);
   const [generatedTokenIds, setGeneratedTokenIds] = useState<number[]>([]);
+  const [generationThroughput, setGenerationThroughput] = useState<GenerationThroughput>({
+    prefillTokensPerSecond: null,
+    decodeTokensPerSecond: null,
+  });
   const [webgpuAvailability, setWebgpuAvailability] = useState<WebGpuAvailability>("checking");
   const [webgpuMaxStorageBufferBindingSize, setWebgpuMaxStorageBufferBindingSize] =
     useState<number | null>(null);
@@ -201,6 +222,7 @@ export default function App() {
     setGenerationError(null);
     setGeneratedTokenIds([]);
     setInputTokenCount(null);
+    resetGenerationThroughput();
     if (selectedModelId === "tinystories") {
       void ensureTokenizerLoaded(selectedModelId);
     }
@@ -268,6 +290,9 @@ export default function App() {
       }
 
       if (message.type === "next-token-result") {
+        if (message.performance) {
+          recordGenerationPerformance(message.performance);
+        }
         const pending = message.requestId
           ? pendingNextTokenRequestsRef.current.get(message.requestId)
           : undefined;
@@ -386,6 +411,7 @@ export default function App() {
     setGenerationError(null);
     setGeneratedTokenIds([]);
     setInputTokenCount(null);
+    resetGenerationThroughput();
   }
 
   async function generateCompletion() {
@@ -393,6 +419,11 @@ export default function App() {
     if (!tokenizer || loadState !== "ready" || !summary) {
       setGenerationState("error");
       setGenerationError("Model and tokenizer must be ready before generation.");
+      return;
+    }
+    if (selectedModelId === "qwen" && qwenGenerationInFlightRef.current) {
+      setGenerationState("error");
+      setGenerationError("Qwen generation is still finishing its previous GPU request.");
       return;
     }
 
@@ -407,6 +438,12 @@ export default function App() {
     const modelPrompt = formatPromptForModel(selectedModelId, baseText);
     const inputIds = tokenizer.encode(modelPrompt);
     const availableNewTokens = summary.config.maximumSequenceLength - inputIds.length;
+    const qwenSafetyError = qwenGpuBlockingPromptError(selectedModelId, summary, inputIds.length);
+    if (qwenSafetyError) {
+      setGenerationState("error");
+      setGenerationError(qwenSafetyError);
+      return;
+    }
     if (availableNewTokens <= 0) {
       setGenerationState("error");
       setGenerationError("Prompt is longer than the model context window.");
@@ -417,16 +454,30 @@ export default function App() {
     generationRunRef.current = runId;
     const nextInputIds = [...inputIds];
     const nextGeneratedTokenIds: number[] = [];
-    const targetNewTokens = Math.min(maxNewTokens, availableNewTokens);
+    const targetNewTokens = Math.min(
+      maxNewTokens,
+      availableNewTokens,
+      qwenGpuAvailableNewTokens(selectedModelId, summary, inputIds.length),
+    );
+    if (targetNewTokens <= 0) {
+      setGenerationState("error");
+      setGenerationError("Qwen WebGPU safety limit leaves no room for new tokens.");
+      return;
+    }
+    if (selectedModelId === "qwen") {
+      qwenGenerationInFlightRef.current = true;
+    }
 
     setInputTokenCount(inputIds.length);
     setGeneratedTokenIds([]);
+    resetGenerationThroughput();
     setGenerationError(null);
     setGenerationState("generating");
 
     try {
       for (let tokenIndex = 0; tokenIndex < targetNewTokens; tokenIndex += 1) {
         const tokenId = await requestNextToken(nextInputIds, {
+          resetCache: selectedModelId === "qwen" && tokenIndex === 0,
           temperature,
           topK,
         });
@@ -462,6 +513,10 @@ export default function App() {
       setGenerationError(
         generationError instanceof Error ? generationError.message : String(generationError),
       );
+    } finally {
+      if (selectedModelId === "qwen") {
+        qwenGenerationInFlightRef.current = false;
+      }
     }
   }
 
@@ -472,11 +527,42 @@ export default function App() {
       new Error("Generation stopped"),
     );
     setGenerationState("done");
+    qwenGenerationInFlightRef.current = false;
+  }
+
+  function resetGenerationThroughput() {
+    decodeThroughputRef.current = { tokenCount: 0, elapsedMs: 0 };
+    setGenerationThroughput({
+      prefillTokensPerSecond: null,
+      decodeTokensPerSecond: null,
+    });
+  }
+
+  function recordGenerationPerformance(performance: AppInferencePerformance) {
+    if (performance.phase === "prefill") {
+      setGenerationThroughput((current) => ({
+        ...current,
+        prefillTokensPerSecond: performance.tokensPerSecond,
+      }));
+      return;
+    }
+
+    decodeThroughputRef.current = {
+      tokenCount: decodeThroughputRef.current.tokenCount + performance.tokenCount,
+      elapsedMs: decodeThroughputRef.current.elapsedMs + performance.elapsedMs,
+    };
+    setGenerationThroughput((current) => ({
+      ...current,
+      decodeTokensPerSecond: tokensPerSecond(
+        decodeThroughputRef.current.tokenCount,
+        decodeThroughputRef.current.elapsedMs,
+      ),
+    }));
   }
 
   function requestNextToken(
     inputIds: number[],
-    options: { temperature: number; topK: number },
+    options: { resetCache?: boolean; temperature: number; topK: number },
   ): Promise<number> {
     const worker = workerRef.current;
     if (!worker) {
@@ -489,6 +575,7 @@ export default function App() {
       requestId,
       modelId: selectedModelId,
       inputIds,
+      resetCache: options.resetCache,
       temperature: options.temperature,
       topK: options.topK,
     };
@@ -526,11 +613,13 @@ export default function App() {
         <ChatSection
           canGenerate={canGenerate}
           chatText={chatText}
+          decodeTokensPerSecond={generationThroughput.decodeTokensPerSecond}
           generatedTokenCount={generatedTokenIds.length}
           generationError={generationError}
           generationState={generationState}
           loadState={loadState}
           maxNewTokens={maxNewTokens}
+          prefillTokensPerSecond={generationThroughput.prefillTokensPerSecond}
           temperature={temperature}
           textareaRef={chatTextareaRef}
           tokenCount={chatTokenPreview ?? inputTokenCount}
@@ -904,11 +993,13 @@ function LayerStrip({ summary }: { summary: AppLoadedModelSummary }) {
 function ChatSection({
   canGenerate,
   chatText,
+  decodeTokensPerSecond,
   generatedTokenCount,
   generationError,
   generationState,
   loadState,
   maxNewTokens,
+  prefillTokensPerSecond,
   temperature,
   textareaRef,
   tokenCount,
@@ -923,11 +1014,13 @@ function ChatSection({
 }: {
   canGenerate: boolean;
   chatText: string;
+  decodeTokensPerSecond: number | null;
   generatedTokenCount: number;
   generationError: string | null;
   generationState: GenerationState;
   loadState: LoadState;
   maxNewTokens: number;
+  prefillTokensPerSecond: number | null;
   temperature: number;
   textareaRef: React.RefObject<HTMLTextAreaElement | null>;
   tokenCount: number | null;
@@ -999,6 +1092,8 @@ function ChatSection({
             <div className="token-stats">
               <span>{tokenCount ?? "-"} tokens</span>
               <span>{generatedTokenCount} generated</span>
+              <span>Prefill {formatTokensPerSecond(prefillTokensPerSecond)}</span>
+              <span>Decode {formatTokensPerSecond(decodeTokensPerSecond)}</span>
               <span>{generationTitle(generationState)}</span>
             </div>
             <div className="chat-actions">
@@ -1138,6 +1233,58 @@ function generationTitle(generationState: GenerationState): string {
     default:
       return "Ready";
   }
+}
+
+function qwenGpuBlockingPromptError(
+  selectedModelId: ModelId,
+  summary: AppLoadedModelSummary | null,
+  tokenCount: number | null,
+): string | null {
+  if (
+    selectedModelId !== "qwen" ||
+    summary?.kind !== "qwen2" ||
+    summary.backend !== "webgpu" ||
+    tokenCount === null
+  ) {
+    return null;
+  }
+
+  const prefillError = qwen2WebGpuPrefillSafetyError(tokenCount);
+  if (prefillError) {
+    return prefillError;
+  }
+  if (tokenCount >= qwen2WebGpuSafetyLimits.maxSequenceTokens) {
+    return (
+      `Qwen WebGPU cache is capped at ${qwen2WebGpuSafetyLimits.maxSequenceTokens} ` +
+      `tokens for GPU stability. Current prompt is ${tokenCount} tokens.`
+    );
+  }
+  return null;
+}
+
+function qwenGpuAvailableNewTokens(
+  selectedModelId: ModelId,
+  summary: AppLoadedModelSummary,
+  promptTokenCount: number,
+): number {
+  if (selectedModelId !== "qwen" || summary.kind !== "qwen2" || summary.backend !== "webgpu") {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  return Math.max(0, qwen2WebGpuSafetyLimits.maxSequenceTokens - promptTokenCount);
+}
+
+function tokensPerSecond(tokenCount: number, elapsedMs: number): number {
+  if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) {
+    return 0;
+  }
+  return tokenCount / (elapsedMs / 1000);
+}
+
+function formatTokensPerSecond(value: number | null): string {
+  if (value === null || !Number.isFinite(value) || value <= 0) {
+    return "- tok/s";
+  }
+  return `${value >= 10 ? value.toFixed(1) : value.toFixed(2)} tok/s`;
 }
 
 function clampTokenLimit(value: number): number {

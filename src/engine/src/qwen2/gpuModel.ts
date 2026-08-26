@@ -2,6 +2,7 @@ import type { Qwen2ModelKvCache } from "./attentionCache";
 import { resetQwen2ModelKvCache } from "./attentionCache";
 import type { LoadedQwen2Model, TensorView } from "./loader";
 import { isFloat32TensorView, type QwenTensorView } from "./quantizedTensor";
+import { qwen2WebGpuPrefillSafetyError } from "./webgpuSafety";
 import {
   createStaticStorageBuffer,
   createStorageBuffer,
@@ -38,12 +39,43 @@ const residentQwen2GpuCacheByCpuCache = new WeakMap<
   ResidentQwen2GpuModelCache
 >();
 
+type Qwen2PrefillProfileStep =
+  | "embedding"
+  | "attentionNorm"
+  | "qkvProjection"
+  | "rope"
+  | "attention"
+  | "attentionOutputProjection"
+  | "mlpNorm"
+  | "mlpGateProjection"
+  | "mlpUpProjection"
+  | "mlpActivation"
+  | "mlpDownProjection"
+  | "residual"
+  | "submit"
+  | "finalNorm"
+  | "logitsProjection"
+  | "logitsReadback";
+
+interface Qwen2PrefillProfile {
+  startedAt: number;
+  promptTokens: number;
+  layers: number;
+  totals: Partial<Record<Qwen2PrefillProfileStep, number>>;
+  fusedQkvLayers: number;
+}
+
 export async function qwen2PrefillLogitsResidentGpu(
   model: LoadedQwen2Model,
   inputIds: readonly number[],
   cache: Qwen2ModelKvCache,
   runtime: WebGpuRuntime,
 ): Promise<Float32Array> {
+  const safetyError = qwen2WebGpuPrefillSafetyError(inputIds.length);
+  if (safetyError) {
+    throw new Error(safetyError);
+  }
+
   resetQwen2ModelKvCache(cache);
   const gpuCache = resetResidentQwen2GpuCache(model, cache, runtime);
 
@@ -52,6 +84,7 @@ export async function qwen2PrefillLogitsResidentGpu(
   const hiddenElements = sequenceLength * hiddenSize;
   const intermediateElements = sequenceLength * model.config.intermediateSize;
   const context = createResidentQwen2GpuContext(runtime);
+  const profile = createQwen2PrefillProfile(model, sequenceLength);
 
   const tokenIdsBuffer = tempBuffer(context, runtime, Uint32Array.from(inputIds));
   const hiddenA = tempBuffer(context, runtime, hiddenElements * Float32Array.BYTES_PER_ELEMENT);
@@ -75,12 +108,14 @@ export async function qwen2PrefillLogitsResidentGpu(
     model.config.vocabularySize * Float32Array.BYTES_PER_ELEMENT,
   );
 
-  encodeQwen2EmbeddingSequence(context, runtime, {
-    tokenIds: tokenIdsBuffer,
-    embedding: model.weights.tokenEmbedding,
-    output: hiddenA,
-    sequenceLength,
-    embeddingSize: hiddenSize,
+  profileQwen2PrefillStep(profile, "embedding", () => {
+    encodeQwen2EmbeddingSequence(context, runtime, {
+      tokenIds: tokenIdsBuffer,
+      embedding: model.weights.tokenEmbedding,
+      output: hiddenA,
+      sequenceLength,
+      embeddingSize: hiddenSize,
+    });
   });
 
   let layerInput = hiddenA;
@@ -93,157 +128,185 @@ export async function qwen2PrefillLogitsResidentGpu(
       throw new Error(`missing Qwen2 layer/GPU cache at index ${layerIndex}`);
     }
 
-    encodeRmsNormSequence(context, runtime, {
-      input: layerInput,
-      weight: tensorBuffer(runtime, layerWeights.inputLayerNorm.weight),
-      output: normed,
-      sequenceLength,
-      featureSize: hiddenSize,
-      epsilon: model.config.rmsNormEpsilon,
+    profileQwen2PrefillStep(profile, "attentionNorm", () => {
+      encodeRmsNormSequence(context, runtime, {
+        input: layerInput,
+        weight: tensorBuffer(runtime, layerWeights.inputLayerNorm.weight),
+        output: normed,
+        sequenceLength,
+        featureSize: hiddenSize,
+        epsilon: model.config.rmsNormEpsilon,
+      });
     });
-    encodeQwen2MatrixMultiplySequence(context, runtime, {
-      input: normed,
-      weight: layerWeights.attention.qProjWeight,
-      bias: layerWeights.attention.qProjBias,
-      output: q,
-      inputSize: hiddenSize,
-      outputSize: hiddenSize,
-      sequenceLength,
+    profileQwen2PrefillStep(profile, "qkvProjection", () => {
+      if (
+        encodeQwen2QkvProjectionSequence(context, runtime, {
+          input: normed,
+          qWeight: layerWeights.attention.qProjWeight,
+          qBias: layerWeights.attention.qProjBias,
+          kWeight: layerWeights.attention.kProjWeight,
+          kBias: layerWeights.attention.kProjBias,
+          vWeight: layerWeights.attention.vProjWeight,
+          vBias: layerWeights.attention.vProjBias,
+          qOutput: q,
+          kOutput: layerCache.keys,
+          vOutput: layerCache.values,
+          inputSize: hiddenSize,
+          qOutputSize: hiddenSize,
+          keyValueOutputSize: model.config.keyValueHiddenSize,
+          sequenceLength,
+        })
+      ) {
+        profile.fusedQkvLayers += 1;
+      }
     });
-    encodeQwen2MatrixMultiplySequence(context, runtime, {
-      input: normed,
-      weight: layerWeights.attention.kProjWeight,
-      bias: layerWeights.attention.kProjBias,
-      output: layerCache.keys,
-      inputSize: hiddenSize,
-      outputSize: model.config.keyValueHiddenSize,
-      sequenceLength,
+    profileQwen2PrefillStep(profile, "rope", () => {
+      encodeRoPESequence(context, runtime, {
+        values: q,
+        sequenceLength,
+        hiddenSize,
+        numberOfHeads: model.config.numberOfHeads,
+        headDimension: model.config.headDimension,
+        basePosition: 0,
+        theta: model.config.ropeTheta,
+      });
+      encodeRoPESequence(context, runtime, {
+        values: layerCache.keys,
+        sequenceLength,
+        hiddenSize: model.config.keyValueHiddenSize,
+        numberOfHeads: model.config.numberOfKeyValueHeads,
+        headDimension: model.config.headDimension,
+        basePosition: 0,
+        theta: model.config.ropeTheta,
+      });
     });
-    encodeQwen2MatrixMultiplySequence(context, runtime, {
-      input: normed,
-      weight: layerWeights.attention.vProjWeight,
-      bias: layerWeights.attention.vProjBias,
-      output: layerCache.values,
-      inputSize: hiddenSize,
-      outputSize: model.config.keyValueHiddenSize,
-      sequenceLength,
+    profileQwen2PrefillStep(profile, "attention", () => {
+      encodeCausalGqaAttention(context, runtime, {
+        q,
+        k: layerCache.keys,
+        v: layerCache.values,
+        output: attentionOutput,
+        sequenceLength,
+        hiddenSize,
+        numberOfHeads: model.config.numberOfHeads,
+        numberOfKeyValueHeads: model.config.numberOfKeyValueHeads,
+        headDimension: model.config.headDimension,
+        keyValueHiddenSize: model.config.keyValueHiddenSize,
+      });
     });
-    encodeRoPESequence(context, runtime, {
-      values: q,
-      sequenceLength,
-      hiddenSize,
-      numberOfHeads: model.config.numberOfHeads,
-      headDimension: model.config.headDimension,
-      basePosition: 0,
-      theta: model.config.ropeTheta,
+    profileQwen2PrefillStep(profile, "attentionOutputProjection", () => {
+      encodeQwen2MatrixMultiplySequence(context, runtime, {
+        input: attentionOutput,
+        weight: layerWeights.attention.outProjWeight,
+        output: layerOutput,
+        inputSize: hiddenSize,
+        outputSize: hiddenSize,
+        sequenceLength,
+      });
     });
-    encodeRoPESequence(context, runtime, {
-      values: layerCache.keys,
-      sequenceLength,
-      hiddenSize: model.config.keyValueHiddenSize,
-      numberOfHeads: model.config.numberOfKeyValueHeads,
-      headDimension: model.config.headDimension,
-      basePosition: 0,
-      theta: model.config.ropeTheta,
-    });
-    encodeCausalGqaAttention(context, runtime, {
-      q,
-      k: layerCache.keys,
-      v: layerCache.values,
-      output: attentionOutput,
-      sequenceLength,
-      hiddenSize,
-      numberOfHeads: model.config.numberOfHeads,
-      numberOfKeyValueHeads: model.config.numberOfKeyValueHeads,
-      headDimension: model.config.headDimension,
-      keyValueHiddenSize: model.config.keyValueHiddenSize,
-    });
-    encodeQwen2MatrixMultiplySequence(context, runtime, {
-      input: attentionOutput,
-      weight: layerWeights.attention.outProjWeight,
-      output: layerOutput,
-      inputSize: hiddenSize,
-      outputSize: hiddenSize,
-      sequenceLength,
-    });
-    encodeResidualAdd(context, runtime, {
-      left: layerOutput,
-      right: layerInput,
-      output: attentionOutput,
-      length: hiddenElements,
+    profileQwen2PrefillStep(profile, "residual", () => {
+      encodeResidualAdd(context, runtime, {
+        left: layerOutput,
+        right: layerInput,
+        output: attentionOutput,
+        length: hiddenElements,
+      });
     });
 
-    encodeRmsNormSequence(context, runtime, {
-      input: attentionOutput,
-      weight: tensorBuffer(runtime, layerWeights.postAttentionLayerNorm.weight),
-      output: normed,
-      sequenceLength,
-      featureSize: hiddenSize,
-      epsilon: model.config.rmsNormEpsilon,
+    profileQwen2PrefillStep(profile, "mlpNorm", () => {
+      encodeRmsNormSequence(context, runtime, {
+        input: attentionOutput,
+        weight: tensorBuffer(runtime, layerWeights.postAttentionLayerNorm.weight),
+        output: normed,
+        sequenceLength,
+        featureSize: hiddenSize,
+        epsilon: model.config.rmsNormEpsilon,
+      });
     });
-    encodeQwen2MatrixMultiplySequence(context, runtime, {
-      input: normed,
-      weight: layerWeights.mlp.gateProjWeight,
-      output: gate,
-      inputSize: hiddenSize,
-      outputSize: model.config.intermediateSize,
-      sequenceLength,
+    profileQwen2PrefillStep(profile, "mlpGateProjection", () => {
+      encodeQwen2MatrixMultiplySequence(context, runtime, {
+        input: normed,
+        weight: layerWeights.mlp.gateProjWeight,
+        output: gate,
+        inputSize: hiddenSize,
+        outputSize: model.config.intermediateSize,
+        sequenceLength,
+      });
     });
-    encodeQwen2MatrixMultiplySequence(context, runtime, {
-      input: normed,
-      weight: layerWeights.mlp.upProjWeight,
-      output: up,
-      inputSize: hiddenSize,
-      outputSize: model.config.intermediateSize,
-      sequenceLength,
+    profileQwen2PrefillStep(profile, "mlpUpProjection", () => {
+      encodeQwen2MatrixMultiplySequence(context, runtime, {
+        input: normed,
+        weight: layerWeights.mlp.upProjWeight,
+        output: up,
+        inputSize: hiddenSize,
+        outputSize: model.config.intermediateSize,
+        sequenceLength,
+      });
     });
-    encodeSilu(context, runtime, {
-      input: gate,
-      output: activatedGate,
-      length: intermediateElements,
+    profileQwen2PrefillStep(profile, "mlpActivation", () => {
+      encodeSilu(context, runtime, {
+        input: gate,
+        output: activatedGate,
+        length: intermediateElements,
+      });
+      encodeElementwiseMultiply(context, runtime, {
+        left: activatedGate,
+        right: up,
+        output: gated,
+        length: intermediateElements,
+      });
     });
-    encodeElementwiseMultiply(context, runtime, {
-      left: activatedGate,
-      right: up,
-      output: gated,
-      length: intermediateElements,
+    profileQwen2PrefillStep(profile, "mlpDownProjection", () => {
+      encodeQwen2MatrixMultiplySequence(context, runtime, {
+        input: gated,
+        weight: layerWeights.mlp.downProjWeight,
+        output: mlpOutput,
+        inputSize: model.config.intermediateSize,
+        outputSize: hiddenSize,
+        sequenceLength,
+      });
     });
-    encodeQwen2MatrixMultiplySequence(context, runtime, {
-      input: gated,
-      weight: layerWeights.mlp.downProjWeight,
-      output: mlpOutput,
-      inputSize: model.config.intermediateSize,
-      outputSize: hiddenSize,
-      sequenceLength,
+    profileQwen2PrefillStep(profile, "residual", () => {
+      encodeResidualAdd(context, runtime, {
+        left: mlpOutput,
+        right: attentionOutput,
+        output: layerInput,
+        length: hiddenElements,
+      });
     });
-    encodeResidualAdd(context, runtime, {
-      left: mlpOutput,
-      right: attentionOutput,
-      output: layerInput,
-      length: hiddenElements,
+    profileQwen2PrefillStep(profile, "submit", () => {
+      submitResidentQwen2GpuContext(runtime, context);
     });
   }
 
-  encodeRmsNormSequence(context, runtime, {
-    input: layerInput,
-    inputOffset: (sequenceLength - 1) * hiddenSize,
-    weight: tensorBuffer(runtime, model.weights.finalNorm.weight),
-    output: finalHidden,
-    sequenceLength: 1,
-    featureSize: hiddenSize,
-    epsilon: model.config.rmsNormEpsilon,
+  profileQwen2PrefillStep(profile, "finalNorm", () => {
+    encodeRmsNormSequence(context, runtime, {
+      input: layerInput,
+      inputOffset: (sequenceLength - 1) * hiddenSize,
+      weight: tensorBuffer(runtime, model.weights.finalNorm.weight),
+      output: finalHidden,
+      sequenceLength: 1,
+      featureSize: hiddenSize,
+      epsilon: model.config.rmsNormEpsilon,
+    });
   });
-  encodeQwen2MatrixMultiplySequence(context, runtime, {
-    input: finalHidden,
-    weight: model.weights.lmHead,
-    output: logits,
-    inputSize: hiddenSize,
-    outputSize: model.config.vocabularySize,
-    sequenceLength: 1,
+  profileQwen2PrefillStep(profile, "logitsProjection", () => {
+    encodeQwen2MatrixMultiplySequence(context, runtime, {
+      input: finalHidden,
+      weight: model.weights.lmHead,
+      output: logits,
+      inputSize: hiddenSize,
+      outputSize: model.config.vocabularySize,
+      sequenceLength: 1,
+    });
   });
 
-  runtime.device.queue.submit([context.encoder.finish()]);
-  const logitsCpu = await readFloat32Buffer(runtime, logits, model.config.vocabularySize);
+  profileQwen2PrefillStep(profile, "submit", () => {
+    submitResidentQwen2GpuContext(runtime, context);
+  });
+  const logitsCpu = await profileQwen2PrefillAsyncStep(profile, "logitsReadback", () =>
+    readFloat32Buffer(runtime, logits, model.config.vocabularySize),
+  );
 
   for (let layerIndex = 0; layerIndex < cache.layers.length; layerIndex += 1) {
     const cpuLayerCache = cache.layers[layerIndex];
@@ -257,6 +320,7 @@ export async function qwen2PrefillLogitsResidentGpu(
   cache.inputIds.push(...inputIds);
   gpuCache.inputIds.push(...inputIds);
   destroyBuffers(...context.temps);
+  logQwen2PrefillProfile(profile);
   return logitsCpu;
 }
 
@@ -329,31 +393,20 @@ export async function qwen2DecodeTokenLogitsResidentGpu(
       featureSize: hiddenSize,
       epsilon: model.config.rmsNormEpsilon,
     });
-    encodeQwen2MatrixMultiplySequence(context, runtime, {
+    encodeQwen2QkvProjectionSequence(context, runtime, {
       input: normed,
-      weight: layerWeights.attention.qProjWeight,
-      bias: layerWeights.attention.qProjBias,
-      output: q,
+      qWeight: layerWeights.attention.qProjWeight,
+      qBias: layerWeights.attention.qProjBias,
+      kWeight: layerWeights.attention.kProjWeight,
+      kBias: layerWeights.attention.kProjBias,
+      vWeight: layerWeights.attention.vProjWeight,
+      vBias: layerWeights.attention.vProjBias,
+      qOutput: q,
+      kOutput: k,
+      vOutput: v,
       inputSize: hiddenSize,
-      outputSize: hiddenSize,
-      sequenceLength: 1,
-    });
-    encodeQwen2MatrixMultiplySequence(context, runtime, {
-      input: normed,
-      weight: layerWeights.attention.kProjWeight,
-      bias: layerWeights.attention.kProjBias,
-      output: k,
-      inputSize: hiddenSize,
-      outputSize: keyValueHiddenSize,
-      sequenceLength: 1,
-    });
-    encodeQwen2MatrixMultiplySequence(context, runtime, {
-      input: normed,
-      weight: layerWeights.attention.vProjWeight,
-      bias: layerWeights.attention.vProjBias,
-      output: v,
-      inputSize: hiddenSize,
-      outputSize: keyValueHiddenSize,
+      qOutputSize: hiddenSize,
+      keyValueOutputSize: keyValueHiddenSize,
       sequenceLength: 1,
     });
     encodeRoPESequence(context, runtime, {
@@ -508,6 +561,81 @@ function createResidentQwen2GpuContext(runtime: WebGpuRuntime): ResidentQwen2Gpu
     encoder: runtime.device.createCommandEncoder(),
     dummyBias,
   };
+}
+
+function submitResidentQwen2GpuContext(
+  runtime: WebGpuRuntime,
+  context: ResidentQwen2GpuContext,
+): void {
+  runtime.device.queue.submit([context.encoder.finish()]);
+  context.encoder = runtime.device.createCommandEncoder();
+}
+
+function createQwen2PrefillProfile(
+  model: LoadedQwen2Model,
+  promptTokens: number,
+): Qwen2PrefillProfile {
+  return {
+    startedAt: nowMs(),
+    promptTokens,
+    layers: model.config.numberOfLayers,
+    totals: {},
+    fusedQkvLayers: 0,
+  };
+}
+
+function profileQwen2PrefillStep<T>(
+  profile: Qwen2PrefillProfile,
+  step: Qwen2PrefillProfileStep,
+  fn: () => T,
+): T {
+  const startedAt = nowMs();
+  try {
+    return fn();
+  } finally {
+    addQwen2PrefillTiming(profile, step, nowMs() - startedAt);
+  }
+}
+
+async function profileQwen2PrefillAsyncStep<T>(
+  profile: Qwen2PrefillProfile,
+  step: Qwen2PrefillProfileStep,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const startedAt = nowMs();
+  try {
+    return await fn();
+  } finally {
+    addQwen2PrefillTiming(profile, step, nowMs() - startedAt);
+  }
+}
+
+function addQwen2PrefillTiming(
+  profile: Qwen2PrefillProfile,
+  step: Qwen2PrefillProfileStep,
+  elapsedMs: number,
+): void {
+  profile.totals[step] = (profile.totals[step] ?? 0) + elapsedMs;
+}
+
+function logQwen2PrefillProfile(profile: Qwen2PrefillProfile): void {
+  console.info("[broslm] Qwen WebGPU prefill timing", {
+    promptTokens: profile.promptTokens,
+    layers: profile.layers,
+    fusedQkvLayers: profile.fusedQkvLayers,
+    totalWallMs: roundTiming(nowMs() - profile.startedAt),
+    encodeAndSyncMs: Object.fromEntries(
+      Object.entries(profile.totals).map(([step, value]) => [step, roundTiming(value ?? 0)]),
+    ),
+  });
+}
+
+function roundTiming(value: number): number {
+  return Math.round(value * 10) / 10;
+}
+
+function nowMs(): number {
+  return globalThis.performance?.now() ?? Date.now();
 }
 
 function tempBuffer(
@@ -805,6 +933,161 @@ function encodeQwen2MatrixMultiplySequence(
   );
 }
 
+function encodeQwen2QkvProjectionSequence(
+  context: ResidentQwen2GpuContext,
+  runtime: WebGpuRuntime,
+  options: {
+    input: GPUBuffer;
+    inputBaseOffset?: number;
+    qWeight: QwenTensorView;
+    qBias?: TensorView | Float32Array;
+    kWeight: QwenTensorView;
+    kBias?: TensorView | Float32Array;
+    vWeight: QwenTensorView;
+    vBias?: TensorView | Float32Array;
+    qOutput: GPUBuffer;
+    kOutput: GPUBuffer;
+    vOutput: GPUBuffer;
+    inputSize: number;
+    qOutputSize: number;
+    keyValueOutputSize: number;
+    sequenceLength: number;
+  },
+): boolean {
+  validateQkvProjectionShapes(options);
+  if (!canFuseQwen2QkvProjection(options.qWeight, options.kWeight, options.vWeight)) {
+    encodeQwen2MatrixMultiplySequence(context, runtime, {
+      input: options.input,
+      inputBaseOffset: options.inputBaseOffset,
+      weight: options.qWeight,
+      bias: options.qBias,
+      output: options.qOutput,
+      inputSize: options.inputSize,
+      outputSize: options.qOutputSize,
+      sequenceLength: options.sequenceLength,
+    });
+    encodeQwen2MatrixMultiplySequence(context, runtime, {
+      input: options.input,
+      inputBaseOffset: options.inputBaseOffset,
+      weight: options.kWeight,
+      bias: options.kBias,
+      output: options.kOutput,
+      inputSize: options.inputSize,
+      outputSize: options.keyValueOutputSize,
+      sequenceLength: options.sequenceLength,
+    });
+    encodeQwen2MatrixMultiplySequence(context, runtime, {
+      input: options.input,
+      inputBaseOffset: options.inputBaseOffset,
+      weight: options.vWeight,
+      bias: options.vBias,
+      output: options.vOutput,
+      inputSize: options.inputSize,
+      outputSize: options.keyValueOutputSize,
+      sequenceLength: options.sequenceLength,
+    });
+    return false;
+  }
+
+  const qkvBias = qkvBiasBuffer(context, runtime, {
+    qBias: options.qBias,
+    kBias: options.kBias,
+    vBias: options.vBias,
+    qOutputSize: options.qOutputSize,
+    keyValueOutputSize: options.keyValueOutputSize,
+  });
+
+  if (isFloat32TensorView(options.qWeight)) {
+    const params = paramsBuffer(
+      context,
+      runtime,
+      new Uint32Array([
+        options.inputSize,
+        options.qOutputSize,
+        options.keyValueOutputSize,
+        options.sequenceLength,
+        options.inputBaseOffset ?? 0,
+        0,
+        0,
+        0,
+      ]),
+    );
+    encodeComputeShader(
+      runtime,
+      context.encoder,
+      qwen2F32QkvProjectionSequenceShader,
+      [
+        { binding: 0, resource: { buffer: qwenTensorBuffer(runtime, options.qWeight) } },
+        { binding: 1, resource: { buffer: qwenTensorBuffer(runtime, options.kWeight) } },
+        { binding: 2, resource: { buffer: qwenTensorBuffer(runtime, options.vWeight) } },
+        { binding: 3, resource: { buffer: options.input } },
+        { binding: 4, resource: { buffer: qkvBias } },
+        { binding: 5, resource: { buffer: params } },
+        { binding: 6, resource: { buffer: options.qOutput } },
+        { binding: 7, resource: { buffer: options.kOutput } },
+        { binding: 8, resource: { buffer: options.vOutput } },
+      ],
+      [
+        Math.ceil(
+          (options.sequenceLength *
+            (options.qOutputSize + 2 * options.keyValueOutputSize)) /
+            64,
+        ),
+      ],
+    );
+    return true;
+  }
+
+  if (
+    isFloat32TensorView(options.kWeight) ||
+    isFloat32TensorView(options.vWeight) ||
+    options.qWeight.type !== options.kWeight.type ||
+    options.qWeight.type !== options.vWeight.type
+  ) {
+    throw new Error("invalid Qwen2 QKV fusion state");
+  }
+
+  const rowByteLength = quantizedRowByteLength(options.qWeight, options.inputSize);
+  const params = paramsBuffer(
+    context,
+    runtime,
+    new Uint32Array([
+      options.inputSize,
+      options.qOutputSize,
+      options.keyValueOutputSize,
+      options.sequenceLength,
+      options.inputBaseOffset ?? 0,
+      rowByteLength,
+      options.qWeight.type === "q4_0" ? 4 : 8,
+      0,
+    ]),
+  );
+  encodeComputeShader(
+    runtime,
+    context.encoder,
+    qwen2QuantizedQkvProjectionSequenceShader,
+    [
+      { binding: 0, resource: { buffer: qwenTensorBuffer(runtime, options.qWeight) } },
+      { binding: 1, resource: { buffer: qwenTensorBuffer(runtime, options.kWeight) } },
+      { binding: 2, resource: { buffer: qwenTensorBuffer(runtime, options.vWeight) } },
+      { binding: 3, resource: { buffer: options.input } },
+      { binding: 4, resource: { buffer: qkvBias } },
+      { binding: 5, resource: { buffer: params } },
+      { binding: 6, resource: { buffer: options.qOutput } },
+      { binding: 7, resource: { buffer: options.kOutput } },
+      { binding: 8, resource: { buffer: options.vOutput } },
+    ],
+    [
+      Math.ceil(
+        (options.sequenceLength *
+          (options.qOutputSize + 2 * options.keyValueOutputSize)) /
+          64,
+      ),
+    ],
+  );
+  return true;
+}
+
 function encodeRmsNormSequence(
   context: ResidentQwen2GpuContext,
   runtime: WebGpuRuntime,
@@ -1044,6 +1327,93 @@ function encodeResidualAdd(
   );
 }
 
+function validateQkvProjectionShapes(options: {
+  qWeight: QwenTensorView;
+  kWeight: QwenTensorView;
+  vWeight: QwenTensorView;
+  inputSize: number;
+  qOutputSize: number;
+  keyValueOutputSize: number;
+}): void {
+  const [qOutputSize, qInputSize] = requireMatrixShape(options.qWeight, "qWeight");
+  const [kOutputSize, kInputSize] = requireMatrixShape(options.kWeight, "kWeight");
+  const [vOutputSize, vInputSize] = requireMatrixShape(options.vWeight, "vWeight");
+  if (
+    qInputSize !== options.inputSize ||
+    kInputSize !== options.inputSize ||
+    vInputSize !== options.inputSize ||
+    qOutputSize !== options.qOutputSize ||
+    kOutputSize !== options.keyValueOutputSize ||
+    vOutputSize !== options.keyValueOutputSize
+  ) {
+    throw new Error(
+      `invalid Qwen2 QKV projection shapes: q=[${qOutputSize}, ${qInputSize}], ` +
+        `k=[${kOutputSize}, ${kInputSize}], v=[${vOutputSize}, ${vInputSize}]`,
+    );
+  }
+}
+
+function canFuseQwen2QkvProjection(
+  qWeight: QwenTensorView,
+  kWeight: QwenTensorView,
+  vWeight: QwenTensorView,
+): boolean {
+  const qIsF32 = isFloat32TensorView(qWeight);
+  const kIsF32 = isFloat32TensorView(kWeight);
+  const vIsF32 = isFloat32TensorView(vWeight);
+  if (qIsF32 || kIsF32 || vIsF32) {
+    return qIsF32 && kIsF32 && vIsF32;
+  }
+  return qWeight.type === kWeight.type && qWeight.type === vWeight.type;
+}
+
+function qkvBiasBuffer(
+  context: ResidentQwen2GpuContext,
+  runtime: WebGpuRuntime,
+  options: {
+    qBias?: TensorView | Float32Array;
+    kBias?: TensorView | Float32Array;
+    vBias?: TensorView | Float32Array;
+    qOutputSize: number;
+    keyValueOutputSize: number;
+  },
+): GPUBuffer {
+  const bias = new Float32Array(options.qOutputSize + 2 * options.keyValueOutputSize);
+  copyBiasValues(options.qBias, bias, 0, options.qOutputSize, "qBias");
+  copyBiasValues(
+    options.kBias,
+    bias,
+    options.qOutputSize,
+    options.keyValueOutputSize,
+    "kBias",
+  );
+  copyBiasValues(
+    options.vBias,
+    bias,
+    options.qOutputSize + options.keyValueOutputSize,
+    options.keyValueOutputSize,
+    "vBias",
+  );
+  return tempBuffer(context, runtime, bias);
+}
+
+function copyBiasValues(
+  bias: TensorView | Float32Array | undefined,
+  target: Float32Array,
+  targetOffset: number,
+  expectedLength: number,
+  name: string,
+): void {
+  if (!bias) {
+    return;
+  }
+  const values = bias instanceof Float32Array ? bias : bias.data;
+  if (values.length !== expectedLength) {
+    throw new Error(`${name} length is ${values.length}, expected ${expectedLength}`);
+  }
+  target.set(values, targetOffset);
+}
+
 function requireMatrixShape(tensor: QwenTensorView, name: string): [number, number] {
   if (tensor.shape.length !== 2) {
     throw new Error(`${name} must be rank 2, got shape [${tensor.shape.join(", ")}]`);
@@ -1206,6 +1576,247 @@ fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
     sum = sum + weight[weightOffset + column] * input[inputOffset + column];
   }
   output[index] = sum;
+}
+`;
+
+const qwen2F32QkvProjectionSequenceShader = `
+struct Params {
+  inputSize: u32,
+  qOutputSize: u32,
+  keyValueOutputSize: u32,
+  sequenceLength: u32,
+  inputBaseOffset: u32,
+  _padding0: u32,
+  _padding1: u32,
+  _padding2: u32,
+}
+
+@group(0) @binding(0) var<storage, read> qWeight: array<f32>;
+@group(0) @binding(1) var<storage, read> kWeight: array<f32>;
+@group(0) @binding(2) var<storage, read> vWeight: array<f32>;
+@group(0) @binding(3) var<storage, read> input: array<f32>;
+@group(0) @binding(4) var<storage, read> bias: array<f32>;
+@group(0) @binding(5) var<uniform> params: Params;
+@group(0) @binding(6) var<storage, read_write> qOutput: array<f32>;
+@group(0) @binding(7) var<storage, read_write> kOutput: array<f32>;
+@group(0) @binding(8) var<storage, read_write> vOutput: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
+  let index = globalId.x;
+  let outputSize = params.qOutputSize + 2u * params.keyValueOutputSize;
+  let outputElements = params.sequenceLength * outputSize;
+  if (index >= outputElements) {
+    return;
+  }
+
+  let position = index / outputSize;
+  let projectionRow = index % outputSize;
+  let inputOffset = params.inputBaseOffset + position * params.inputSize;
+
+  if (projectionRow < params.qOutputSize) {
+    var sum = bias[projectionRow];
+    let weightOffset = projectionRow * params.inputSize;
+    for (var column = 0u; column < params.inputSize; column = column + 1u) {
+      sum = sum + qWeight[weightOffset + column] * input[inputOffset + column];
+    }
+    qOutput[position * params.qOutputSize + projectionRow] = sum;
+    return;
+  }
+
+  if (projectionRow < params.qOutputSize + params.keyValueOutputSize) {
+    let row = projectionRow - params.qOutputSize;
+    var sum = bias[params.qOutputSize + row];
+    let weightOffset = row * params.inputSize;
+    for (var column = 0u; column < params.inputSize; column = column + 1u) {
+      sum = sum + kWeight[weightOffset + column] * input[inputOffset + column];
+    }
+    kOutput[position * params.keyValueOutputSize + row] = sum;
+    return;
+  }
+
+  let row = projectionRow - params.qOutputSize - params.keyValueOutputSize;
+  var sum = bias[params.qOutputSize + params.keyValueOutputSize + row];
+  let weightOffset = row * params.inputSize;
+  for (var column = 0u; column < params.inputSize; column = column + 1u) {
+    sum = sum + vWeight[weightOffset + column] * input[inputOffset + column];
+  }
+  vOutput[position * params.keyValueOutputSize + row] = sum;
+}
+`;
+
+const qwen2QuantizedQkvProjectionSequenceShader = `
+struct Params {
+  inputSize: u32,
+  qOutputSize: u32,
+  keyValueOutputSize: u32,
+  sequenceLength: u32,
+  inputBaseOffset: u32,
+  rowByteLength: u32,
+  quantType: u32,
+  _padding0: u32,
+}
+
+@group(0) @binding(0) var<storage, read> qWeightWords: array<u32>;
+@group(0) @binding(1) var<storage, read> kWeightWords: array<u32>;
+@group(0) @binding(2) var<storage, read> vWeightWords: array<u32>;
+@group(0) @binding(3) var<storage, read> input: array<f32>;
+@group(0) @binding(4) var<storage, read> bias: array<f32>;
+@group(0) @binding(5) var<uniform> params: Params;
+@group(0) @binding(6) var<storage, read_write> qOutput: array<f32>;
+@group(0) @binding(7) var<storage, read_write> kOutput: array<f32>;
+@group(0) @binding(8) var<storage, read_write> vOutput: array<f32>;
+
+fn qByteAt(byteOffset: u32) -> u32 {
+  let word = qWeightWords[byteOffset / 4u];
+  let shift = (byteOffset % 4u) * 8u;
+  return (word >> shift) & 0xffu;
+}
+
+fn kByteAt(byteOffset: u32) -> u32 {
+  let word = kWeightWords[byteOffset / 4u];
+  let shift = (byteOffset % 4u) * 8u;
+  return (word >> shift) & 0xffu;
+}
+
+fn vByteAt(byteOffset: u32) -> u32 {
+  let word = vWeightWords[byteOffset / 4u];
+  let shift = (byteOffset % 4u) * 8u;
+  return (word >> shift) & 0xffu;
+}
+
+fn signedByte(value: u32) -> f32 {
+  if (value > 127u) {
+    return f32(i32(value) - 256);
+  }
+  return f32(value);
+}
+
+fn f16ToF32(lowByte: u32, highByte: u32) -> f32 {
+  let half = lowByte | (highByte << 8u);
+  let sign = select(1.0, -1.0, (half & 0x8000u) != 0u);
+  let exponent = (half >> 10u) & 0x1fu;
+  let fraction = half & 0x03ffu;
+
+  if (exponent == 0u) {
+    if (fraction == 0u) {
+      return sign * 0.0;
+    }
+    return sign * exp2(-14.0) * (f32(fraction) / 1024.0);
+  }
+  if (exponent == 0x1fu) {
+    return sign * 3.4028234663852886e38;
+  }
+  return sign * exp2(f32(i32(exponent) - 15)) * (1.0 + f32(fraction) / 1024.0);
+}
+
+fn qDot(row: u32, inputOffset: u32) -> f32 {
+  var sum = 0.0;
+  var sourceOffset = row * params.rowByteLength;
+  for (var base = 0u; base < params.inputSize; base = base + 32u) {
+    let scale = f16ToF32(qByteAt(sourceOffset), qByteAt(sourceOffset + 1u));
+    sourceOffset = sourceOffset + 2u;
+
+    if (params.quantType == 4u) {
+      for (var packedIndex = 0u; packedIndex < 16u; packedIndex = packedIndex + 1u) {
+        let packed = qByteAt(sourceOffset + packedIndex);
+        let low = f32(i32(packed & 0x0fu) - 8) * scale;
+        let high = f32(i32((packed >> 4u) & 0x0fu) - 8) * scale;
+        sum = sum + low * input[inputOffset + base + packedIndex];
+        sum = sum + high * input[inputOffset + base + 16u + packedIndex];
+      }
+      sourceOffset = sourceOffset + 16u;
+    } else {
+      for (var element = 0u; element < 32u; element = element + 1u) {
+        sum = sum + signedByte(qByteAt(sourceOffset + element)) * scale * input[inputOffset + base + element];
+      }
+      sourceOffset = sourceOffset + 32u;
+    }
+  }
+  return sum;
+}
+
+fn kDot(row: u32, inputOffset: u32) -> f32 {
+  var sum = 0.0;
+  var sourceOffset = row * params.rowByteLength;
+  for (var base = 0u; base < params.inputSize; base = base + 32u) {
+    let scale = f16ToF32(kByteAt(sourceOffset), kByteAt(sourceOffset + 1u));
+    sourceOffset = sourceOffset + 2u;
+
+    if (params.quantType == 4u) {
+      for (var packedIndex = 0u; packedIndex < 16u; packedIndex = packedIndex + 1u) {
+        let packed = kByteAt(sourceOffset + packedIndex);
+        let low = f32(i32(packed & 0x0fu) - 8) * scale;
+        let high = f32(i32((packed >> 4u) & 0x0fu) - 8) * scale;
+        sum = sum + low * input[inputOffset + base + packedIndex];
+        sum = sum + high * input[inputOffset + base + 16u + packedIndex];
+      }
+      sourceOffset = sourceOffset + 16u;
+    } else {
+      for (var element = 0u; element < 32u; element = element + 1u) {
+        sum = sum + signedByte(kByteAt(sourceOffset + element)) * scale * input[inputOffset + base + element];
+      }
+      sourceOffset = sourceOffset + 32u;
+    }
+  }
+  return sum;
+}
+
+fn vDot(row: u32, inputOffset: u32) -> f32 {
+  var sum = 0.0;
+  var sourceOffset = row * params.rowByteLength;
+  for (var base = 0u; base < params.inputSize; base = base + 32u) {
+    let scale = f16ToF32(vByteAt(sourceOffset), vByteAt(sourceOffset + 1u));
+    sourceOffset = sourceOffset + 2u;
+
+    if (params.quantType == 4u) {
+      for (var packedIndex = 0u; packedIndex < 16u; packedIndex = packedIndex + 1u) {
+        let packed = vByteAt(sourceOffset + packedIndex);
+        let low = f32(i32(packed & 0x0fu) - 8) * scale;
+        let high = f32(i32((packed >> 4u) & 0x0fu) - 8) * scale;
+        sum = sum + low * input[inputOffset + base + packedIndex];
+        sum = sum + high * input[inputOffset + base + 16u + packedIndex];
+      }
+      sourceOffset = sourceOffset + 16u;
+    } else {
+      for (var element = 0u; element < 32u; element = element + 1u) {
+        sum = sum + signedByte(vByteAt(sourceOffset + element)) * scale * input[inputOffset + base + element];
+      }
+      sourceOffset = sourceOffset + 32u;
+    }
+  }
+  return sum;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
+  let index = globalId.x;
+  let outputSize = params.qOutputSize + 2u * params.keyValueOutputSize;
+  let outputElements = params.sequenceLength * outputSize;
+  if (index >= outputElements) {
+    return;
+  }
+
+  let position = index / outputSize;
+  let projectionRow = index % outputSize;
+  let inputOffset = params.inputBaseOffset + position * params.inputSize;
+
+  if (projectionRow < params.qOutputSize) {
+    qOutput[position * params.qOutputSize + projectionRow] =
+      bias[projectionRow] + qDot(projectionRow, inputOffset);
+    return;
+  }
+
+  if (projectionRow < params.qOutputSize + params.keyValueOutputSize) {
+    let row = projectionRow - params.qOutputSize;
+    kOutput[position * params.keyValueOutputSize + row] =
+      bias[params.qOutputSize + row] + kDot(row, inputOffset);
+    return;
+  }
+
+  let row = projectionRow - params.qOutputSize - params.keyValueOutputSize;
+  vOutput[position * params.keyValueOutputSize + row] =
+    bias[params.qOutputSize + params.keyValueOutputSize + row] + vDot(row, inputOffset);
 }
 `;
 

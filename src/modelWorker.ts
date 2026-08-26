@@ -8,6 +8,7 @@ import {
 import { nextTokenWithCacheBackend as nextGptNeoTokenWithCacheBackend } from "./engine/src/gpt-neo/model";
 import {
   allocateQwen2ModelKvCache,
+  resetQwen2ModelKvCache,
   type Qwen2ModelKvCache,
 } from "./engine/src/qwen2/attentionCache";
 import type { GgufTensorInfo } from "./engine/src/qwen2/gguf";
@@ -18,6 +19,11 @@ import {
   type Qwen2LoaderProgress,
 } from "./engine/src/qwen2/loader";
 import { qwen2NextTokenWithCacheBackend } from "./engine/src/qwen2/model";
+import {
+  qwen2WebGpuCacheSequenceLength,
+  qwen2WebGpuPrefillSafetyError,
+  qwen2WebGpuSafetyLimits,
+} from "./engine/src/qwen2/webgpuSafety";
 import {
   createWebGpuRuntime,
   detectWebGpuSupport,
@@ -30,6 +36,7 @@ import {
   modelCatalog,
   normalizeGptNeoSummary,
   type AppLoadedModelSummary,
+  type AppInferencePerformance,
   type AppLoaderProgress,
   type AppTensorSummary,
   type AppWorkerRequest,
@@ -61,7 +68,13 @@ type WorkerLoadedModel =
       runtime?: WebGpuRuntime;
     };
 
+interface WorkerNextTokenResult {
+  tokenId: number;
+  performance?: AppInferencePerformance;
+}
+
 let workerLoadedModel: WorkerLoadedModel | null = null;
+let activeQwenInferenceRequestId: string | null = null;
 
 export function installModelWorker(
   selfScope: ModelWorkerScope = globalThis as unknown as ModelWorkerScope,
@@ -91,6 +104,7 @@ async function handleNextTokenMessage(
   selfScope: ModelWorkerScope,
   message: Extract<AppWorkerRequest, { type: "next-token" }>,
 ): Promise<void> {
+  let ownsActiveQwenRequest = false;
   try {
     if (!workerLoadedModel) {
       throw new Error("Model must be loaded before running next-token inference");
@@ -101,36 +115,32 @@ async function handleNextTokenMessage(
       );
     }
 
-    const result =
-      workerLoadedModel.modelId === "tinystories"
-        ? await nextGptNeoTokenWithCacheBackend(
-            workerLoadedModel.model,
-            message.inputIds,
-            workerLoadedModel.cache,
-            {
-              backend: workerLoadedModel.backend,
-              runtime: workerLoadedModel.runtime,
-              temperature: message.temperature,
-              topK: message.topK,
-            },
-          )
-        : await qwen2NextTokenWithCacheBackend(
-            workerLoadedModel.model,
-            message.inputIds,
-            workerLoadedModel.cache,
-            {
-              backend: workerLoadedModel.backend,
-              runtime: workerLoadedModel.runtime,
-              temperature: message.temperature,
-              topK: message.topK,
-            },
-          );
+    let result: WorkerNextTokenResult;
+    if (workerLoadedModel.modelId === "tinystories") {
+      const nextTokenResult = await nextGptNeoTokenWithCacheBackend(
+        workerLoadedModel.model,
+        message.inputIds,
+        workerLoadedModel.cache,
+        {
+          backend: workerLoadedModel.backend,
+          runtime: workerLoadedModel.runtime,
+          temperature: message.temperature,
+          topK: message.topK,
+        },
+      );
+      result = { tokenId: nextTokenResult.tokenId };
+    } else {
+      result = await runQwen2NextToken(workerLoadedModel, message, () => {
+        ownsActiveQwenRequest = true;
+      });
+    }
 
     selfScope.postMessage({
       type: "next-token-result",
       requestId: message.requestId,
       modelId: message.modelId,
       tokenId: result.tokenId,
+      performance: result.performance,
     });
   } catch (error: unknown) {
     selfScope.postMessage({
@@ -139,7 +149,148 @@ async function handleNextTokenMessage(
       modelId: message.modelId,
       error: error instanceof Error ? error.message : String(error),
     });
+  } finally {
+    if (ownsActiveQwenRequest) {
+      activeQwenInferenceRequestId = null;
+    }
   }
+}
+
+async function runQwen2NextToken(
+  workerModel: Extract<WorkerLoadedModel, { modelId: "qwen" }>,
+  message: Extract<AppWorkerRequest, { type: "next-token" }>,
+  markActive: () => void,
+): Promise<WorkerNextTokenResult> {
+  if (activeQwenInferenceRequestId) {
+    throw new Error("Qwen WebGPU inference is still running. Wait for the current token to finish.");
+  }
+
+  activeQwenInferenceRequestId = message.requestId ?? "qwen-inference";
+  markActive();
+  if (message.resetCache) {
+    resetQwen2ModelKvCache(workerModel.cache);
+  }
+  validateQwen2WebGpuWorkload(workerModel, message);
+  logQwen2WebGpuWorkload(workerModel, message);
+
+  const performanceProfile = qwen2InferencePerformanceProfile(workerModel.cache, message);
+  const startedAt = nowMs();
+  const result = await qwen2NextTokenWithCacheBackend(
+    workerModel.model,
+    message.inputIds,
+    workerModel.cache,
+    {
+      backend: workerModel.backend,
+      runtime: workerModel.runtime,
+      temperature: message.temperature,
+      topK: message.topK,
+    },
+  );
+  const elapsedMs = nowMs() - startedAt;
+
+  return {
+    tokenId: result.tokenId,
+    performance: {
+      phase: performanceProfile.phase,
+      tokenCount: performanceProfile.tokenCount,
+      elapsedMs,
+      tokensPerSecond: tokensPerSecond(performanceProfile.tokenCount, elapsedMs),
+    },
+  };
+}
+
+function qwen2InferencePerformanceProfile(
+  cache: Qwen2ModelKvCache,
+  message: Extract<AppWorkerRequest, { type: "next-token" }>,
+): Pick<AppInferencePerformance, "phase" | "tokenCount"> {
+  const phase = qwen2RequestNeedsPrefill(cache.inputIds, message.inputIds, message.resetCache)
+    ? "prefill"
+    : "decode";
+  const tokenCount =
+    phase === "prefill"
+      ? message.inputIds.length
+      : Math.max(1, message.inputIds.length - cache.inputIds.length);
+  return { phase, tokenCount };
+}
+
+function tokensPerSecond(tokenCount: number, elapsedMs: number): number {
+  if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) {
+    return 0;
+  }
+  return tokenCount / (elapsedMs / 1000);
+}
+
+function nowMs(): number {
+  return globalThis.performance?.now() ?? Date.now();
+}
+
+function validateQwen2WebGpuWorkload(
+  workerModel: Extract<WorkerLoadedModel, { modelId: "qwen" }>,
+  message: Extract<AppWorkerRequest, { type: "next-token" }>,
+): void {
+  if (workerModel.backend !== "webgpu") {
+    return;
+  }
+
+  if (message.inputIds.length > workerModel.cache.maximumSequenceLength) {
+    throw new Error(
+      `Qwen WebGPU cache is capped at ${workerModel.cache.maximumSequenceLength} tokens ` +
+        `for GPU stability. Current request has ${message.inputIds.length} tokens.`,
+    );
+  }
+
+  if (qwen2RequestNeedsPrefill(workerModel.cache.inputIds, message.inputIds, message.resetCache)) {
+    const safetyError = qwen2WebGpuPrefillSafetyError(message.inputIds.length);
+    if (safetyError) {
+      throw new Error(safetyError);
+    }
+  }
+}
+
+function logQwen2WebGpuWorkload(
+  workerModel: Extract<WorkerLoadedModel, { modelId: "qwen" }>,
+  message: Extract<AppWorkerRequest, { type: "next-token" }>,
+): void {
+  if (workerModel.backend !== "webgpu") {
+    return;
+  }
+
+  const tokenCount = message.inputIds.length;
+  const cacheLength = workerModel.cache.inputIds.length;
+  const prefill = qwen2RequestNeedsPrefill(
+    workerModel.cache.inputIds,
+    message.inputIds,
+    message.resetCache,
+  );
+  console.info("[broslm] Qwen WebGPU workload", {
+    requestId: message.requestId,
+    mode: prefill ? "prefill" : "decode",
+    promptTokens: tokenCount,
+    cacheTokens: cacheLength,
+    cacheLimit: workerModel.cache.maximumSequenceLength,
+    prefillLimit: qwen2WebGpuSafetyLimits.maxPrefillTokens,
+    layers: workerModel.model.config.numberOfLayers,
+    hiddenSize: workerModel.model.config.hiddenSize,
+    keyValueHiddenSize: workerModel.model.config.keyValueHiddenSize,
+    estimatedAttentionCells: prefill ? tokenCount * tokenCount * workerModel.model.config.numberOfHeads : tokenCount,
+  });
+}
+
+function qwen2RequestNeedsPrefill(
+  cacheInputIds: readonly number[],
+  inputIds: readonly number[],
+  resetCache = false,
+): boolean {
+  if (resetCache || cacheInputIds.length === inputIds.length || cacheInputIds.length > inputIds.length) {
+    return true;
+  }
+
+  for (let index = 0; index < cacheInputIds.length; index += 1) {
+    if (cacheInputIds[index] !== inputIds[index]) {
+      return true;
+    }
+  }
+  return false;
 }
 
 async function loadRequestedModel(
@@ -197,7 +348,12 @@ async function loadRequestedModel(
     workerLoadedModel = {
       modelId: "qwen",
       model: loadedModel,
-      cache: allocateQwen2ModelKvCache(loadedModel.config),
+      cache: allocateQwen2ModelKvCache(
+        loadedModel.config,
+        backend === "webgpu"
+          ? qwen2WebGpuCacheSequenceLength(loadedModel.config.maximumSequenceLength)
+          : loadedModel.config.maximumSequenceLength,
+      ),
       backend,
       runtime,
     };
