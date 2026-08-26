@@ -4,7 +4,11 @@ import {
   resetModelKvCache,
   type ModelKvCache,
 } from "./attentionCache";
-import { gptNeoPrefillLogitsResidentGpu } from "./gpuModel";
+import {
+  gptNeoDecodeTokenLogitsResidentGpu,
+  gptNeoPrefillLogitsResidentGpu,
+  hasGptNeoResidentGpuCache,
+} from "./gpuModel";
 import type { LoadedModel, TensorView } from "./loader";
 import { embeddingLookupGpu } from "../primitives/embeddingLookup";
 import { layerNorm } from "../primitives/layerNorm";
@@ -309,7 +313,11 @@ async function lastTokenLogitsWithCacheGpu(
   validateInputIds(model, inputIds);
   validateModelKvCache(model, cache);
 
-  if (!cachePrefixMatches(cache.inputIds, inputIds) || cache.inputIds.length === inputIds.length) {
+  if (
+    !cachePrefixMatches(cache.inputIds, inputIds) ||
+    cache.inputIds.length === inputIds.length ||
+    !hasGptNeoResidentGpuCache(model, cache, runtime)
+  ) {
     return prefillLogitsGpu(model, inputIds, cache, runtime);
   }
 
@@ -380,37 +388,7 @@ async function decodeTokenLogitsGpu(
   cache: ModelKvCache,
   runtime: WebGpuRuntime,
 ): Promise<Float32Array> {
-  const { hiddenSize } = model.config;
-  let hiddenState = await embedTokenAtPositionGpu(model, tokenId, position, runtime);
-
-  for (let layerIndex = 0; layerIndex < model.weights.layers.length; layerIndex += 1) {
-    const layerWeights = model.weights.layers[layerIndex];
-    const layerCache = cache.layers[layerIndex];
-    if (!layerWeights || !layerCache) {
-      throw new Error(`missing layer/cache at index ${layerIndex}`);
-    }
-    hiddenState = await transformerLayerIncrementalGpu(
-      runtime,
-      hiddenState,
-      position,
-      model.config,
-      layerWeights,
-      layerCache,
-    );
-  }
-
-  const finalHidden = await layerNormGpu(
-    runtime,
-    hiddenState,
-    model.weights.finalLayerNorm.weight,
-    model.weights.finalLayerNorm.bias,
-    {
-      featureSize: hiddenSize,
-      epsilon: model.config.layerNormEpsilon,
-    },
-  );
-
-  return matrixVectorMultiplyGpu(runtime, model.weights.lmHead, finalHidden);
+  return gptNeoDecodeTokenLogitsResidentGpu(model, tokenId, position, cache, runtime);
 }
 
 function embedTokenAtPosition(
