@@ -1,6 +1,7 @@
 import type { TensorView } from "../tensor";
 import {
   createStorageBuffer,
+  createStaticStorageBuffer,
   destroyBuffers,
   readFloat32Buffer,
   runComputeShader,
@@ -57,8 +58,8 @@ export async function layerNormGpu(
   }
 
   const inputBuffer = createStorageBuffer(runtime, input);
-  const weightBuffer = createStorageBuffer(runtime, weight.data);
-  const biasBuffer = createStorageBuffer(runtime, bias.data);
+  const weightBuffer = createStaticStorageBuffer(runtime, weight.data);
+  const biasBuffer = createStaticStorageBuffer(runtime, bias.data);
   const outputBuffer = createStorageBuffer(runtime, featureSize * Float32Array.BYTES_PER_ELEMENT);
   const paramsBuffer = createStorageBuffer(
     runtime,
@@ -81,7 +82,7 @@ export async function layerNormGpu(
     );
     return readFloat32Buffer(runtime, outputBuffer, featureSize);
   } finally {
-    destroyBuffers(inputBuffer, weightBuffer, biasBuffer, outputBuffer, paramsBuffer);
+    destroyBuffers(inputBuffer, outputBuffer, paramsBuffer);
   }
 }
 

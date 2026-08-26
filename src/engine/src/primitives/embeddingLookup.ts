@@ -1,6 +1,7 @@
 import type { TensorView } from "../tensor";
 import {
   createStorageBuffer,
+  createStaticStorageBuffer,
   destroyBuffers,
   readFloat32Buffer,
   runComputeShader,
@@ -41,7 +42,7 @@ export async function embeddingLookupGpu(
     throw new RangeError(`tokenId must be an integer in [0, ${entryCount}), got ${tokenId}`);
   }
 
-  const embeddingBuffer = createStorageBuffer(runtime, embedding.data);
+  const embeddingBuffer = createStaticStorageBuffer(runtime, embedding.data);
   const outputBuffer = createStorageBuffer(runtime, embeddingSize * Float32Array.BYTES_PER_ELEMENT);
   const paramsBuffer = createStorageBuffer(
     runtime,
@@ -62,7 +63,7 @@ export async function embeddingLookupGpu(
     );
     return readFloat32Buffer(runtime, outputBuffer, embeddingSize);
   } finally {
-    destroyBuffers(embeddingBuffer, outputBuffer, paramsBuffer);
+    destroyBuffers(outputBuffer, paramsBuffer);
   }
 }
 

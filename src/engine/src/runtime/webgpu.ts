@@ -18,6 +18,8 @@ export interface WebGpuRuntime {
   backend: "webgpu";
   adapter: GPUAdapter;
   device: GPUDevice;
+  staticBufferCache: WeakMap<object, GPUBuffer>;
+  computePipelineCache: Map<string, GPUComputePipeline>;
 }
 
 export interface WebGpuRuntimeOptions {
@@ -113,6 +115,8 @@ export async function createWebGpuRuntime(
     backend: "webgpu",
     adapter,
     device,
+    staticBufferCache: new WeakMap(),
+    computePipelineCache: new Map(),
   };
 }
 
@@ -199,6 +203,22 @@ export function createStorageBuffer(
   return buffer;
 }
 
+export function createStaticStorageBuffer(
+  runtime: WebGpuRuntime,
+  data: Float32Array | Uint32Array | Uint8Array | ArrayBuffer,
+  usage: GPUBufferUsageFlags =
+    webGpuBufferUsage.storage | webGpuBufferUsage.copyDst | webGpuBufferUsage.copySrc,
+): GPUBuffer {
+  const cached = runtime.staticBufferCache.get(data);
+  if (cached) {
+    return cached;
+  }
+
+  const buffer = createStorageBuffer(runtime, data, usage);
+  runtime.staticBufferCache.set(data, buffer);
+  return buffer;
+}
+
 export async function readFloat32Buffer(
   runtime: WebGpuRuntime,
   source: GPUBuffer,
@@ -228,15 +248,7 @@ export async function runComputeShader(
   workgroups: readonly [number, number?, number?],
   constants?: Record<string, number>,
 ): Promise<void> {
-  const shaderModule = runtime.device.createShaderModule({ code: shaderCode });
-  const pipeline = runtime.device.createComputePipeline({
-    layout: "auto",
-    compute: {
-      module: shaderModule,
-      entryPoint: "main",
-      constants,
-    },
-  });
+  const pipeline = getCachedComputePipeline(runtime, shaderCode, constants);
   const bindGroup = runtime.device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
     entries,
@@ -248,7 +260,45 @@ export async function runComputeShader(
   pass.dispatchWorkgroups(workgroups[0], workgroups[1] ?? 1, workgroups[2] ?? 1);
   pass.end();
   runtime.device.queue.submit([encoder.finish()]);
-  await runtime.device.queue.onSubmittedWorkDone();
+}
+
+function getCachedComputePipeline(
+  runtime: WebGpuRuntime,
+  shaderCode: string,
+  constants?: Record<string, number>,
+): GPUComputePipeline {
+  const cacheKey = computePipelineCacheKey(shaderCode, constants);
+  const cached = runtime.computePipelineCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  const shaderModule = runtime.device.createShaderModule({ code: shaderCode });
+  const pipeline = runtime.device.createComputePipeline({
+    layout: "auto",
+    compute: {
+      module: shaderModule,
+      entryPoint: "main",
+      constants,
+    },
+  });
+  runtime.computePipelineCache.set(cacheKey, pipeline);
+  return pipeline;
+}
+
+function computePipelineCacheKey(
+  shaderCode: string,
+  constants?: Record<string, number>,
+): string {
+  if (!constants) {
+    return shaderCode;
+  }
+
+  const constantKey = Object.keys(constants)
+    .sort()
+    .map((key) => `${key}:${constants[key]}`)
+    .join(",");
+  return `${shaderCode}\nconstants:${constantKey}`;
 }
 
 export function destroyBuffers(...buffers: Array<GPUBuffer | undefined>): void {

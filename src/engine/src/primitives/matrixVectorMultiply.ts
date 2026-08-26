@@ -1,6 +1,7 @@
 import type { TensorView } from "../tensor";
 import {
   createStorageBuffer,
+  createStaticStorageBuffer,
   destroyBuffers,
   readFloat32Buffer,
   runComputeShader,
@@ -51,13 +52,16 @@ export async function matrixVectorMultiplyGpu(
   const [outputSize, inputSize] = requireMatrixShape(weight, "weight");
   const inputOffset = options.inputOffset ?? 0;
   const bias = options.bias ? resolveBias(options.bias, outputSize) : new Float32Array(outputSize);
+  const biasIsStaticTensor = options.bias !== undefined && !(options.bias instanceof Float32Array);
 
   validateSpan("input", input.length, inputOffset, inputSize);
 
   const output = createStorageBuffer(runtime, outputSize * Float32Array.BYTES_PER_ELEMENT);
-  const weightBuffer = createStorageBuffer(runtime, weight.data);
+  const weightBuffer = createStaticStorageBuffer(runtime, weight.data);
   const inputBuffer = createStorageBuffer(runtime, input);
-  const biasBuffer = createStorageBuffer(runtime, bias);
+  const biasBuffer = biasIsStaticTensor
+    ? createStaticStorageBuffer(runtime, bias)
+    : createStorageBuffer(runtime, bias);
   const paramsBuffer = createStorageBuffer(
     runtime,
     new Uint32Array([inputSize, inputOffset, outputSize, 0]),
@@ -79,7 +83,7 @@ export async function matrixVectorMultiplyGpu(
     );
     return readFloat32Buffer(runtime, output, outputSize);
   } finally {
-    destroyBuffers(output, weightBuffer, inputBuffer, biasBuffer, paramsBuffer);
+    destroyBuffers(output, inputBuffer, biasIsStaticTensor ? undefined : biasBuffer, paramsBuffer);
   }
 }
 

@@ -4,6 +4,7 @@ import { matrixVectorMultiply } from "../primitives/matrixVectorMultiply";
 import { matrixVectorMultiplyGpu } from "../primitives/matrixVectorMultiply";
 import {
   createStorageBuffer,
+  createStaticStorageBuffer,
   destroyBuffers,
   readFloat32Buffer,
   runComputeShader,
@@ -111,12 +112,15 @@ export async function matrixVectorMultiplyQwenGpu(
   const [outputSize, inputSize] = requireMatrixShape(weight, "weight");
   const inputOffset = options.inputOffset ?? 0;
   const bias = options.bias ? resolveBias(options.bias, outputSize) : new Float32Array(outputSize);
+  const biasIsStaticTensor = options.bias !== undefined && !(options.bias instanceof Float32Array);
   validateSpan("input", input.length, inputOffset, inputSize);
 
   const rowByteLength = quantizedRowByteLength(weight.type, inputSize);
-  const weightBuffer = createStorageBuffer(runtime, weight.data);
+  const weightBuffer = createStaticStorageBuffer(runtime, weight.data);
   const inputBuffer = createStorageBuffer(runtime, input);
-  const biasBuffer = createStorageBuffer(runtime, bias);
+  const biasBuffer = biasIsStaticTensor
+    ? createStaticStorageBuffer(runtime, bias)
+    : createStorageBuffer(runtime, bias);
   const outputBuffer = createStorageBuffer(runtime, outputSize * Float32Array.BYTES_PER_ELEMENT);
   const paramsBuffer = createStorageBuffer(
     runtime,
@@ -148,7 +152,7 @@ export async function matrixVectorMultiplyQwenGpu(
     );
     return readFloat32Buffer(runtime, outputBuffer, outputSize);
   } finally {
-    destroyBuffers(weightBuffer, inputBuffer, biasBuffer, outputBuffer, paramsBuffer);
+    destroyBuffers(inputBuffer, biasIsStaticTensor ? undefined : biasBuffer, outputBuffer, paramsBuffer);
   }
 }
 
@@ -277,7 +281,7 @@ export async function embeddingLookupQwenGpu(
   }
 
   const rowByteLength = quantizedRowByteLength(embedding.type, embeddingSize);
-  const dataBuffer = createStorageBuffer(runtime, embedding.data);
+  const dataBuffer = createStaticStorageBuffer(runtime, embedding.data);
   const outputBuffer = createStorageBuffer(runtime, embeddingSize * Float32Array.BYTES_PER_ELEMENT);
   const paramsBuffer = createStorageBuffer(
     runtime,
@@ -303,7 +307,7 @@ export async function embeddingLookupQwenGpu(
     );
     return readFloat32Buffer(runtime, outputBuffer, embeddingSize);
   } finally {
-    destroyBuffers(dataBuffer, outputBuffer, paramsBuffer);
+    destroyBuffers(outputBuffer, paramsBuffer);
   }
 }
 
