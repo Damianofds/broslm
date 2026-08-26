@@ -4,6 +4,7 @@ import {
   resetModelKvCache,
   type ModelKvCache,
 } from "./attentionCache";
+import { gptNeoPrefillLogitsResidentGpu } from "./gpuModel";
 import type { LoadedModel, TensorView } from "./loader";
 import { embeddingLookupGpu } from "../primitives/embeddingLookup";
 import { layerNorm } from "../primitives/layerNorm";
@@ -328,44 +329,7 @@ async function prefillLogitsGpu(
   cache: ModelKvCache,
   runtime: WebGpuRuntime,
 ): Promise<Float32Array> {
-  resetModelKvCache(cache);
-
-  const sequenceLength = inputIds.length;
-  const { hiddenSize } = model.config;
-  let hiddenState = await embedInputIdsGpu(model, inputIds, runtime);
-
-  for (let layerIndex = 0; layerIndex < model.weights.layers.length; layerIndex += 1) {
-    const layerWeights = model.weights.layers[layerIndex];
-    const layerCache = cache.layers[layerIndex];
-    if (!layerWeights || !layerCache) {
-      throw new Error(`missing layer/cache at index ${layerIndex}`);
-    }
-    hiddenState = await transformerLayerPrefillGpu(
-      runtime,
-      hiddenState,
-      sequenceLength,
-      model.config,
-      layerWeights,
-      layerCache,
-    );
-  }
-
-  const lastTokenOffset = (sequenceLength - 1) * hiddenSize;
-  const finalHidden = await layerNormGpu(
-    runtime,
-    hiddenState,
-    model.weights.finalLayerNorm.weight,
-    model.weights.finalLayerNorm.bias,
-    {
-      inputOffset: lastTokenOffset,
-      featureSize: hiddenSize,
-      epsilon: model.config.layerNormEpsilon,
-    },
-  );
-
-  const logits = await matrixVectorMultiplyGpu(runtime, model.weights.lmHead, finalHidden);
-  cache.inputIds.push(...inputIds);
-  return logits;
+  return gptNeoPrefillLogitsResidentGpu(model, inputIds, cache, runtime);
 }
 
 function decodeTokenLogits(

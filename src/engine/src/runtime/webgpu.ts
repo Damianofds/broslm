@@ -248,18 +248,29 @@ export async function runComputeShader(
   workgroups: readonly [number, number?, number?],
   constants?: Record<string, number>,
 ): Promise<void> {
+  const encoder = runtime.device.createCommandEncoder();
+  encodeComputeShader(runtime, encoder, shaderCode, entries, workgroups, constants);
+  runtime.device.queue.submit([encoder.finish()]);
+}
+
+export function encodeComputeShader(
+  runtime: WebGpuRuntime,
+  encoder: GPUCommandEncoder,
+  shaderCode: string,
+  entries: GPUBindGroupEntry[],
+  workgroups: readonly [number, number?, number?],
+  constants?: Record<string, number>,
+): void {
   const pipeline = getCachedComputePipeline(runtime, shaderCode, constants);
   const bindGroup = runtime.device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
     entries,
   });
-  const encoder = runtime.device.createCommandEncoder();
   const pass = encoder.beginComputePass();
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, bindGroup);
   pass.dispatchWorkgroups(workgroups[0], workgroups[1] ?? 1, workgroups[2] ?? 1);
   pass.end();
-  runtime.device.queue.submit([encoder.finish()]);
 }
 
 function getCachedComputePipeline(
