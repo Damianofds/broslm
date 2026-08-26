@@ -1,3 +1,12 @@
+import {
+  createStorageBuffer,
+  destroyBuffers,
+  readFloat32Buffer,
+  runComputeShader,
+  type WebGpuRuntime,
+  webGpuBufferUsage,
+} from "../runtime/webgpu";
+
 export function silu(
   input: Float32Array,
   output: Float32Array,
@@ -14,6 +23,63 @@ export function silu(
     output[outputOffset + index] = value / (1 + Math.exp(-value));
   }
 }
+
+export async function siluGpu(
+  runtime: WebGpuRuntime,
+  input: Float32Array,
+  options: { inputOffset?: number; length?: number } = {},
+): Promise<Float32Array> {
+  const inputOffset = options.inputOffset ?? 0;
+  const length = options.length ?? input.length - inputOffset;
+  validateSpan("input", input.length, inputOffset, length);
+
+  const inputBuffer = createStorageBuffer(runtime, input);
+  const outputBuffer = createStorageBuffer(runtime, length * Float32Array.BYTES_PER_ELEMENT);
+  const paramsBuffer = createStorageBuffer(
+    runtime,
+    new Uint32Array([inputOffset, length, 0, 0]),
+    webGpuBufferUsage.uniform | webGpuBufferUsage.copyDst,
+  );
+
+  try {
+    await runComputeShader(
+      runtime,
+      siluShader,
+      [
+        { binding: 0, resource: { buffer: inputBuffer } },
+        { binding: 1, resource: { buffer: paramsBuffer } },
+        { binding: 2, resource: { buffer: outputBuffer } },
+      ],
+      [Math.ceil(length / 128)],
+    );
+    return readFloat32Buffer(runtime, outputBuffer, length);
+  } finally {
+    destroyBuffers(inputBuffer, outputBuffer, paramsBuffer);
+  }
+}
+
+const siluShader = `
+struct Params {
+  inputOffset: u32,
+  length: u32,
+  _padding0: u32,
+  _padding1: u32,
+}
+
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
+  let index = globalId.x;
+  if (index >= params.length) {
+    return;
+  }
+  let value = input[params.inputOffset + index];
+  output[index] = value / (1.0 + exp(-value));
+}
+`;
 
 function validateSpan(name: string, bufferLength: number, offset: number, length: number): void {
   if (!Number.isInteger(offset) || offset < 0) {

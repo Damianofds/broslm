@@ -5,7 +5,7 @@ import {
   type LoadedModel as LoadedGptNeoModel,
   type LoaderProgress as GptNeoLoaderProgress,
 } from "./engine/src/gpt-neo/loader";
-import { nextTokenWithCache as nextGptNeoTokenWithCache } from "./engine/src/gpt-neo/model";
+import { nextTokenWithCacheBackend as nextGptNeoTokenWithCacheBackend } from "./engine/src/gpt-neo/model";
 import {
   allocateQwen2ModelKvCache,
   type Qwen2ModelKvCache,
@@ -17,7 +17,14 @@ import {
   type LoadedQwen2Model,
   type Qwen2LoaderProgress,
 } from "./engine/src/qwen2/loader";
-import { qwen2NextTokenWithCache } from "./engine/src/qwen2/model";
+import { qwen2NextTokenWithCacheBackend } from "./engine/src/qwen2/model";
+import {
+  createWebGpuRuntime,
+  detectWebGpuSupport,
+  resolveInferenceBackend,
+  type InferenceBackend,
+  type WebGpuRuntime,
+} from "./engine/src/runtime/webgpu";
 import { createQwen2TokenizerPartsFromGgufMetadata } from "./engine/src/qwen2/tokenizer";
 import {
   modelCatalog,
@@ -43,11 +50,15 @@ type WorkerLoadedModel =
       modelId: "tinystories";
       model: LoadedGptNeoModel;
       cache: ModelKvCache;
+      backend: InferenceBackend;
+      runtime?: WebGpuRuntime;
     }
   | {
       modelId: "qwen";
       model: LoadedQwen2Model;
       cache: Qwen2ModelKvCache;
+      backend: InferenceBackend;
+      runtime?: WebGpuRuntime;
     };
 
 let workerLoadedModel: WorkerLoadedModel | null = null;
@@ -63,7 +74,7 @@ export function installModelWorker(
     }
 
     if (message.type === "next-token") {
-      handleNextTokenMessage(selfScope, message);
+      void handleNextTokenMessage(selfScope, message);
       return;
     }
 
@@ -76,10 +87,10 @@ export function installModelWorker(
   });
 }
 
-function handleNextTokenMessage(
+async function handleNextTokenMessage(
   selfScope: ModelWorkerScope,
   message: Extract<AppWorkerRequest, { type: "next-token" }>,
-): void {
+): Promise<void> {
   try {
     if (!workerLoadedModel) {
       throw new Error("Model must be loaded before running next-token inference");
@@ -92,20 +103,24 @@ function handleNextTokenMessage(
 
     const result =
       workerLoadedModel.modelId === "tinystories"
-        ? nextGptNeoTokenWithCache(
+        ? await nextGptNeoTokenWithCacheBackend(
             workerLoadedModel.model,
             message.inputIds,
             workerLoadedModel.cache,
             {
+              backend: workerLoadedModel.backend,
+              runtime: workerLoadedModel.runtime,
               temperature: message.temperature,
               topK: message.topK,
             },
           )
-        : qwen2NextTokenWithCache(
+        : await qwen2NextTokenWithCacheBackend(
             workerLoadedModel.model,
             message.inputIds,
             workerLoadedModel.cache,
             {
+              backend: workerLoadedModel.backend,
+              runtime: workerLoadedModel.runtime,
               temperature: message.temperature,
               topK: message.topK,
             },
@@ -133,6 +148,15 @@ async function loadRequestedModel(
   fetchImpl?: typeof fetch,
 ): Promise<void> {
   try {
+    const backend = await resolveRequestedBackend(message);
+    const runtime =
+      backend === "webgpu"
+        ? await createWebGpuRuntime(undefined, {
+            requiredStorageBufferBindingSize:
+              modelCatalog[message.modelId].backendPolicy.minimumStorageBufferBindingSize,
+          })
+        : undefined;
+
     if (message.modelId === "tinystories") {
       const loadedModel = await loadGptNeoModel({
         baseUrl: message.baseUrl,
@@ -148,12 +172,15 @@ async function loadRequestedModel(
         modelId: "tinystories",
         model: loadedModel,
         cache: allocateModelKvCache(loadedModel.config),
+        backend,
+        runtime,
       };
       selfScope.postMessage({
         type: "model-ready",
         requestId: message.requestId,
         modelId: "tinystories",
-        summary: normalizeGptNeoSummary(summarizeLoadedModel(loadedModel)),
+        backend,
+        summary: normalizeGptNeoSummary(summarizeLoadedModel(loadedModel), backend),
       });
       return;
     }
@@ -171,12 +198,15 @@ async function loadRequestedModel(
       modelId: "qwen",
       model: loadedModel,
       cache: allocateQwen2ModelKvCache(loadedModel.config),
+      backend,
+      runtime,
     };
     selfScope.postMessage({
       type: "model-ready",
       requestId: message.requestId,
       modelId: "qwen",
-      summary: summarizeQwenForApp(loadedModel),
+      backend,
+      summary: summarizeQwenForApp(loadedModel, backend),
       tokenizer: {
         kind: "qwen2-gguf",
         parts: tokenizerParts,
@@ -191,6 +221,17 @@ async function loadRequestedModel(
       error: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+async function resolveRequestedBackend(
+  message: Extract<AppWorkerRequest, { type: "load-model" }>,
+): Promise<InferenceBackend> {
+  const support = await detectWebGpuSupport();
+  return resolveInferenceBackend({
+    preference: message.backendPreference,
+    webgpuRequired: message.webgpuRequired,
+    webgpuAvailable: support.supported,
+  });
 }
 
 function postProgress(
@@ -209,12 +250,16 @@ function postProgress(
   });
 }
 
-function summarizeQwenForApp(model: LoadedQwen2Model): AppLoadedModelSummary {
+function summarizeQwenForApp(
+  model: LoadedQwen2Model,
+  backend: InferenceBackend = "cpu",
+): AppLoadedModelSummary {
   const summary = summarizeLoadedQwen2Model(model);
   return {
     kind: "qwen2",
     modelId: "qwen",
     modelLabel: modelCatalog.qwen.label,
+    backend,
     architecture: summary.architecture,
     dtype: describeGgufDtype(model),
     tensorCount: summary.tensorCount,

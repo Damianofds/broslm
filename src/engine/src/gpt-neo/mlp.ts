@@ -1,6 +1,7 @@
 import type { MlpWeights as BoundMlpWeights, TensorView } from "./loader";
-import { gelu } from "../primitives/gelu";
-import { matrixVectorMultiply } from "../primitives/matrixVectorMultiply";
+import { gelu, geluGpu } from "../primitives/gelu";
+import { matrixVectorMultiply, matrixVectorMultiplyGpu } from "../primitives/matrixVectorMultiply";
+import type { WebGpuRuntime } from "../runtime/webgpu";
 
 export interface MlpConfig {
   hiddenSize: number;
@@ -40,6 +41,23 @@ export function mlp(
   });
 
   return output;
+}
+
+export async function mlpGpu(
+  runtime: WebGpuRuntime,
+  input: Float32Array,
+  weights: MlpWeights,
+  config: MlpConfig,
+): Promise<Float32Array> {
+  validateMlpInputs(input, weights, config);
+
+  const intermediate = await matrixVectorMultiplyGpu(runtime, weights.upWeight, input, {
+    bias: weights.upBias,
+  });
+  const activated = await geluGpu(runtime, intermediate);
+  return matrixVectorMultiplyGpu(runtime, weights.downWeight, activated, {
+    bias: weights.downBias,
+  });
 }
 
 export function gptNeoMlpWeights(weights: BoundMlpWeights): MlpWeights {

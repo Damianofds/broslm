@@ -1,7 +1,12 @@
 import type { Qwen2MlpWeights } from "./loader";
-import { matrixVectorMultiplyQwen, type QwenTensorView } from "./quantizedTensor";
-import { elementwiseMultiply } from "../primitives/elementwiseMultiply";
-import { silu } from "../primitives/silu";
+import {
+  matrixVectorMultiplyQwen,
+  matrixVectorMultiplyQwenGpu,
+  type QwenTensorView,
+} from "./quantizedTensor";
+import { elementwiseMultiply, elementwiseMultiplyGpu } from "../primitives/elementwiseMultiply";
+import { silu, siluGpu } from "../primitives/silu";
+import type { WebGpuRuntime } from "../runtime/webgpu";
 
 export interface Qwen2MlpConfig {
   hiddenSize: number;
@@ -26,6 +31,21 @@ export function qwen2Mlp(
   config: Qwen2MlpConfig,
 ): Float32Array {
   return qwen2MlpWithDebug(input, weights, config).output;
+}
+
+export async function qwen2MlpGpu(
+  runtime: WebGpuRuntime,
+  input: Float32Array,
+  weights: Qwen2MlpWeights,
+  config: Qwen2MlpConfig,
+): Promise<Float32Array> {
+  validateMlpInputs(input, weights, config);
+
+  const gate = await matrixVectorMultiplyQwenGpu(runtime, weights.gateProjWeight, input);
+  const up = await matrixVectorMultiplyQwenGpu(runtime, weights.upProjWeight, input);
+  const activatedGate = await siluGpu(runtime, gate);
+  const gated = await elementwiseMultiplyGpu(runtime, activatedGate, up);
+  return matrixVectorMultiplyQwenGpu(runtime, weights.downProjWeight, gated);
 }
 
 export function qwen2MlpWithDebug(

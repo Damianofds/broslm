@@ -8,6 +8,7 @@ import type {
   Qwen2Config,
   Qwen2LoaderProgress,
 } from "./engine/src/qwen2/loader";
+import type { InferenceBackend, InferenceBackendPreference } from "./engine/src/runtime/webgpu";
 import { currentModelExportName } from "./modelName";
 import type { Qwen2TokenizerParts } from "./tokenizer";
 
@@ -20,9 +21,17 @@ export interface ModelCatalogEntry {
   shortLabel: string;
   baseUrl: string;
   promptMode: PromptMode;
+  backendPolicy: ModelBackendPolicy;
   tokenizerUrl?: string;
   ggufPath?: string;
   ggufFallbackUrls?: readonly string[];
+}
+
+export interface ModelBackendPolicy {
+  defaultPreference: InferenceBackendPreference;
+  webgpu: "preferred" | "required" | "unsupported";
+  cpuFallback: boolean;
+  minimumStorageBufferBindingSize?: number;
 }
 
 export interface AppTensorSummary {
@@ -54,6 +63,7 @@ export interface AppLoadStep {
 interface BaseAppLoadedModelSummary {
   modelId: ModelId;
   modelLabel: string;
+  backend: InferenceBackend;
   architecture: string;
   dtype: string;
   tensorCount: number;
@@ -100,6 +110,8 @@ export type AppWorkerRequest =
       scratchSequenceLength?: number;
       ggufPath?: string;
       ggufFallbackUrls?: readonly string[];
+      backendPreference?: InferenceBackendPreference;
+      webgpuRequired?: boolean;
     }
   | {
       type: "next-token";
@@ -121,6 +133,7 @@ export type AppWorkerResponse =
       type: "model-ready";
       requestId?: string;
       modelId: ModelId;
+      backend: InferenceBackend;
       summary: AppLoadedModelSummary;
       tokenizer?: AppTokenizerPayload;
     }
@@ -151,6 +164,11 @@ export const modelCatalog: Record<ModelId, ModelCatalogEntry> = {
     shortLabel: "TinyStories",
     baseUrl: `${publicBaseUrl}models/${currentModelExportName}/`,
     promptMode: "raw",
+    backendPolicy: {
+      defaultPreference: "auto",
+      webgpu: "preferred",
+      cpuFallback: true,
+    },
     tokenizerUrl: `${publicBaseUrl}tokenizer/tinystories-tokenizer.json`,
   },
   qwen: {
@@ -159,6 +177,12 @@ export const modelCatalog: Record<ModelId, ModelCatalogEntry> = {
     shortLabel: "Qwen",
     baseUrl: `${publicBaseUrl}models/${qwenModelFolderName}/`,
     promptMode: "qwen-chat",
+    backendPolicy: {
+      defaultPreference: "auto",
+      webgpu: "required",
+      cpuFallback: false,
+      minimumStorageBufferBindingSize: 144_643_072,
+    },
     ggufPath: "model.gguf",
     ggufFallbackUrls: [qwenOfficialQ4_0GgufUrl],
   },
@@ -221,12 +245,14 @@ export function visibleGeneratedTextForModel(modelId: ModelId, decodedText: stri
 
 export function normalizeGptNeoSummary(
   summary: GptNeoLoadedModelSummary,
+  backend: InferenceBackend = "cpu",
 ): TinyStoriesLoadedModelSummary {
   return {
     ...summary,
     kind: "gpt-neo",
     modelId: "tinystories",
     modelLabel: modelCatalog.tinystories.label,
+    backend,
     tensors: summary.tensors,
   };
 }

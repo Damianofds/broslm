@@ -1,5 +1,8 @@
 import {
   causalSelfAttention,
+  causalSelfAttentionGpu,
+  causalSelfAttentionIncrementalGpu,
+  causalSelfAttentionPrefillGpu,
   causalSelfAttentionIncremental,
   causalSelfAttentionPrefill,
   type CausalSelfAttentionConfig,
@@ -7,9 +10,10 @@ import {
 } from "./attention";
 import type { LayerKvCache } from "./attentionCache";
 import type { LayerNormWeights, TransformerLayerWeights } from "./loader";
-import { gptNeoMlpWeights, mlp, type MlpConfig } from "./mlp";
-import { layerNorm } from "../primitives/layerNorm";
-import { residualAdd } from "../primitives/residualAdd";
+import { gptNeoMlpWeights, mlp, mlpGpu, type MlpConfig } from "./mlp";
+import { layerNorm, layerNormGpu } from "../primitives/layerNorm";
+import { residualAdd, residualAddGpu } from "../primitives/residualAdd";
+import type { WebGpuRuntime } from "../runtime/webgpu";
 
 export interface TransformerLayerConfig extends CausalSelfAttentionConfig, MlpConfig {
   layerNormEpsilon: number;
@@ -70,6 +74,52 @@ export function transformerLayer(
   return output;
 }
 
+export async function transformerLayerGpu(
+  runtime: WebGpuRuntime,
+  input: Float32Array,
+  sequenceLength: number,
+  config: TransformerLayerConfig,
+  weights: TransformerLayerWeights,
+): Promise<Float32Array> {
+  validateTransformerLayerInputs(input, sequenceLength, config);
+
+  const normedForAttention = await applyLayerNormToSequenceGpu(
+    runtime,
+    input,
+    sequenceLength,
+    config.hiddenSize,
+    config.layerNormEpsilon,
+    weights.ln1,
+  );
+  const attentionOutput = await causalSelfAttentionGpu(
+    runtime,
+    normedForAttention,
+    sequenceLength,
+    config,
+    gptNeoAttentionWeights(weights.attention),
+  );
+  const afterAttention = await residualAddGpu(runtime, attentionOutput, input);
+  const normedForMlp = await applyLayerNormToSequenceGpu(
+    runtime,
+    afterAttention,
+    sequenceLength,
+    config.hiddenSize,
+    config.layerNormEpsilon,
+    weights.ln2,
+  );
+
+  const mlpOutput = new Float32Array(input.length);
+  const adaptedMlpWeights = gptNeoMlpWeights(weights.mlp);
+  for (let position = 0; position < sequenceLength; position += 1) {
+    const offset = position * config.hiddenSize;
+    const tokenInput = normedForMlp.subarray(offset, offset + config.hiddenSize);
+    const tokenOutput = await mlpGpu(runtime, tokenInput, adaptedMlpWeights, config);
+    mlpOutput.set(tokenOutput, offset);
+  }
+
+  return residualAddGpu(runtime, mlpOutput, afterAttention);
+}
+
 export function transformerLayerPrefill(
   input: Float32Array,
   sequenceLength: number,
@@ -123,6 +173,54 @@ export function transformerLayerPrefill(
   return output;
 }
 
+export async function transformerLayerPrefillGpu(
+  runtime: WebGpuRuntime,
+  input: Float32Array,
+  sequenceLength: number,
+  config: TransformerLayerConfig,
+  weights: TransformerLayerWeights,
+  cache: LayerKvCache,
+): Promise<Float32Array> {
+  validateTransformerLayerInputs(input, sequenceLength, config);
+
+  const normedForAttention = await applyLayerNormToSequenceGpu(
+    runtime,
+    input,
+    sequenceLength,
+    config.hiddenSize,
+    config.layerNormEpsilon,
+    weights.ln1,
+  );
+  const attentionOutput = await causalSelfAttentionPrefillGpu(
+    runtime,
+    normedForAttention,
+    sequenceLength,
+    config,
+    gptNeoAttentionWeights(weights.attention),
+    cache,
+  );
+  const afterAttention = await residualAddGpu(runtime, attentionOutput, input);
+  const normedForMlp = await applyLayerNormToSequenceGpu(
+    runtime,
+    afterAttention,
+    sequenceLength,
+    config.hiddenSize,
+    config.layerNormEpsilon,
+    weights.ln2,
+  );
+
+  const mlpOutput = new Float32Array(input.length);
+  const adaptedMlpWeights = gptNeoMlpWeights(weights.mlp);
+  for (let position = 0; position < sequenceLength; position += 1) {
+    const offset = position * config.hiddenSize;
+    const tokenInput = normedForMlp.subarray(offset, offset + config.hiddenSize);
+    const tokenOutput = await mlpGpu(runtime, tokenInput, adaptedMlpWeights, config);
+    mlpOutput.set(tokenOutput, offset);
+  }
+
+  return residualAddGpu(runtime, mlpOutput, afterAttention);
+}
+
 export function transformerLayerIncremental(
   input: Float32Array,
   position: number,
@@ -166,6 +264,49 @@ export function transformerLayerIncremental(
   return output;
 }
 
+export async function transformerLayerIncrementalGpu(
+  runtime: WebGpuRuntime,
+  input: Float32Array,
+  position: number,
+  config: TransformerLayerConfig,
+  weights: TransformerLayerWeights,
+  cache: LayerKvCache,
+): Promise<Float32Array> {
+  validateTransformerTokenInputs(input, position, config);
+
+  const normedForAttention = await layerNormGpu(
+    runtime,
+    input,
+    weights.ln1.weight,
+    weights.ln1.bias,
+    {
+      featureSize: config.hiddenSize,
+      epsilon: config.layerNormEpsilon,
+    },
+  );
+  const attentionOutput = await causalSelfAttentionIncrementalGpu(
+    runtime,
+    normedForAttention,
+    position,
+    config,
+    gptNeoAttentionWeights(weights.attention),
+    cache,
+  );
+  const afterAttention = await residualAddGpu(runtime, attentionOutput, input);
+  const normedForMlp = await layerNormGpu(
+    runtime,
+    afterAttention,
+    weights.ln2.weight,
+    weights.ln2.bias,
+    {
+      featureSize: config.hiddenSize,
+      epsilon: config.layerNormEpsilon,
+    },
+  );
+  const mlpOutput = await mlpGpu(runtime, normedForMlp, gptNeoMlpWeights(weights.mlp), config);
+  return residualAddGpu(runtime, mlpOutput, afterAttention);
+}
+
 function applyLayerNormToSequence(
   input: Float32Array,
   output: Float32Array,
@@ -183,6 +324,27 @@ function applyLayerNormToSequence(
       epsilon,
     });
   }
+}
+
+async function applyLayerNormToSequenceGpu(
+  runtime: WebGpuRuntime,
+  input: Float32Array,
+  sequenceLength: number,
+  hiddenSize: number,
+  epsilon: number,
+  weights: LayerNormWeights,
+): Promise<Float32Array> {
+  const output = new Float32Array(input.length);
+  for (let position = 0; position < sequenceLength; position += 1) {
+    const offset = position * hiddenSize;
+    const tokenOutput = await layerNormGpu(runtime, input, weights.weight, weights.bias, {
+      inputOffset: offset,
+      featureSize: hiddenSize,
+      epsilon,
+    });
+    output.set(tokenOutput, offset);
+  }
+  return output;
 }
 
 function validateTransformerLayerInputs(

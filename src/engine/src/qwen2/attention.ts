@@ -1,8 +1,16 @@
 import type { Qwen2LayerKvCache } from "./attentionCache";
 import type { Qwen2AttentionWeights, QwenTensorView, TensorView } from "./loader";
-import { matrixVectorMultiplyQwen } from "./quantizedTensor";
-import { applyRoPE } from "../primitives/applyRoPE";
+import { matrixVectorMultiplyQwen, matrixVectorMultiplyQwenGpu } from "./quantizedTensor";
+import { applyRoPE, applyRoPEGpu } from "../primitives/applyRoPE";
 import { softmax } from "../primitives/softmax";
+import {
+  createStorageBuffer,
+  destroyBuffers,
+  readFloat32Buffer,
+  runComputeShader,
+  type WebGpuRuntime,
+  webGpuBufferUsage,
+} from "../runtime/webgpu";
 
 export interface Qwen2SelfAttentionConfig {
   hiddenSize: number;
@@ -49,6 +57,16 @@ export function qwen2SelfAttention(
   return qwen2SelfAttentionWithDebug(input, sequenceLength, config, weights).output;
 }
 
+export async function qwen2SelfAttentionGpu(
+  runtime: WebGpuRuntime,
+  input: Float32Array,
+  sequenceLength: number,
+  config: Qwen2SelfAttentionConfig,
+  weights: Qwen2SelfAttentionWeights,
+): Promise<Float32Array> {
+  return (await qwen2SelfAttentionWithDebugGpu(runtime, input, sequenceLength, config, weights)).output;
+}
+
 export function qwen2SelfAttentionPrefill(
   input: Float32Array,
   sequenceLength: number,
@@ -57,6 +75,19 @@ export function qwen2SelfAttentionPrefill(
   cache: Qwen2LayerKvCache,
 ): Float32Array {
   const result = qwen2SelfAttentionWithDebug(input, sequenceLength, config, weights);
+  writeProjectedKvToCache(result.debug.k, result.debug.v, sequenceLength, config, cache);
+  return result.output;
+}
+
+export async function qwen2SelfAttentionPrefillGpu(
+  runtime: WebGpuRuntime,
+  input: Float32Array,
+  sequenceLength: number,
+  config: Qwen2SelfAttentionConfig,
+  weights: Qwen2SelfAttentionWeights,
+  cache: Qwen2LayerKvCache,
+): Promise<Float32Array> {
+  const result = await qwen2SelfAttentionWithDebugGpu(runtime, input, sequenceLength, config, weights);
   writeProjectedKvToCache(result.debug.k, result.debug.v, sequenceLength, config, cache);
   return result.output;
 }
@@ -126,6 +157,55 @@ export function qwen2SelfAttentionIncremental(
   }
 
   matrixVectorMultiplyQwen(weights.output, concatenated, projected);
+  cache.length = position + 1;
+  return projected;
+}
+
+export async function qwen2SelfAttentionIncrementalGpu(
+  runtime: WebGpuRuntime,
+  input: Float32Array,
+  position: number,
+  config: Qwen2SelfAttentionConfig,
+  weights: Qwen2SelfAttentionWeights,
+  cache: Qwen2LayerKvCache,
+): Promise<Float32Array> {
+  validateAttentionConfig(config);
+  validateAttentionWeights(config, weights);
+  if (input.length !== config.hiddenSize) {
+    throw new Error(`input length is ${input.length}, expected ${config.hiddenSize}`);
+  }
+  if (cache.length !== position) {
+    throw new Error(`cache length is ${cache.length}, expected current position ${position}`);
+  }
+  validateCacheBuffers(cache, config);
+
+  const q = await matrixVectorMultiplyQwenGpu(runtime, weights.query, input, {
+    bias: weights.queryBias,
+  });
+  const k = await matrixVectorMultiplyQwenGpu(runtime, weights.key, input, {
+    bias: weights.keyBias,
+  });
+  const v = await matrixVectorMultiplyQwenGpu(runtime, weights.value, input, {
+    bias: weights.valueBias,
+  });
+  await applyRoPEToQueryGpu(runtime, q, 1, config, position);
+  await applyRoPEToKeyGpu(runtime, k, 1, config, position);
+
+  const cacheOffset = position * config.keyValueHiddenSize;
+  cache.keys.set(k, cacheOffset);
+  cache.values.set(v, cacheOffset);
+
+  const qSequence = new Float32Array((position + 1) * config.hiddenSize);
+  qSequence.set(q, position * config.hiddenSize);
+  const concatenated = await causalGqaHeadOutputsGpu(runtime, {
+    q: qSequence,
+    k: cache.keys.subarray(0, (position + 1) * config.keyValueHiddenSize),
+    v: cache.values.subarray(0, (position + 1) * config.keyValueHiddenSize),
+    sequenceLength: position + 1,
+    config,
+    outputLastPositionOnly: true,
+  });
+  const projected = await matrixVectorMultiplyQwenGpu(runtime, weights.output, concatenated);
   cache.length = position + 1;
   return projected;
 }
@@ -209,6 +289,88 @@ export function qwen2SelfAttentionWithDebug(
   };
 }
 
+export async function qwen2SelfAttentionWithDebugGpu(
+  runtime: WebGpuRuntime,
+  input: Float32Array,
+  sequenceLength: number,
+  config: Qwen2SelfAttentionConfig,
+  weights: Qwen2SelfAttentionWeights,
+): Promise<Qwen2SelfAttentionResult> {
+  validateAttentionInputs(input, sequenceLength, config, weights);
+
+  const hiddenElements = sequenceLength * config.hiddenSize;
+  const keyValueElements = sequenceLength * config.keyValueHiddenSize;
+  const scoreElements = config.numberOfHeads * sequenceLength * sequenceLength;
+  const q = new Float32Array(hiddenElements);
+  const k = new Float32Array(keyValueElements);
+  const v = new Float32Array(keyValueElements);
+
+  await projectSequenceGpu(runtime, input, sequenceLength, config.hiddenSize, weights.query, q, config.hiddenSize, weights.queryBias);
+  await projectSequenceGpu(
+    runtime,
+    input,
+    sequenceLength,
+    config.hiddenSize,
+    weights.key,
+    k,
+    config.keyValueHiddenSize,
+    weights.keyBias,
+  );
+  await projectSequenceGpu(
+    runtime,
+    input,
+    sequenceLength,
+    config.hiddenSize,
+    weights.value,
+    v,
+    config.keyValueHiddenSize,
+    weights.valueBias,
+  );
+  await applyRoPEToQueryGpu(runtime, q, sequenceLength, config);
+  await applyRoPEToKeyGpu(runtime, k, sequenceLength, config);
+
+  const concatenated = await causalGqaHeadOutputsGpu(runtime, {
+    q,
+    k,
+    v,
+    sequenceLength,
+    config,
+  });
+
+  const projected = new Float32Array(hiddenElements);
+  await projectSequenceGpu(
+    runtime,
+    concatenated,
+    sequenceLength,
+    config.hiddenSize,
+    weights.output,
+    projected,
+    config.hiddenSize,
+  );
+
+  const rawScores = new Float32Array(scoreElements);
+  const scaledScores = new Float32Array(scoreElements);
+  const probabilities = new Float32Array(scoreElements);
+  rawScores.fill(Number.NaN);
+  scaledScores.fill(Number.NaN);
+  probabilities.fill(Number.NaN);
+
+  return {
+    output: projected,
+    debug: {
+      q,
+      k,
+      v,
+      rawScores,
+      scaledScores,
+      probabilities,
+      headOutput: concatenated,
+      concatenated,
+      projected,
+    },
+  };
+}
+
 export function qwen2AttentionWeights(weights: Qwen2AttentionWeights): Qwen2SelfAttentionWeights {
   return {
     query: weights.qProjWeight,
@@ -236,6 +398,25 @@ function projectSequence(
       inputOffset: position * hiddenSize,
       outputOffset: position * outputSize,
     });
+  }
+}
+
+async function projectSequenceGpu(
+  runtime: WebGpuRuntime,
+  input: Float32Array,
+  sequenceLength: number,
+  hiddenSize: number,
+  weight: QwenTensorView,
+  output: Float32Array,
+  outputSize: number,
+  bias?: TensorView | Float32Array,
+): Promise<void> {
+  for (let position = 0; position < sequenceLength; position += 1) {
+    const projected = await matrixVectorMultiplyQwenGpu(runtime, weight, input, {
+      bias,
+      inputOffset: position * hiddenSize,
+    });
+    output.set(projected, position * outputSize);
   }
 }
 
@@ -296,6 +477,27 @@ function applyRoPEToQuery(
   }
 }
 
+async function applyRoPEToQueryGpu(
+  runtime: WebGpuRuntime,
+  q: Float32Array,
+  sequenceLength: number,
+  config: Qwen2SelfAttentionConfig,
+  basePosition = 0,
+): Promise<void> {
+  for (let position = 0; position < sequenceLength; position += 1) {
+    for (let head = 0; head < config.numberOfHeads; head += 1) {
+      const offset = hiddenIndex(position, head, 0, config);
+      const rotated = await applyRoPEGpu(runtime, q, {
+        position: basePosition + position,
+        theta: config.ropeTheta,
+        inputOffset: offset,
+        headDimension: config.headDimension,
+      });
+      q.set(rotated, offset);
+    }
+  }
+}
+
 function applyRoPEToKey(
   k: Float32Array,
   sequenceLength: number,
@@ -315,6 +517,151 @@ function applyRoPEToKey(
     }
   }
 }
+
+async function applyRoPEToKeyGpu(
+  runtime: WebGpuRuntime,
+  k: Float32Array,
+  sequenceLength: number,
+  config: Qwen2SelfAttentionConfig,
+  basePosition = 0,
+): Promise<void> {
+  for (let position = 0; position < sequenceLength; position += 1) {
+    for (let keyValueHead = 0; keyValueHead < config.numberOfKeyValueHeads; keyValueHead += 1) {
+      const offset = kvHiddenIndex(position, keyValueHead, 0, config);
+      const rotated = await applyRoPEGpu(runtime, k, {
+        position: basePosition + position,
+        theta: config.ropeTheta,
+        inputOffset: offset,
+        headDimension: config.headDimension,
+      });
+      k.set(rotated, offset);
+    }
+  }
+}
+
+async function causalGqaHeadOutputsGpu(
+  runtime: WebGpuRuntime,
+  options: {
+    q: Float32Array;
+    k: Float32Array;
+    v: Float32Array;
+    sequenceLength: number;
+    config: Qwen2SelfAttentionConfig;
+    outputLastPositionOnly?: boolean;
+  },
+): Promise<Float32Array> {
+  const outputSequenceLength = options.outputLastPositionOnly ? 1 : options.sequenceLength;
+  const outputLength = outputSequenceLength * options.config.hiddenSize;
+  const qBuffer = createStorageBuffer(runtime, options.q);
+  const kBuffer = createStorageBuffer(runtime, options.k);
+  const vBuffer = createStorageBuffer(runtime, options.v);
+  const outputBuffer = createStorageBuffer(runtime, outputLength * Float32Array.BYTES_PER_ELEMENT);
+  const paramsBuffer = createStorageBuffer(
+    runtime,
+    new Uint32Array([
+      options.sequenceLength,
+      options.config.hiddenSize,
+      options.config.numberOfHeads,
+      options.config.numberOfKeyValueHeads,
+      options.config.headDimension,
+      options.config.keyValueHiddenSize,
+      options.outputLastPositionOnly ? 1 : 0,
+      0,
+    ]),
+    webGpuBufferUsage.uniform | webGpuBufferUsage.copyDst,
+  );
+
+  try {
+    await runComputeShader(
+      runtime,
+      causalGqaHeadOutputsShader,
+      [
+        { binding: 0, resource: { buffer: qBuffer } },
+        { binding: 1, resource: { buffer: kBuffer } },
+        { binding: 2, resource: { buffer: vBuffer } },
+        { binding: 3, resource: { buffer: paramsBuffer } },
+        { binding: 4, resource: { buffer: outputBuffer } },
+      ],
+      [Math.ceil(outputLength / 128)],
+    );
+    return readFloat32Buffer(runtime, outputBuffer, outputLength);
+  } finally {
+    destroyBuffers(qBuffer, kBuffer, vBuffer, outputBuffer, paramsBuffer);
+  }
+}
+
+const causalGqaHeadOutputsShader = `
+struct Params {
+  sequenceLength: u32,
+  hiddenSize: u32,
+  numberOfHeads: u32,
+  numberOfKeyValueHeads: u32,
+  headDimension: u32,
+  keyValueHiddenSize: u32,
+  outputLastPositionOnly: u32,
+  _padding: u32,
+}
+
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> k: array<f32>;
+@group(0) @binding(2) var<storage, read> v: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+
+fn hiddenIndex(position: u32, head: u32, dimension: u32) -> u32 {
+  return position * params.hiddenSize + head * params.headDimension + dimension;
+}
+
+fn kvHiddenIndex(position: u32, keyValueHead: u32, dimension: u32) -> u32 {
+  return position * params.keyValueHiddenSize + keyValueHead * params.headDimension + dimension;
+}
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
+  let outputIndex = globalId.x;
+  let outputSequenceLength = select(params.sequenceLength, 1u, params.outputLastPositionOnly == 1u);
+  let outputLength = outputSequenceLength * params.hiddenSize;
+  if (outputIndex >= outputLength) {
+    return;
+  }
+
+  let outputPosition = outputIndex / params.hiddenSize;
+  let queryPosition = select(outputPosition, params.sequenceLength - 1u, params.outputLastPositionOnly == 1u);
+  let hiddenOffset = outputIndex % params.hiddenSize;
+  let head = hiddenOffset / params.headDimension;
+  let dimension = hiddenOffset % params.headDimension;
+  let groupSize = params.numberOfHeads / params.numberOfKeyValueHeads;
+  let keyValueHead = head / groupSize;
+  let scale = inverseSqrt(f32(params.headDimension));
+
+  var maxScore = -3.4028234663852886e38;
+  for (var keyPosition = 0u; keyPosition <= queryPosition; keyPosition = keyPosition + 1u) {
+    var score = 0.0;
+    for (var scoreDimension = 0u; scoreDimension < params.headDimension; scoreDimension = scoreDimension + 1u) {
+      score = score +
+        q[hiddenIndex(queryPosition, head, scoreDimension)] *
+        k[kvHiddenIndex(keyPosition, keyValueHead, scoreDimension)];
+    }
+    maxScore = max(maxScore, score * scale);
+  }
+
+  var sum = 0.0;
+  var weightedValue = 0.0;
+  for (var valuePosition = 0u; valuePosition <= queryPosition; valuePosition = valuePosition + 1u) {
+    var score = 0.0;
+    for (var scoreDimension = 0u; scoreDimension < params.headDimension; scoreDimension = scoreDimension + 1u) {
+      score = score +
+        q[hiddenIndex(queryPosition, head, scoreDimension)] *
+        k[kvHiddenIndex(valuePosition, keyValueHead, scoreDimension)];
+    }
+    let probabilityNumerator = exp(score * scale - maxScore);
+    sum = sum + probabilityNumerator;
+    weightedValue = weightedValue + probabilityNumerator * v[kvHiddenIndex(valuePosition, keyValueHead, dimension)];
+  }
+
+  output[outputIndex] = weightedValue / sum;
+}
+`;
 
 function computeCausalGqaHeadOutputs(options: {
   q: Float32Array;

@@ -1,15 +1,19 @@
 import {
   qwen2AttentionWeights,
   qwen2SelfAttention,
+  qwen2SelfAttentionGpu,
   qwen2SelfAttentionIncremental,
+  qwen2SelfAttentionIncrementalGpu,
   qwen2SelfAttentionPrefill,
+  qwen2SelfAttentionPrefillGpu,
   type Qwen2SelfAttentionConfig,
 } from "./attention";
 import type { Qwen2LayerKvCache } from "./attentionCache";
 import type { Qwen2NormWeights, Qwen2TransformerLayerWeights } from "./loader";
-import { qwen2Mlp, type Qwen2MlpConfig } from "./mlp";
-import { residualAdd } from "../primitives/residualAdd";
-import { rmsNorm } from "../primitives/rmsNorm";
+import { qwen2Mlp, qwen2MlpGpu, type Qwen2MlpConfig } from "./mlp";
+import { residualAdd, residualAddGpu } from "../primitives/residualAdd";
+import { rmsNorm, rmsNormGpu } from "../primitives/rmsNorm";
+import type { WebGpuRuntime } from "../runtime/webgpu";
 
 export interface Qwen2TransformerLayerConfig
   extends Qwen2SelfAttentionConfig,
@@ -67,6 +71,51 @@ export function qwen2TransformerLayer(
   return output;
 }
 
+export async function qwen2TransformerLayerGpu(
+  runtime: WebGpuRuntime,
+  input: Float32Array,
+  sequenceLength: number,
+  config: Qwen2TransformerLayerConfig,
+  weights: Qwen2TransformerLayerWeights,
+): Promise<Float32Array> {
+  validateTransformerLayerInputs(input, sequenceLength, config);
+
+  const normedForAttention = await applyRmsNormToSequenceGpu(
+    runtime,
+    input,
+    sequenceLength,
+    config.hiddenSize,
+    config.rmsNormEpsilon,
+    weights.inputLayerNorm,
+  );
+  const attentionOutput = await qwen2SelfAttentionGpu(
+    runtime,
+    normedForAttention,
+    sequenceLength,
+    config,
+    qwen2AttentionWeights(weights.attention),
+  );
+  const afterAttention = await residualAddGpu(runtime, attentionOutput, input);
+  const normedForMlp = await applyRmsNormToSequenceGpu(
+    runtime,
+    afterAttention,
+    sequenceLength,
+    config.hiddenSize,
+    config.rmsNormEpsilon,
+    weights.postAttentionLayerNorm,
+  );
+
+  const mlpOutput = new Float32Array(input.length);
+  for (let position = 0; position < sequenceLength; position += 1) {
+    const offset = position * config.hiddenSize;
+    const tokenInput = normedForMlp.subarray(offset, offset + config.hiddenSize);
+    const tokenOutput = await qwen2MlpGpu(runtime, tokenInput, weights.mlp, config);
+    mlpOutput.set(tokenOutput, offset);
+  }
+
+  return residualAddGpu(runtime, mlpOutput, afterAttention);
+}
+
 export function qwen2TransformerLayerPrefill(
   input: Float32Array,
   sequenceLength: number,
@@ -119,6 +168,53 @@ export function qwen2TransformerLayerPrefill(
   return output;
 }
 
+export async function qwen2TransformerLayerPrefillGpu(
+  runtime: WebGpuRuntime,
+  input: Float32Array,
+  sequenceLength: number,
+  config: Qwen2TransformerLayerConfig,
+  weights: Qwen2TransformerLayerWeights,
+  cache: Qwen2LayerKvCache,
+): Promise<Float32Array> {
+  validateTransformerLayerInputs(input, sequenceLength, config);
+
+  const normedForAttention = await applyRmsNormToSequenceGpu(
+    runtime,
+    input,
+    sequenceLength,
+    config.hiddenSize,
+    config.rmsNormEpsilon,
+    weights.inputLayerNorm,
+  );
+  const attentionOutput = await qwen2SelfAttentionPrefillGpu(
+    runtime,
+    normedForAttention,
+    sequenceLength,
+    config,
+    qwen2AttentionWeights(weights.attention),
+    cache,
+  );
+  const afterAttention = await residualAddGpu(runtime, attentionOutput, input);
+  const normedForMlp = await applyRmsNormToSequenceGpu(
+    runtime,
+    afterAttention,
+    sequenceLength,
+    config.hiddenSize,
+    config.rmsNormEpsilon,
+    weights.postAttentionLayerNorm,
+  );
+
+  const mlpOutput = new Float32Array(input.length);
+  for (let position = 0; position < sequenceLength; position += 1) {
+    const offset = position * config.hiddenSize;
+    const tokenInput = normedForMlp.subarray(offset, offset + config.hiddenSize);
+    const tokenOutput = await qwen2MlpGpu(runtime, tokenInput, weights.mlp, config);
+    mlpOutput.set(tokenOutput, offset);
+  }
+
+  return residualAddGpu(runtime, mlpOutput, afterAttention);
+}
+
 export function qwen2TransformerLayerIncremental(
   input: Float32Array,
   position: number,
@@ -156,6 +252,47 @@ export function qwen2TransformerLayerIncremental(
   return output;
 }
 
+export async function qwen2TransformerLayerIncrementalGpu(
+  runtime: WebGpuRuntime,
+  input: Float32Array,
+  position: number,
+  config: Qwen2TransformerLayerConfig,
+  weights: Qwen2TransformerLayerWeights,
+  cache: Qwen2LayerKvCache,
+): Promise<Float32Array> {
+  validateTransformerTokenInputs(input, position, config);
+
+  const normedForAttention = await rmsNormGpu(
+    runtime,
+    input,
+    weights.inputLayerNorm.weight,
+    {
+      featureSize: config.hiddenSize,
+      epsilon: config.rmsNormEpsilon,
+    },
+  );
+  const attentionOutput = await qwen2SelfAttentionIncrementalGpu(
+    runtime,
+    normedForAttention,
+    position,
+    config,
+    qwen2AttentionWeights(weights.attention),
+    cache,
+  );
+  const afterAttention = await residualAddGpu(runtime, attentionOutput, input);
+  const normedForMlp = await rmsNormGpu(
+    runtime,
+    afterAttention,
+    weights.postAttentionLayerNorm.weight,
+    {
+      featureSize: config.hiddenSize,
+      epsilon: config.rmsNormEpsilon,
+    },
+  );
+  const mlpOutput = await qwen2MlpGpu(runtime, normedForMlp, weights.mlp, config);
+  return residualAddGpu(runtime, mlpOutput, afterAttention);
+}
+
 function applyRmsNormToSequence(
   input: Float32Array,
   output: Float32Array,
@@ -173,6 +310,27 @@ function applyRmsNormToSequence(
       epsilon,
     });
   }
+}
+
+async function applyRmsNormToSequenceGpu(
+  runtime: WebGpuRuntime,
+  input: Float32Array,
+  sequenceLength: number,
+  hiddenSize: number,
+  epsilon: number,
+  weights: Qwen2NormWeights,
+): Promise<Float32Array> {
+  const output = new Float32Array(input.length);
+  for (let position = 0; position < sequenceLength; position += 1) {
+    const offset = position * hiddenSize;
+    const tokenOutput = await rmsNormGpu(runtime, input, weights.weight, {
+      inputOffset: offset,
+      featureSize: hiddenSize,
+      epsilon,
+    });
+    output.set(tokenOutput, offset);
+  }
+  return output;
 }
 
 function validateTransformerLayerInputs(

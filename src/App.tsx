@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { detectWebGpuSupport } from "./engine/src/runtime/webgpu";
 import {
   createQwen2ByteLevelBpeTokenizer,
   loadByteLevelBpeTokenizer,
@@ -18,6 +19,7 @@ import {
   type AppLoadStep,
   type AppWorkerRequest,
   type AppWorkerResponse,
+  type ModelCatalogEntry,
   type ModelId,
 } from "./modelCatalog";
 
@@ -25,6 +27,7 @@ type LoadState = "idle" | "loading" | "ready" | "error";
 type TokenizerState = "idle" | "loading" | "ready" | "error";
 type GenerationState = "idle" | "generating" | "done" | "error";
 type LoadFrame = "start" | "loading" | "transition" | "config";
+type WebGpuAvailability = "checking" | "available" | "unavailable";
 
 interface PendingNextTokenRequest {
   resolve: (tokenId: number) => void;
@@ -66,6 +69,9 @@ export default function App() {
   const [generationError, setGenerationError] = useState<string | null>(null);
   const [inputTokenCount, setInputTokenCount] = useState<number | null>(null);
   const [generatedTokenIds, setGeneratedTokenIds] = useState<number[]>([]);
+  const [webgpuAvailability, setWebgpuAvailability] = useState<WebGpuAvailability>("checking");
+  const [webgpuMaxStorageBufferBindingSize, setWebgpuMaxStorageBufferBindingSize] =
+    useState<number | null>(null);
   const activeSteps = modelLoadSteps[selectedModelId];
 
   useEffect(() => {
@@ -76,6 +82,21 @@ export default function App() {
         new Error("Component unmounted"),
       );
       workerRef.current?.terminate();
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void detectWebGpuSupport().then((support) => {
+      if (!cancelled) {
+        setWebgpuAvailability(support.supported ? "available" : "unavailable");
+        setWebgpuMaxStorageBufferBindingSize(
+          support.limits?.maxStorageBufferBindingSize ?? null,
+        );
+      }
+    });
+    return () => {
+      cancelled = true;
     };
   }, []);
 
@@ -153,6 +174,13 @@ export default function App() {
     }
 
     const model = modelCatalog[selectedModelId];
+    if (!modelCanRun(model, webgpuAvailability, webgpuMaxStorageBufferBindingSize)) {
+      setError(
+        modelUnavailableMessage(model, webgpuAvailability, webgpuMaxStorageBufferBindingSize),
+      );
+      setLoadState("error");
+      return;
+    }
     generationRunRef.current += 1;
     rejectPendingNextTokenRequests(
       pendingNextTokenRequestsRef.current,
@@ -281,6 +309,8 @@ export default function App() {
       scratchSequenceLength: 256,
       ggufPath: model.ggufPath,
       ggufFallbackUrls: model.ggufFallbackUrls,
+      backendPreference: model.backendPolicy.defaultPreference,
+      webgpuRequired: model.backendPolicy.webgpu === "required",
     } satisfies AppWorkerRequest);
   }
 
@@ -321,7 +351,13 @@ export default function App() {
   }
 
   function selectModel(nextModelId: ModelId) {
-    if (nextModelId === selectedModelId || loadState === "loading" || generationState === "generating") {
+    const nextModel = modelCatalog[nextModelId];
+    if (
+      nextModelId === selectedModelId ||
+      loadState === "loading" ||
+      generationState === "generating" ||
+      !modelCanRun(nextModel, webgpuAvailability, webgpuMaxStorageBufferBindingSize)
+    ) {
       return;
     }
 
@@ -480,6 +516,8 @@ export default function App() {
         visibleStepIndex={visibleStepIndex}
         canEnterChat={canEnterChat}
         steps={activeSteps}
+        webgpuAvailability={webgpuAvailability}
+        webgpuMaxStorageBufferBindingSize={webgpuMaxStorageBufferBindingSize}
         onLoadModel={loadModel}
         onModelIdChange={selectModel}
       />
@@ -558,6 +596,8 @@ function LoadModelSection({
   steps,
   onLoadModel,
   onModelIdChange,
+  webgpuAvailability,
+  webgpuMaxStorageBufferBindingSize,
 }: {
   error: string | null;
   frame: LoadFrame;
@@ -573,6 +613,8 @@ function LoadModelSection({
   steps: readonly AppLoadStep[];
   onLoadModel: () => void;
   onModelIdChange: (modelId: ModelId) => void;
+  webgpuAvailability: WebGpuAvailability;
+  webgpuMaxStorageBufferBindingSize: number | null;
 }) {
   return (
     <section className="landing-section load-section" id="load-model">
@@ -586,6 +628,8 @@ function LoadModelSection({
               modelSelectDisabled={modelSelectDisabled}
               selectedModelId={selectedModelId}
               tokenizerError={tokenizerError}
+              webgpuAvailability={webgpuAvailability}
+              webgpuMaxStorageBufferBindingSize={webgpuMaxStorageBufferBindingSize}
               onLoadModel={onLoadModel}
               onModelIdChange={onModelIdChange}
             />
@@ -606,6 +650,8 @@ function LoadModelSection({
               modelSelectDisabled={modelSelectDisabled}
               selectedModelId={selectedModelId}
               summary={summary}
+              webgpuAvailability={webgpuAvailability}
+              webgpuMaxStorageBufferBindingSize={webgpuMaxStorageBufferBindingSize}
               onLoadModel={onLoadModel}
               onModelIdChange={onModelIdChange}
             />
@@ -632,6 +678,8 @@ function StartLoadFrame({
   modelSelectDisabled,
   selectedModelId,
   tokenizerError,
+  webgpuAvailability,
+  webgpuMaxStorageBufferBindingSize,
   onLoadModel,
   onModelIdChange,
 }: {
@@ -640,6 +688,8 @@ function StartLoadFrame({
   modelSelectDisabled: boolean;
   selectedModelId: ModelId;
   tokenizerError: string | null;
+  webgpuAvailability: WebGpuAvailability;
+  webgpuMaxStorageBufferBindingSize: number | null;
   onLoadModel: () => void;
   onModelIdChange: (modelId: ModelId) => void;
 }) {
@@ -647,7 +697,14 @@ function StartLoadFrame({
     <div className="start-load-frame">
       <button
         className="load-button"
-        disabled={loadState === "loading"}
+        disabled={
+          loadState === "loading" ||
+          !modelCanRun(
+            modelCatalog[selectedModelId],
+            webgpuAvailability,
+            webgpuMaxStorageBufferBindingSize,
+          )
+        }
         onClick={onLoadModel}
         type="button"
       >
@@ -656,6 +713,8 @@ function StartLoadFrame({
       <ModelSelector
         disabled={modelSelectDisabled}
         selectedModelId={selectedModelId}
+        webgpuAvailability={webgpuAvailability}
+        webgpuMaxStorageBufferBindingSize={webgpuMaxStorageBufferBindingSize}
         onModelIdChange={onModelIdChange}
       />
       <p className="frame-copy">
@@ -671,10 +730,14 @@ function StartLoadFrame({
 function ModelSelector({
   disabled,
   selectedModelId,
+  webgpuAvailability,
+  webgpuMaxStorageBufferBindingSize,
   onModelIdChange,
 }: {
   disabled: boolean;
   selectedModelId: ModelId;
+  webgpuAvailability: WebGpuAvailability;
+  webgpuMaxStorageBufferBindingSize: number | null;
   onModelIdChange: (modelId: ModelId) => void;
 }) {
   return (
@@ -686,11 +749,22 @@ function ModelSelector({
         onChange={(event) => onModelIdChange(event.currentTarget.value as ModelId)}
         value={selectedModelId}
       >
-        {modelOptions.map((model) => (
-          <option key={model.id} value={model.id}>
-            {model.label}
-          </option>
-        ))}
+        {modelOptions.map((model) => {
+          const unavailable = !modelCanRun(
+            model,
+            webgpuAvailability,
+            webgpuMaxStorageBufferBindingSize,
+          );
+          return (
+            <option disabled={unavailable} key={model.id} value={model.id}>
+              {modelDropdownLabel(
+                model,
+                webgpuAvailability,
+                webgpuMaxStorageBufferBindingSize,
+              )}
+            </option>
+          );
+        })}
       </select>
     </label>
   );
@@ -752,6 +826,8 @@ function ConfigFrame({
   modelSelectDisabled,
   selectedModelId,
   summary,
+  webgpuAvailability,
+  webgpuMaxStorageBufferBindingSize,
   onLoadModel,
   onModelIdChange,
 }: {
@@ -759,6 +835,8 @@ function ConfigFrame({
   modelSelectDisabled: boolean;
   selectedModelId: ModelId;
   summary: AppLoadedModelSummary;
+  webgpuAvailability: WebGpuAvailability;
+  webgpuMaxStorageBufferBindingSize: number | null;
   onLoadModel: () => void;
   onModelIdChange: (modelId: ModelId) => void;
 }) {
@@ -790,6 +868,8 @@ function ConfigFrame({
         <ModelSelector
           disabled={modelSelectDisabled}
           selectedModelId={selectedModelId}
+          webgpuAvailability={webgpuAvailability}
+          webgpuMaxStorageBufferBindingSize={webgpuMaxStorageBufferBindingSize}
           onModelIdChange={onModelIdChange}
         />
       </div>
@@ -1085,6 +1165,96 @@ function normalizeLineBreaks(value: string): string {
   return value.replace(/\r\n?/g, "\n").replace(/\n+/g, "\n");
 }
 
+function modelCanRun(
+  model: ModelCatalogEntry,
+  webgpuAvailability: WebGpuAvailability,
+  webgpuMaxStorageBufferBindingSize: number | null,
+): boolean {
+  if (model.backendPolicy.cpuFallback) {
+    return true;
+  }
+
+  return (
+    webgpuAvailability === "available" &&
+    modelWebGpuRequirementsMet(model, webgpuMaxStorageBufferBindingSize)
+  );
+}
+
+function modelDropdownLabel(
+  model: ModelCatalogEntry,
+  webgpuAvailability: WebGpuAvailability,
+  webgpuMaxStorageBufferBindingSize: number | null,
+): string {
+  const runtimeLabel = modelRuntimeLabel(
+    model,
+    webgpuAvailability,
+    webgpuMaxStorageBufferBindingSize,
+  );
+  return `${model.label} - ${runtimeLabel}`;
+}
+
+function modelRuntimeLabel(
+  model: ModelCatalogEntry,
+  webgpuAvailability: WebGpuAvailability,
+  webgpuMaxStorageBufferBindingSize: number | null,
+): string {
+  if (webgpuAvailability === "checking") {
+    return model.backendPolicy.cpuFallback ? "checking GPU, CPU fallback" : "checking GPU";
+  }
+
+  if (webgpuAvailability === "available") {
+    if (model.backendPolicy.webgpu === "unsupported") {
+      return "CPU only";
+    }
+    if (!modelWebGpuRequirementsMet(model, webgpuMaxStorageBufferBindingSize)) {
+      return "GPU limit too low";
+    }
+    return model.backendPolicy.cpuFallback ? "GPU available, CPU fallback" : "GPU available";
+  }
+
+  if (model.backendPolicy.cpuFallback) {
+    return "GPU unavailable, CPU fallback";
+  }
+
+  return "GPU unavailable";
+}
+
+function modelUnavailableMessage(
+  model: ModelCatalogEntry,
+  webgpuAvailability: WebGpuAvailability,
+  webgpuMaxStorageBufferBindingSize: number | null,
+): string {
+  if (webgpuAvailability === "checking") {
+    return `${model.label} requires WebGPU. WebGPU support is still being checked.`;
+  }
+  if (
+    webgpuAvailability === "available" &&
+    !modelWebGpuRequirementsMet(model, webgpuMaxStorageBufferBindingSize)
+  ) {
+    return (
+      `${model.label} requires a WebGPU storage buffer binding size of at least ` +
+      `${formatBytes(model.backendPolicy.minimumStorageBufferBindingSize ?? 0)}, but this ` +
+      `adapter reports ${formatBytes(webgpuMaxStorageBufferBindingSize ?? 0)}.`
+    );
+  }
+
+  return `${model.label} requires WebGPU, but WebGPU is not available in this browser.`;
+}
+
+function modelWebGpuRequirementsMet(
+  model: ModelCatalogEntry,
+  webgpuMaxStorageBufferBindingSize: number | null,
+): boolean {
+  const requiredStorageBindingSize = model.backendPolicy.minimumStorageBufferBindingSize;
+  if (!requiredStorageBindingSize) {
+    return true;
+  }
+  return (
+    webgpuMaxStorageBufferBindingSize !== null &&
+    webgpuMaxStorageBufferBindingSize >= requiredStorageBindingSize
+  );
+}
+
 function createRequestId(): string {
   const cryptoApi = globalThis.crypto;
   if (typeof cryptoApi?.randomUUID === "function") {
@@ -1159,6 +1329,7 @@ function modelConfigRows(summary: AppLoadedModelSummary): Array<{ label: string;
     const { config } = summary;
     return [
       { label: "Model", value: summary.modelLabel },
+      { label: "Backend", value: summary.backend.toUpperCase() },
       { label: "Architecture", value: summary.architecture },
       { label: "Dtype", value: summary.dtype },
       { label: "Layers", value: formatInteger(summary.layers) },
@@ -1180,6 +1351,7 @@ function modelConfigRows(summary: AppLoadedModelSummary): Array<{ label: string;
   const { config } = summary;
   return [
     { label: "Model", value: summary.modelLabel },
+    { label: "Backend", value: summary.backend.toUpperCase() },
     { label: "Architecture", value: summary.architecture },
     { label: "Dtype", value: summary.dtype },
     { label: "Layers", value: formatInteger(summary.layers) },
