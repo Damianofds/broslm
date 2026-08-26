@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import type { TensorView, TransformerLayerWeights } from "../src/loader";
+import type { TensorView, TransformerLayerWeights } from "../src/gpt-neo/loader";
 import {
   type TransformerLayerConfig,
   transformerLayer,
-} from "../src/transformerLayer";
+} from "../src/gpt-neo/transformerLayer";
 
 describe("transformerLayer", () => {
   it("composes ln_1, attention, and the first residual add", () => {

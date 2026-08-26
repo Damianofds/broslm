@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { TensorView } from "../../src/loader";
+import type { TensorView } from "../../src/tensor";
 import { layerNorm } from "../../src/primitives/layerNorm";
 
 describe("layerNorm", () => {

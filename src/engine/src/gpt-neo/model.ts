@@ -5,9 +5,9 @@ import {
   type ModelKvCache,
 } from "./attentionCache";
 import type { LoadedModel, TensorView } from "./loader";
-import { layerNorm } from "./primitives/layerNorm";
-import { matrixVectorMultiply } from "./primitives/matrixVectorMultiply";
-import { sampleTokenFromLogits, type SamplingOptions } from "./sampling";
+import { layerNorm } from "../primitives/layerNorm";
+import { matrixVectorMultiply } from "../primitives/matrixVectorMultiply";
+import { sampleTokenFromLogits, type SamplingOptions } from "../sampling";
 import {
   transformerLayer,
   transformerLayerIncremental,

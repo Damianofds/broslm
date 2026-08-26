@@ -1,6 +1,6 @@
 # broSLM
 
-broSLM stands for Browser Small Language Model. The project explores running a small causal language model directly in the browser by exporting a Hugging Face TinyStories GPT-Neo checkpoint into simple raw files and loading those files from a TypeScript inference worker.
+broSLM stands for Browser Small Language Model. The project explores running small causal language models directly in the browser. The app can load the default Hugging Face TinyStories GPT-Neo raw export or an optional Qwen2.5 0.5B GGUF model from a local model folder.
 
 The repo is split into three working areas:
 
@@ -11,8 +11,9 @@ The repo is split into three working areas:
 ## Current Flow
 
 1. Use the Python workspace to download or validate the TinyStories model and export raw files.
-2. Keep completed exports in `models/output_<YYYYmmdd_HHMMSS>/`.
-3. Use the TypeScript workspace to run or build the browser app with Vite.
+2. Keep completed TinyStories exports in `models/output_<YYYYmmdd_HHMMSS>/`.
+3. Keep optional Qwen2 GGUF files in `models/qwen2.5-0.5b-instruct-q4_0/model.gguf`.
+4. Use the TypeScript workspace to run or build the browser app with Vite.
 
 ## Build And Run
 

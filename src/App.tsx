@@ -1,16 +1,25 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type {
-  LoadedModelSummary,
-  LoaderProgress,
-  LoaderWorkerRequest,
-  LoaderWorkerResponse,
-} from "./engine/src/loader";
-import { modelBaseUrl, tokenizerUrl } from "./modelExport";
 import {
+  createQwen2ByteLevelBpeTokenizer,
   loadByteLevelBpeTokenizer,
   type ByteLevelBpeTokenizer,
 } from "./tokenizer";
 import { createModelCacheFetch } from "./modelCache";
+import {
+  defaultModelId,
+  formatPromptForModel,
+  modelCatalog,
+  modelLoadSteps,
+  modelOptions,
+  stepIndexForProgressStage,
+  visibleGeneratedTextForModel,
+  type AppLoadedModelSummary,
+  type AppLoaderProgress,
+  type AppLoadStep,
+  type AppWorkerRequest,
+  type AppWorkerResponse,
+  type ModelId,
+} from "./modelCatalog";
 
 type LoadState = "idle" | "loading" | "ready" | "error";
 type TokenizerState = "idle" | "loading" | "ready" | "error";
@@ -22,23 +31,6 @@ interface PendingNextTokenRequest {
   reject: (error: Error) => void;
 }
 
-interface Step {
-  stage: LoaderProgress["stage"];
-  label: string;
-}
-
-const steps: readonly Step[] = [
-  { stage: "descriptors-download-started", label: "Start descriptor downloads" },
-  { stage: "descriptors-downloaded", label: "Receive config and tensor index" },
-  { stage: "descriptors-validated", label: "Validate architecture and tensor metadata" },
-  { stage: "weights-download-started", label: "Download raw FP32 weights" },
-  { stage: "weights-validated", label: "Validate weight buffer boundaries" },
-  { stage: "tensor-views-created", label: "Create zero-copy tensor views" },
-  { stage: "weights-bound", label: "Bind tensors into GPT-Neo layers" },
-  { stage: "scratch-allocated", label: "Allocate inference scratch buffers" },
-  { stage: "ready", label: "Keep model resident in the worker" },
-];
-
 const defaultMaxNewTokens = 120;
 const defaultTemperature = 0.95;
 const defaultTopK = 10;
@@ -48,19 +40,22 @@ const transitionTiles = Array.from({ length: 18 }, (_, index) => index);
 export default function App() {
   const workerRef = useRef<Worker | null>(null);
   const tokenizerRef = useRef<ByteLevelBpeTokenizer | null>(null);
+  const tokenizerModelIdRef = useRef<ModelId | null>(null);
+  const selectedModelIdRef = useRef<ModelId>(defaultModelId);
   const cachedFetchRef = useRef<typeof fetch | null>(null);
   const pendingNextTokenRequestsRef = useRef<Map<string, PendingNextTokenRequest>>(new Map());
   const generationRunRef = useRef(0);
   const chatTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
+  const [selectedModelId, setSelectedModelId] = useState<ModelId>(defaultModelId);
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [tokenizerState, setTokenizerState] = useState<TokenizerState>("idle");
-  const [progress, setProgress] = useState<LoaderProgress | null>(null);
+  const [progress, setProgress] = useState<AppLoaderProgress | null>(null);
   const [transientProgressMessage, setTransientProgressMessage] = useState<string | null>(null);
   const [configRevealReady, setConfigRevealReady] = useState(false);
   const [actualStepIndex, setActualStepIndex] = useState(-1);
   const [visibleStepIndex, setVisibleStepIndex] = useState(-1);
-  const [summary, setSummary] = useState<LoadedModelSummary | null>(null);
+  const [summary, setSummary] = useState<AppLoadedModelSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tokenizerError, setTokenizerError] = useState<string | null>(null);
   const [chatText, setChatText] = useState("Once upon a time");
@@ -71,6 +66,7 @@ export default function App() {
   const [generationError, setGenerationError] = useState<string | null>(null);
   const [inputTokenCount, setInputTokenCount] = useState<number | null>(null);
   const [generatedTokenIds, setGeneratedTokenIds] = useState<number[]>([]);
+  const activeSteps = modelLoadSteps[selectedModelId];
 
   useEffect(() => {
     return () => {
@@ -82,6 +78,10 @@ export default function App() {
       workerRef.current?.terminate();
     };
   }, []);
+
+  useEffect(() => {
+    selectedModelIdRef.current = selectedModelId;
+  }, [selectedModelId]);
 
   useEffect(() => {
     if (visibleStepIndex >= actualStepIndex) {
@@ -97,7 +97,7 @@ export default function App() {
   }, [actualStepIndex, visibleStepIndex]);
 
   useEffect(() => {
-    if (!summary || visibleStepIndex < steps.length - 1 || configRevealReady) {
+    if (!summary || visibleStepIndex < activeSteps.length - 1 || configRevealReady) {
       return;
     }
 
@@ -106,7 +106,7 @@ export default function App() {
     }, configTransitionMs);
 
     return () => window.clearTimeout(timeout);
-  }, [configRevealReady, summary, visibleStepIndex]);
+  }, [activeSteps.length, configRevealReady, summary, visibleStepIndex]);
 
   useEffect(() => {
     const textarea = chatTextareaRef.current;
@@ -123,11 +123,13 @@ export default function App() {
     }
 
     try {
-      return tokenizerRef.current.encode(chatText).length;
+      return tokenizerRef.current.encode(
+        formatPromptForModel(selectedModelId, normalizeLineBreaks(chatText)),
+      ).length;
     } catch {
       return null;
     }
-  }, [chatText, tokenizerState]);
+  }, [chatText, selectedModelId, tokenizerState]);
 
   const canGenerate =
     loadState === "ready" &&
@@ -135,7 +137,13 @@ export default function App() {
     generationState !== "generating" &&
     chatText.length > 0;
 
-  const loadFrame = resolveLoadFrame(loadState, summary, visibleStepIndex, configRevealReady);
+  const loadFrame = resolveLoadFrame(
+    loadState,
+    summary,
+    visibleStepIndex,
+    configRevealReady,
+    activeSteps,
+  );
   const canEnterChat =
     loadFrame === "config" && loadState === "ready" && tokenizerState === "ready" && summary !== null;
 
@@ -144,12 +152,16 @@ export default function App() {
       return;
     }
 
+    const model = modelCatalog[selectedModelId];
     generationRunRef.current += 1;
     rejectPendingNextTokenRequests(
       pendingNextTokenRequestsRef.current,
       new Error("Model is reloading"),
     );
+    tokenizerRef.current = null;
+    tokenizerModelIdRef.current = null;
     setLoadState("loading");
+    setTokenizerState("loading");
     setProgress(null);
     setTransientProgressMessage(null);
     setConfigRevealReady(false);
@@ -161,7 +173,9 @@ export default function App() {
     setGenerationError(null);
     setGeneratedTokenIds([]);
     setInputTokenCount(null);
-    void ensureTokenizerLoaded();
+    if (selectedModelId === "tinystories") {
+      void ensureTokenizerLoaded(selectedModelId);
+    }
 
     workerRef.current?.terminate();
     const worker = new Worker(new URL("./modelWorker.ts", import.meta.url), {
@@ -170,8 +184,11 @@ export default function App() {
     });
     workerRef.current = worker;
 
-    worker.onmessage = (event: MessageEvent<LoaderWorkerResponse>) => {
+    worker.onmessage = (event: MessageEvent<AppWorkerResponse>) => {
       const message = event.data;
+      if (message.modelId && message.modelId !== selectedModelIdRef.current) {
+        return;
+      }
 
       if (message.type === "model-progress") {
         setProgress(message.progress);
@@ -184,15 +201,41 @@ export default function App() {
           }, 1200);
         }
         setActualStepIndex((current) =>
-          Math.max(current, stepIndexForStage(message.progress.stage)),
+          Math.max(
+            current,
+            stepIndexForProgressStage(
+              message.progress.stage,
+              modelLoadSteps[message.modelId],
+            ),
+          ),
         );
         return;
       }
 
       if (message.type === "model-ready") {
         setSummary(message.summary);
-        setActualStepIndex(steps.length - 1);
+        setActualStepIndex(modelLoadSteps[message.modelId].length - 1);
         setLoadState("ready");
+        if (message.modelId === "qwen") {
+          try {
+            if (message.tokenizer?.kind !== "qwen2-gguf") {
+              throw new Error("Qwen tokenizer metadata was missing from the worker response.");
+            }
+            tokenizerRef.current = createQwen2ByteLevelBpeTokenizer(message.tokenizer.parts);
+            tokenizerModelIdRef.current = "qwen";
+            setTokenizerState("ready");
+            setTokenizerError(null);
+          } catch (tokenizerBuildError: unknown) {
+            tokenizerRef.current = null;
+            tokenizerModelIdRef.current = null;
+            setTokenizerState("error");
+            setTokenizerError(
+              tokenizerBuildError instanceof Error
+                ? tokenizerBuildError.message
+                : String(tokenizerBuildError),
+            );
+          }
+        }
         return;
       }
 
@@ -218,6 +261,9 @@ export default function App() {
 
       setError(message.error);
       setLoadState("error");
+      if (tokenizerState === "loading") {
+        setTokenizerState("error");
+      }
     };
 
     worker.onerror = (event) => {
@@ -230,23 +276,40 @@ export default function App() {
     worker.postMessage({
       type: "load-model",
       requestId: createRequestId(),
-      baseUrl: new URL(modelBaseUrl, window.location.href).toString(),
+      modelId: selectedModelId,
+      baseUrl: new URL(model.baseUrl, window.location.href).toString(),
       scratchSequenceLength: 256,
-    } satisfies LoaderWorkerRequest);
+      ggufPath: model.ggufPath,
+      ggufFallbackUrls: model.ggufFallbackUrls,
+    } satisfies AppWorkerRequest);
   }
 
-  async function ensureTokenizerLoaded() {
-    if (tokenizerRef.current || tokenizerState === "loading") {
+  async function ensureTokenizerLoaded(modelId: ModelId) {
+    const model = modelCatalog[modelId];
+    if (!model.tokenizerUrl) {
+      return;
+    }
+    if (tokenizerRef.current && tokenizerModelIdRef.current === modelId) {
+      setTokenizerState("ready");
       return;
     }
 
     setTokenizerState("loading");
     setTokenizerError(null);
     try {
-      tokenizerRef.current = await loadByteLevelBpeTokenizer(tokenizerUrl, getCachedFetch());
+      const tokenizer = await loadByteLevelBpeTokenizer(model.tokenizerUrl, getCachedFetch());
+      if (selectedModelIdRef.current !== modelId) {
+        return;
+      }
+      tokenizerRef.current = tokenizer;
+      tokenizerModelIdRef.current = modelId;
       setTokenizerState("ready");
     } catch (loadError: unknown) {
+      if (selectedModelIdRef.current !== modelId) {
+        return;
+      }
       tokenizerRef.current = null;
+      tokenizerModelIdRef.current = null;
       setTokenizerState("error");
       setTokenizerError(loadError instanceof Error ? loadError.message : String(loadError));
     }
@@ -255,6 +318,38 @@ export default function App() {
   function getCachedFetch(): typeof fetch {
     cachedFetchRef.current ??= createModelCacheFetch();
     return cachedFetchRef.current;
+  }
+
+  function selectModel(nextModelId: ModelId) {
+    if (nextModelId === selectedModelId || loadState === "loading" || generationState === "generating") {
+      return;
+    }
+
+    generationRunRef.current += 1;
+    rejectPendingNextTokenRequests(
+      pendingNextTokenRequestsRef.current,
+      new Error("Model selection changed"),
+    );
+    workerRef.current?.terminate();
+    workerRef.current = null;
+    tokenizerRef.current = null;
+    tokenizerModelIdRef.current = null;
+    selectedModelIdRef.current = nextModelId;
+    setSelectedModelId(nextModelId);
+    setLoadState("idle");
+    setTokenizerState("idle");
+    setProgress(null);
+    setTransientProgressMessage(null);
+    setConfigRevealReady(false);
+    setActualStepIndex(-1);
+    setVisibleStepIndex(-1);
+    setSummary(null);
+    setError(null);
+    setTokenizerError(null);
+    setGenerationState("idle");
+    setGenerationError(null);
+    setGeneratedTokenIds([]);
+    setInputTokenCount(null);
   }
 
   async function generateCompletion() {
@@ -273,7 +368,8 @@ export default function App() {
 
     const baseText = normalizeLineBreaks(chatText);
     setChatText(baseText);
-    const inputIds = tokenizer.encode(baseText);
+    const modelPrompt = formatPromptForModel(selectedModelId, baseText);
+    const inputIds = tokenizer.encode(modelPrompt);
     const availableNewTokens = summary.config.maximumSequenceLength - inputIds.length;
     if (availableNewTokens <= 0) {
       setGenerationState("error");
@@ -308,7 +404,15 @@ export default function App() {
         nextInputIds.push(tokenId);
         nextGeneratedTokenIds.push(tokenId);
         setGeneratedTokenIds([...nextGeneratedTokenIds]);
-        setChatText(normalizeLineBreaks(baseText + tokenizer.decode(nextGeneratedTokenIds)));
+        setChatText(
+          normalizeLineBreaks(
+            baseText +
+              visibleGeneratedTextForModel(
+                selectedModelId,
+                tokenizer.decode(nextGeneratedTokenIds),
+              ),
+          ),
+        );
       }
 
       if (generationRunRef.current === runId) {
@@ -344,9 +448,10 @@ export default function App() {
     }
 
     const requestId = createRequestId();
-    const request: LoaderWorkerRequest = {
+    const request: AppWorkerRequest = {
       type: "next-token",
       requestId,
+      modelId: selectedModelId,
       inputIds,
       temperature: options.temperature,
       topK: options.topK,
@@ -367,12 +472,16 @@ export default function App() {
         frame={loadFrame}
         loadState={loadState}
         progress={progress}
+        selectedModelId={selectedModelId}
+        modelSelectDisabled={loadState === "loading" || generationState === "generating"}
         summary={summary}
         tokenizerError={tokenizerError}
         transientProgressMessage={transientProgressMessage}
         visibleStepIndex={visibleStepIndex}
         canEnterChat={canEnterChat}
+        steps={activeSteps}
         onLoadModel={loadModel}
+        onModelIdChange={selectModel}
       />
 
       {canEnterChat && (
@@ -439,23 +548,31 @@ function LoadModelSection({
   frame,
   loadState,
   progress,
+  selectedModelId,
+  modelSelectDisabled,
   summary,
   tokenizerError,
   transientProgressMessage,
   visibleStepIndex,
   canEnterChat,
+  steps,
   onLoadModel,
+  onModelIdChange,
 }: {
   error: string | null;
   frame: LoadFrame;
   loadState: LoadState;
-  progress: LoaderProgress | null;
-  summary: LoadedModelSummary | null;
+  progress: AppLoaderProgress | null;
+  selectedModelId: ModelId;
+  modelSelectDisabled: boolean;
+  summary: AppLoadedModelSummary | null;
   tokenizerError: string | null;
   transientProgressMessage: string | null;
   visibleStepIndex: number;
   canEnterChat: boolean;
+  steps: readonly AppLoadStep[];
   onLoadModel: () => void;
+  onModelIdChange: (modelId: ModelId) => void;
 }) {
   return (
     <section className="landing-section load-section" id="load-model">
@@ -466,20 +583,33 @@ function LoadModelSection({
             <StartLoadFrame
               error={error}
               loadState={loadState}
+              modelSelectDisabled={modelSelectDisabled}
+              selectedModelId={selectedModelId}
               tokenizerError={tokenizerError}
               onLoadModel={onLoadModel}
+              onModelIdChange={onModelIdChange}
             />
           )}
           {frame === "loading" && (
             <LoadingFrame
               loadState={loadState}
               progress={progress}
+              steps={steps}
               transientProgressMessage={transientProgressMessage}
               visibleStepIndex={visibleStepIndex}
             />
           )}
           {frame === "transition" && <ConfigTransitionFrame />}
-          {frame === "config" && summary && <ConfigFrame summary={summary} onLoadModel={onLoadModel} />}
+          {frame === "config" && summary && (
+            <ConfigFrame
+              loadState={loadState}
+              modelSelectDisabled={modelSelectDisabled}
+              selectedModelId={selectedModelId}
+              summary={summary}
+              onLoadModel={onLoadModel}
+              onModelIdChange={onModelIdChange}
+            />
+          )}
         </div>
       </div>
       {canEnterChat && <ScrollCue href="#chat" label="Let's chat!" />}
@@ -499,13 +629,19 @@ function ScrollCue({ href, label }: { href: string; label: string }) {
 function StartLoadFrame({
   error,
   loadState,
+  modelSelectDisabled,
+  selectedModelId,
   tokenizerError,
   onLoadModel,
+  onModelIdChange,
 }: {
   error: string | null;
   loadState: LoadState;
+  modelSelectDisabled: boolean;
+  selectedModelId: ModelId;
   tokenizerError: string | null;
   onLoadModel: () => void;
+  onModelIdChange: (modelId: ModelId) => void;
 }) {
   return (
     <div className="start-load-frame">
@@ -517,6 +653,11 @@ function StartLoadFrame({
       >
         Start
       </button>
+      <ModelSelector
+        disabled={modelSelectDisabled}
+        selectedModelId={selectedModelId}
+        onModelIdChange={onModelIdChange}
+      />
       <p className="frame-copy">
         The browser will fetch the model weights, validate them, and keep the network quiet after
         the worker is ready.
@@ -527,25 +668,55 @@ function StartLoadFrame({
   );
 }
 
+function ModelSelector({
+  disabled,
+  selectedModelId,
+  onModelIdChange,
+}: {
+  disabled: boolean;
+  selectedModelId: ModelId;
+  onModelIdChange: (modelId: ModelId) => void;
+}) {
+  return (
+    <label className="model-selector-field">
+      <span>Model</span>
+      <select
+        aria-label="Model"
+        disabled={disabled}
+        onChange={(event) => onModelIdChange(event.currentTarget.value as ModelId)}
+        value={selectedModelId}
+      >
+        {modelOptions.map((model) => (
+          <option key={model.id} value={model.id}>
+            {model.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
 function LoadingFrame({
   loadState,
   progress,
+  steps,
   transientProgressMessage,
   visibleStepIndex,
 }: {
   loadState: LoadState;
-  progress: LoaderProgress | null;
+  progress: AppLoaderProgress | null;
+  steps: readonly AppLoadStep[];
   transientProgressMessage: string | null;
   visibleStepIndex: number;
 }) {
   return (
     <div className="loading-frame-inner">
       <div className="progress-track" aria-label="Model loading progress">
-        <div className="progress-fill" style={{ width: `${stepPercent(visibleStepIndex)}%` }} />
+        <div className="progress-fill" style={{ width: `${stepPercent(visibleStepIndex, steps)}%` }} />
       </div>
 
       <p className="current-message">
-        {transientProgressMessage ?? currentStepMessage(visibleStepIndex, loadState)}
+        {transientProgressMessage ?? currentStepMessage(visibleStepIndex, loadState, steps)}
         {!transientProgressMessage && progress?.loadedBytes && progress.totalBytes
           ? ` / ${formatBytes(progress.loadedBytes)} of ${formatBytes(progress.totalBytes)}`
           : ""}
@@ -553,7 +724,7 @@ function LoadingFrame({
 
       <ol className="step-list">
         {steps.map((step, index) => (
-          <li className={stepClassName(index, visibleStepIndex)} key={step.stage}>
+          <li className={stepClassName(index, visibleStepIndex)} key={step.key}>
             <span className="step-index">{String(index + 1).padStart(2, "0")}</span>
             <span>{step.label}</span>
           </li>
@@ -577,11 +748,19 @@ function ConfigTransitionFrame() {
 }
 
 function ConfigFrame({
+  loadState,
+  modelSelectDisabled,
+  selectedModelId,
   summary,
   onLoadModel,
+  onModelIdChange,
 }: {
-  summary: LoadedModelSummary;
+  loadState: LoadState;
+  modelSelectDisabled: boolean;
+  selectedModelId: ModelId;
+  summary: AppLoadedModelSummary;
   onLoadModel: () => void;
+  onModelIdChange: (modelId: ModelId) => void;
 }) {
   return (
     <div className="config-frame-inner">
@@ -592,13 +771,7 @@ function ConfigFrame({
             <ConfigItem key={row.label} label={row.label} value={row.value} />
           ))}
         </div>
-        <div className="attention-strip" aria-label="Attention layer types">
-          {summary.config.attentionLayers.map((kind, index) => (
-            <span className={kind} key={`${kind}-${index}`} title={`Layer ${index}: ${kind}`}>
-              {index}
-            </span>
-          ))}
-        </div>
+        <LayerStrip summary={summary} />
       </section>
 
       <section className="config-panel">
@@ -610,9 +783,40 @@ function ConfigFrame({
         </div>
       </section>
 
-      <button className="reload-link" onClick={onLoadModel} type="button">
-        Reload model
-      </button>
+      <div className="config-actions">
+        <button className="reload-link" onClick={onLoadModel} type="button">
+          Reload model
+        </button>
+        <ModelSelector
+          disabled={modelSelectDisabled}
+          selectedModelId={selectedModelId}
+          onModelIdChange={onModelIdChange}
+        />
+      </div>
+    </div>
+  );
+}
+
+function LayerStrip({ summary }: { summary: AppLoadedModelSummary }) {
+  if (summary.kind === "gpt-neo") {
+    return (
+      <div className="attention-strip" aria-label="Attention layer types">
+        {summary.config.attentionLayers.map((kind, index) => (
+          <span className={kind} key={`${kind}-${index}`} title={`Layer ${index}: ${kind}`}>
+            {index}
+          </span>
+        ))}
+      </div>
+    );
+  }
+
+  return (
+    <div className="attention-strip" aria-label="Qwen GQA layers">
+      {Array.from({ length: summary.layers }, (_, index) => (
+        <span className="qwen" key={index} title={`Layer ${index}: grouped query attention`}>
+          {index}
+        </span>
+      ))}
     </div>
   );
 }
@@ -787,9 +991,10 @@ function ConfigItem({ label, value }: { label: string; value: string }) {
 
 function resolveLoadFrame(
   loadState: LoadState,
-  summary: LoadedModelSummary | null,
+  summary: AppLoadedModelSummary | null,
   visibleStepIndex: number,
   configRevealReady: boolean,
+  steps: readonly AppLoadStep[],
 ): LoadFrame {
   if (summary && visibleStepIndex >= steps.length - 1) {
     return configRevealReady ? "config" : "transition";
@@ -905,33 +1110,6 @@ function rejectPendingNextTokenRequests(
   requests.clear();
 }
 
-function stepIndexForStage(stage: LoaderProgress["stage"]): number {
-  switch (stage) {
-    case "descriptors-download-started":
-      return 0;
-    case "descriptors-downloaded":
-      return 1;
-    case "descriptors-validated":
-      return 2;
-    case "weights-download-started":
-    case "weights-download-progress":
-    case "weights-downloaded":
-      return 3;
-    case "weights-validated":
-      return 4;
-    case "tensor-views-created":
-      return 5;
-    case "weights-bound":
-      return 6;
-    case "scratch-allocated":
-      return 7;
-    case "ready":
-      return 8;
-    default:
-      return 0;
-  }
-}
-
 function stepClassName(index: number, visibleStepIndex: number): string {
   if (index < visibleStepIndex) {
     return "done";
@@ -942,14 +1120,18 @@ function stepClassName(index: number, visibleStepIndex: number): string {
   return "";
 }
 
-function stepPercent(visibleStepIndex: number): number {
+function stepPercent(visibleStepIndex: number, steps: readonly AppLoadStep[]): number {
   if (visibleStepIndex < 0) {
     return 0;
   }
   return Math.min(100, ((visibleStepIndex + 1) / steps.length) * 100);
 }
 
-function currentStepMessage(visibleStepIndex: number, loadState: LoadState): string {
+function currentStepMessage(
+  visibleStepIndex: number,
+  loadState: LoadState,
+  steps: readonly AppLoadStep[],
+): string {
   if (visibleStepIndex >= 0) {
     return steps[visibleStepIndex]?.label ?? statusTitle(loadState);
   }
@@ -972,9 +1154,32 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
 }
 
-function modelConfigRows(summary: LoadedModelSummary): Array<{ label: string; value: string }> {
+function modelConfigRows(summary: AppLoadedModelSummary): Array<{ label: string; value: string }> {
+  if (summary.kind === "qwen2") {
+    const { config } = summary;
+    return [
+      { label: "Model", value: summary.modelLabel },
+      { label: "Architecture", value: summary.architecture },
+      { label: "Dtype", value: summary.dtype },
+      { label: "Layers", value: formatInteger(summary.layers) },
+      { label: "Hidden size", value: formatInteger(summary.hiddenSize) },
+      { label: "Vocabulary", value: formatInteger(summary.vocabularySize) },
+      { label: "Max sequence", value: formatInteger(config.maximumSequenceLength) },
+      { label: "Intermediate", value: formatInteger(config.intermediateSize) },
+      { label: "Query heads", value: formatInteger(config.numberOfHeads) },
+      { label: "KV heads", value: formatInteger(config.numberOfKeyValueHeads) },
+      { label: "Head dim", value: formatInteger(config.headDimension) },
+      { label: "KV hidden", value: formatInteger(config.keyValueHiddenSize) },
+      { label: "RoPE theta", value: formatInteger(config.ropeTheta) },
+      { label: "RMS eps", value: String(config.rmsNormEpsilon) },
+      { label: "BOS / EOS / PAD", value: `${config.bosTokenId} / ${config.eosTokenId} / ${config.padTokenId ?? "null"}` },
+      { label: "Tied embeddings", value: config.tiedWordEmbeddings ? "yes" : "no" },
+    ];
+  }
+
   const { config } = summary;
   return [
+    { label: "Model", value: summary.modelLabel },
     { label: "Architecture", value: summary.architecture },
     { label: "Dtype", value: summary.dtype },
     { label: "Layers", value: formatInteger(summary.layers) },
@@ -992,29 +1197,47 @@ function modelConfigRows(summary: LoadedModelSummary): Array<{ label: string; va
   ];
 }
 
-function tensorConfigRows(summary: LoadedModelSummary): Array<{ label: string; value: string }> {
-  const tokenEmbedding = tensorByName(summary, "transformer.wte.weight");
-  const positionEmbedding = tensorByName(summary, "transformer.wpe.weight");
-  const lmHead = tensorByName(summary, "lm_head.weight");
-  const finalNorm = tensorByName(summary, "transformer.ln_f.weight");
+function tensorConfigRows(summary: AppLoadedModelSummary): Array<{ label: string; value: string }> {
+  const tokenEmbedding =
+    summary.kind === "qwen2"
+      ? tensorByName(summary, "token_embd.weight")
+      : tensorByName(summary, "transformer.wte.weight");
+  const positionEmbedding =
+    summary.kind === "qwen2" ? null : tensorByName(summary, "transformer.wpe.weight");
+  const lmHead =
+    summary.kind === "qwen2" ? tensorByName(summary, "output.weight") : tensorByName(summary, "lm_head.weight");
+  const finalNorm =
+    summary.kind === "qwen2"
+      ? tensorByName(summary, "output_norm.weight")
+      : tensorByName(summary, "transformer.ln_f.weight");
 
-  return [
+  const rows = [
     { label: "Tensor count", value: formatInteger(summary.tensorCount) },
     { label: "Weight bytes", value: formatBytes(summary.totalByteLength) },
-    { label: "Scratch sequence", value: formatInteger(summary.scratchSequenceLength) },
     { label: "Token embedding", value: tokenEmbedding ? formatShape(tokenEmbedding.shape) : "-" },
-    { label: "Position embedding", value: positionEmbedding ? formatShape(positionEmbedding.shape) : "-" },
     { label: "LM head", value: lmHead ? formatShape(lmHead.shape) : "-" },
     { label: "Final norm", value: finalNorm ? formatShape(finalNorm.shape) : "-" },
     { label: "Largest tensor", value: largestTensorLabel(summary) },
   ];
+
+  if (summary.kind === "gpt-neo") {
+    rows.splice(2, 0, { label: "Scratch sequence", value: formatInteger(summary.scratchSequenceLength) });
+    rows.splice(4, 0, {
+      label: "Position embedding",
+      value: positionEmbedding ? formatShape(positionEmbedding.shape) : "-",
+    });
+  } else {
+    rows.splice(2, 0, { label: "KV hidden", value: formatInteger(summary.keyValueHiddenSize) });
+  }
+
+  return rows;
 }
 
-function tensorByName(summary: LoadedModelSummary, name: string) {
+function tensorByName(summary: AppLoadedModelSummary, name: string) {
   return summary.tensors.find((tensor) => tensor.name === name) ?? null;
 }
 
-function largestTensorLabel(summary: LoadedModelSummary): string {
+function largestTensorLabel(summary: AppLoadedModelSummary): string {
   const tensor = [...summary.tensors].sort((left, right) => right.byteLength - left.byteLength)[0];
   if (!tensor) {
     return "-";

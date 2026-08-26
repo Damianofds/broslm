@@ -1,48 +1,35 @@
 import type { TensorView } from "../tensor";
 
-export function layerNorm(
+export function rmsNorm(
   input: Float32Array,
   weight: TensorView,
-  bias: TensorView,
   output: Float32Array,
   options: { inputOffset?: number; outputOffset?: number; featureSize?: number; epsilon?: number } = {},
 ): void {
   const featureSize = options.featureSize ?? requireVectorLength(weight, "weight");
   const inputOffset = options.inputOffset ?? 0;
   const outputOffset = options.outputOffset ?? 0;
-  const epsilon = options.epsilon ?? 1e-5;
+  const epsilon = options.epsilon ?? 1e-6;
 
   requireVectorLength(weight, "weight", featureSize);
-  requireVectorLength(bias, "bias", featureSize);
   validateSpan("input", input.length, inputOffset, featureSize);
   validateSpan("output", output.length, outputOffset, featureSize);
   if (typeof epsilon !== "number" || !Number.isFinite(epsilon) || epsilon <= 0) {
     throw new RangeError(`epsilon must be a positive finite number, got ${epsilon}`);
   }
 
-  const mean = calculateMean(input, inputOffset, featureSize);
-  const variance = calculateVariance(input, inputOffset, featureSize, mean);
-  const scale = 1 / Math.sqrt(variance + epsilon);
-
+  const scale = 1 / Math.sqrt(calculateMeanSquare(input, inputOffset, featureSize) + epsilon);
   for (let index = 0; index < featureSize; index += 1) {
-    const normalized = ((input[inputOffset + index] ?? 0) - mean) * scale;
-    output[outputOffset + index] = normalized * (weight.data[index] ?? 0) + (bias.data[index] ?? 0);
+    output[outputOffset + index] =
+      (input[inputOffset + index] ?? 0) * scale * (weight.data[index] ?? 0);
   }
 }
 
-function calculateMean(input: Float32Array, offset: number, length: number): number {
+function calculateMeanSquare(input: Float32Array, offset: number, length: number): number {
   let sum = 0;
   for (let index = 0; index < length; index += 1) {
-    sum += input[offset + index] ?? 0;
-  }
-  return sum / length;
-}
-
-function calculateVariance(input: Float32Array, offset: number, length: number, mean: number): number {
-  let sum = 0;
-  for (let index = 0; index < length; index += 1) {
-    const centered = (input[offset + index] ?? 0) - mean;
-    sum += centered * centered;
+    const value = input[offset + index] ?? 0;
+    sum += value * value;
   }
   return sum / length;
 }

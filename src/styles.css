@@ -33,6 +33,7 @@ body {
 
 button,
 input,
+select,
 textarea {
   font: inherit;
 }
@@ -310,6 +311,43 @@ h3 {
   animation: loadButtonPulse 1700ms ease-in-out infinite;
 }
 
+.model-selector-field {
+  display: grid;
+  gap: 8px;
+  width: min(760px, 100%);
+  margin-top: 14px;
+  text-align: left;
+}
+
+.model-selector-field span {
+  color: var(--text);
+  font-size: 0.75rem;
+  font-weight: 900;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.model-selector-field select {
+  width: 100%;
+  min-height: 52px;
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  background: var(--bg);
+  font-weight: 900;
+  outline: none;
+}
+
+.model-selector-field select:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.model-selector-field select:focus {
+  box-shadow: 0 0 0 1px var(--line);
+}
+
 .load-button:disabled {
   cursor: wait;
   opacity: 0.58;
@@ -513,9 +551,25 @@ h3 {
   color: var(--text);
 }
 
-.reload-link {
+.attention-strip .qwen {
+  background: var(--bg);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+
+.config-actions {
   grid-column: 1 / -1;
+  display: grid;
+  gap: 10px;
   justify-self: start;
+  width: min(360px, 100%);
+}
+
+.config-actions .model-selector-field {
+  width: 100%;
+  margin-top: 0;
+}
+
+.reload-link {
   min-height: 44px;
   padding: 0 18px;
   color: var(--text);

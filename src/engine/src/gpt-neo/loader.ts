@@ -1,6 +1,9 @@
 import { allocateModelKvCache, type ModelKvCache } from "./attentionCache";
 import { nextTokenWithCache } from "./model";
-import { isModelAssetCacheHit, type ModelAssetFetchSource } from "./modelAssetFetch";
+import { isModelAssetCacheHit, type ModelAssetFetchSource } from "../modelAssetFetch";
+import type { TensorDescriptor, TensorView, WeightsIndex } from "../tensor";
+
+export type { TensorDescriptor, TensorView, WeightsIndex } from "../tensor";
 
 export type AttentionKind = "global" | "local";
 
@@ -22,28 +25,6 @@ export interface ModelConfig {
   bosTokenId: number;
   eosTokenId: number;
   padTokenId: number | null;
-}
-
-export interface TensorDescriptor {
-  shape: number[];
-  byteOffset: number;
-  byteLength: number;
-}
-
-export interface WeightsIndex {
-  dtype: "float32";
-  byteOrder: "little-endian";
-  totalByteLength: number;
-  tensorCount: number;
-  tensors: Record<string, TensorDescriptor>;
-}
-
-export interface TensorView {
-  name: string;
-  shape: readonly number[];
-  byteOffset: number;
-  byteLength: number;
-  data: Float32Array;
 }
 
 export interface LayerNormWeights {

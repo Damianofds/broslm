@@ -24,6 +24,7 @@
     "modelExport.ts",
     "modelCache.ts",
     "modelCache.test.ts",
+    "modelCatalog.ts",
     "modelName.ts",
     "modelWorker.ts",
     "tokenizer.ts",

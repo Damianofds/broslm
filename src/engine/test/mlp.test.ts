@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import type { TensorView } from "../src/loader";
+import type { TensorView } from "../src/gpt-neo/loader";
 import {
   type MlpConfig,
   type MlpWeights,
   gptNeoMlpWeights,
   mlp,
-} from "../src/mlp";
+} from "../src/gpt-neo/mlp";
 
 describe("mlp", () => {
   it("returns one [hiddenSize] output vector", () => {

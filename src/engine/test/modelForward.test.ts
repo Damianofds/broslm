@@ -13,8 +13,8 @@ import {
   validateWeightsBuffer,
   validateWeightsIndex,
   type WeightsIndex,
-} from "../src/loader";
-import { nextToken } from "../src/model";
+} from "../src/gpt-neo/loader";
+import { nextToken } from "../src/gpt-neo/model";
 
 interface NextTokenFixture {
   name: string;

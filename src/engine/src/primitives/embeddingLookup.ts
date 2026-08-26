@@ -1,4 +1,4 @@
-import type { TensorView } from "../loader";
+import type { TensorView } from "../tensor";
 
 export function embeddingLookup(
   embedding: TensorView,

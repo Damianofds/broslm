@@ -1,6 +1,6 @@
 import type { MlpWeights as BoundMlpWeights, TensorView } from "./loader";
-import { gelu } from "./primitives/gelu";
-import { matrixVectorMultiply } from "./primitives/matrixVectorMultiply";
+import { gelu } from "../primitives/gelu";
+import { matrixVectorMultiply } from "../primitives/matrixVectorMultiply";
 
 export interface MlpConfig {
   hiddenSize: number;

@@ -3,8 +3,8 @@ import {
   type CausalSelfAttentionConfig,
   type CausalSelfAttentionWeights,
   causalSelfAttentionWithDebug,
-} from "../src/attention";
-import type { TensorView } from "../src/loader";
+} from "../src/gpt-neo/attention";
+import type { TensorView } from "../src/gpt-neo/loader";
 
 describe("causalSelfAttention", () => {
   it("prevents future value vectors from affecting previous positions", () => {

@@ -5,7 +5,13 @@ export interface ByteLevelBpeTokenizer {
   decode(tokenIds: readonly number[]): string;
 }
 
-interface TokenizerJson {
+export interface AddedTokenizerToken {
+  id: number;
+  content: string;
+  special?: boolean;
+}
+
+export interface TokenizerJson {
   added_tokens?: Array<{
     id: number;
     content: string;
@@ -18,9 +24,30 @@ interface TokenizerJson {
   };
 }
 
+export interface ByteLevelBpeTokenizerParts {
+  vocab: Record<string, number>;
+  merges: Array<string | [string, string]>;
+  addedTokens?: readonly AddedTokenizerToken[];
+  tokenPattern?: RegExp;
+  eosTokenId?: number | null;
+}
+
+export interface Qwen2TokenizerParts {
+  tokens: readonly string[];
+  merges: readonly string[];
+  tokenTypes?: readonly number[];
+  bosTokenId?: number | null;
+  eosTokenId?: number | null;
+  padTokenId?: number | null;
+}
+
 const TOKEN_PATTERN =
   /'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+/gu;
+const QWEN2_TOKEN_PATTERN =
+  /'(?:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+/giu;
 const PAIR_SEPARATOR = "\u0001";
+const GGUF_TOKEN_TYPE_CONTROL = 3;
+const GGUF_TOKEN_TYPE_USER_DEFINED = 4;
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder("utf-8", { fatal: false });
@@ -48,13 +75,39 @@ export function createByteLevelBpeTokenizer(tokenizerJson: TokenizerJson): ByteL
     throw new Error("Tokenizer JSON must contain BPE vocab and merges");
   }
 
-  const vocabulary: Record<string, number> = vocab;
-  const bpeMerges: Array<string | [string, string]> = merges;
+  const eosTokenId =
+    tokenizerJson.added_tokens?.find((token) => token.content === "<|endoftext|>")?.id ?? null;
+
+  return createByteLevelBpeTokenizerFromParts({
+    vocab,
+    merges,
+    addedTokens: tokenizerJson.added_tokens,
+    eosTokenId,
+  });
+}
+
+export function createByteLevelBpeTokenizerFromParts(
+  parts: ByteLevelBpeTokenizerParts,
+): ByteLevelBpeTokenizer {
+  const vocabulary: Record<string, number> = { ...parts.vocab };
+  for (const token of parts.addedTokens ?? []) {
+    vocabulary[token.content] = token.id;
+  }
+
+  const bpeMerges: Array<string | [string, string]> = parts.merges;
   const idToToken = buildIdToToken(vocabulary);
   const mergeRanks = buildMergeRanks(bpeMerges);
   const { byteEncoder, byteDecoder } = buildByteUnicodeMaps();
   const bpeCache = new Map<string, string[]>();
-  const eosTokenId = tokenizerJson.added_tokens?.find((token) => token.content === "<|endoftext|>")?.id ?? null;
+  const tokenPattern = parts.tokenPattern ?? TOKEN_PATTERN;
+  const specialTokenIds = new Map<string, number>();
+  const specialTokenContents = new Set<string>();
+  for (const token of parts.addedTokens ?? []) {
+    if (token.special) {
+      specialTokenIds.set(token.content, token.id);
+      specialTokenContents.add(token.content);
+    }
+  }
 
   function encode(text: string): number[] {
     if (text.length === 0) {
@@ -62,17 +115,20 @@ export function createByteLevelBpeTokenizer(tokenizerJson: TokenizerJson): ByteL
     }
 
     const tokenIds: number[] = [];
-    for (const match of text.matchAll(TOKEN_PATTERN)) {
-      const piece = match[0] ?? "";
-      const byteLevelToken = encodeBytes(piece, byteEncoder);
-      const bpeTokens = bytePairEncode(byteLevelToken, mergeRanks, bpeCache);
-
-      for (const token of bpeTokens) {
-        const tokenId = vocabulary[token];
-        if (tokenId === undefined) {
-          throw new Error(`Tokenizer vocab is missing token: ${token}`);
-        }
-        tokenIds.push(tokenId);
+    for (const segment of splitSpecialTokens(text, specialTokenIds)) {
+      if (typeof segment === "number") {
+        tokenIds.push(segment);
+      } else {
+        encodeTextSegment(
+          segment,
+          tokenPattern,
+          byteEncoder,
+          byteDecoder,
+          mergeRanks,
+          bpeCache,
+          vocabulary,
+          tokenIds,
+        );
       }
     }
 
@@ -81,11 +137,31 @@ export function createByteLevelBpeTokenizer(tokenizerJson: TokenizerJson): ByteL
 
   function decode(tokenIds: readonly number[]): string {
     const bytes: number[] = [];
+    let decoded = "";
+    const flushBytes = () => {
+      if (bytes.length === 0) {
+        return;
+      }
+      decoded += textDecoder.decode(new Uint8Array(bytes));
+      bytes.length = 0;
+    };
 
     for (const tokenId of tokenIds) {
       const token = idToToken[tokenId];
       if (token === undefined) {
         throw new RangeError(`Unknown token id: ${tokenId}`);
+      }
+
+      if (specialTokenContents.has(token)) {
+        flushBytes();
+        decoded += token;
+        continue;
+      }
+
+      const fallbackByte = parseByteFallbackToken(token);
+      if (fallbackByte !== null) {
+        bytes.push(fallbackByte);
+        continue;
       }
 
       for (const character of Array.from(token)) {
@@ -97,15 +173,120 @@ export function createByteLevelBpeTokenizer(tokenizerJson: TokenizerJson): ByteL
       }
     }
 
-    return textDecoder.decode(new Uint8Array(bytes));
+    flushBytes();
+    return decoded;
   }
 
   return {
     vocabularySize: idToToken.length,
-    eosTokenId,
+    eosTokenId: parts.eosTokenId ?? null,
     encode,
     decode,
   };
+}
+
+export function createQwen2ByteLevelBpeTokenizer(
+  parts: Qwen2TokenizerParts,
+): ByteLevelBpeTokenizer {
+  const vocab: Record<string, number> = {};
+  const addedTokens: AddedTokenizerToken[] = [];
+  for (let id = 0; id < parts.tokens.length; id += 1) {
+    const content = parts.tokens[id];
+    if (content === undefined) {
+      continue;
+    }
+    vocab[content] = id;
+    if (isQwen2SpecialToken(content, parts.tokenTypes?.[id])) {
+      addedTokens.push({
+        id,
+        content,
+        special: true,
+      });
+    }
+  }
+
+  return createByteLevelBpeTokenizerFromParts({
+    vocab,
+    merges: [...parts.merges],
+    addedTokens,
+    tokenPattern: QWEN2_TOKEN_PATTERN,
+    eosTokenId: parts.eosTokenId ?? null,
+  });
+}
+
+function encodeTextSegment(
+  text: string,
+  tokenPattern: RegExp,
+  byteEncoder: Map<number, string>,
+  byteDecoder: Map<string, number>,
+  mergeRanks: ReadonlyMap<string, number>,
+  bpeCache: Map<string, string[]>,
+  vocabulary: Record<string, number>,
+  tokenIds: number[],
+): void {
+  if (text.length === 0) {
+    return;
+  }
+
+  tokenPattern.lastIndex = 0;
+  for (const match of text.matchAll(tokenPattern)) {
+    const piece = match[0] ?? "";
+    const byteLevelToken = encodeBytes(piece, byteEncoder);
+    const bpeTokens = bytePairEncode(byteLevelToken, mergeRanks, bpeCache);
+
+    for (const token of bpeTokens) {
+      const tokenId = vocabulary[token];
+      if (tokenId === undefined) {
+        const fallbackTokenIds = encodeByteFallbackTokenIds(token, byteDecoder, vocabulary);
+        if (!fallbackTokenIds) {
+          throw new Error(`Tokenizer vocab is missing token: ${token}`);
+        }
+        tokenIds.push(...fallbackTokenIds);
+        continue;
+      }
+      tokenIds.push(tokenId);
+    }
+  }
+}
+
+function splitSpecialTokens(
+  text: string,
+  specialTokenIds: ReadonlyMap<string, number>,
+): Array<string | number> {
+  if (specialTokenIds.size === 0) {
+    return [text];
+  }
+
+  const specialTokens = [...specialTokenIds.keys()].sort((left, right) => right.length - left.length);
+  const segments: Array<string | number> = [];
+  let cursor = 0;
+  while (cursor < text.length) {
+    let matchedToken: string | null = null;
+    for (const token of specialTokens) {
+      if (text.startsWith(token, cursor)) {
+        matchedToken = token;
+        break;
+      }
+    }
+
+    if (matchedToken) {
+      segments.push(specialTokenIds.get(matchedToken) ?? 0);
+      cursor += matchedToken.length;
+      continue;
+    }
+
+    let nextSpecialIndex = text.length;
+    for (const token of specialTokens) {
+      const index = text.indexOf(token, cursor + 1);
+      if (index >= 0 && index < nextSpecialIndex) {
+        nextSpecialIndex = index;
+      }
+    }
+    segments.push(text.slice(cursor, nextSpecialIndex));
+    cursor = nextSpecialIndex;
+  }
+
+  return segments;
 }
 
 function buildIdToToken(vocab: Record<string, number>): string[] {
@@ -118,6 +299,47 @@ function buildIdToToken(vocab: Record<string, number>): string[] {
   }
 
   return idToToken;
+}
+
+function encodeByteFallbackTokenIds(
+  token: string,
+  byteDecoder: ReadonlyMap<string, number>,
+  vocabulary: Record<string, number>,
+): number[] | null {
+  const tokenIds: number[] = [];
+  for (const character of Array.from(token)) {
+    const byte = byteDecoder.get(character);
+    if (byte === undefined) {
+      return null;
+    }
+
+    const tokenId = vocabulary[formatByteFallbackToken(byte)];
+    if (tokenId === undefined) {
+      return null;
+    }
+    tokenIds.push(tokenId);
+  }
+  return tokenIds;
+}
+
+function formatByteFallbackToken(byte: number): string {
+  return `<0x${byte.toString(16).toUpperCase().padStart(2, "0")}>`;
+}
+
+function parseByteFallbackToken(token: string): number | null {
+  const match = /^<0x([0-9A-Fa-f]{2})>$/.exec(token);
+  if (!match) {
+    return null;
+  }
+  return Number.parseInt(match[1] ?? "0", 16);
+}
+
+function isQwen2SpecialToken(content: string, tokenType: number | undefined): boolean {
+  return (
+    tokenType === GGUF_TOKEN_TYPE_CONTROL ||
+    tokenType === GGUF_TOKEN_TYPE_USER_DEFINED ||
+    (content.startsWith("<|") && content.endsWith("|>"))
+  );
 }
 
 function buildMergeRanks(merges: Array<string | [string, string]>): Map<string, number> {

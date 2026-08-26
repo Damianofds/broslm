@@ -5,6 +5,7 @@ import { currentModelExportName } from "./modelName";
 
 const modelsRoot = resolve(__dirname, "../models");
 const selectedModelRoot = resolve(modelsRoot, currentModelExportName);
+const optionalModelFolderNames = ["qwen2.5-0.5b-instruct-q4_0"];
 
 export default defineConfig({
   base: process.env.GITHUB_PAGES === "true" ? "./" : "/",
@@ -29,6 +30,16 @@ function bundleSelectedModelPlugin(): Plugin {
         recursive: true,
         force: true,
       });
+      for (const folderName of optionalModelFolderNames) {
+        const optionalModelRoot = resolve(modelsRoot, folderName);
+        if (!existsSync(optionalModelRoot)) {
+          continue;
+        }
+        cpSync(optionalModelRoot, resolve(outputModelsRoot, folderName), {
+          recursive: true,
+          force: true,
+        });
+      }
     },
   };
 }
@@ -45,14 +56,21 @@ function serveModelsPlugin(): Plugin {
 
         const requestedPath = decodeURIComponent(request.url.split("?")[0] ?? "");
         const filePath = resolve(join(modelsRoot, requestedPath));
-        if (!filePath.startsWith(modelsRoot) || !existsSync(filePath)) {
-          next();
+        if (!filePath.startsWith(modelsRoot)) {
+          response.statusCode = 403;
+          response.end("Forbidden model asset path");
+          return;
+        }
+        if (!existsSync(filePath)) {
+          response.statusCode = 404;
+          response.end(`Model asset not found: /models${requestedPath}`);
           return;
         }
 
         const fileStat = statSync(filePath);
         if (!fileStat.isFile()) {
-          next();
+          response.statusCode = 404;
+          response.end(`Model asset not found: /models${requestedPath}`);
           return;
         }
 

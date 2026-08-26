@@ -1,7 +1,11 @@
 export { argmax } from "./argmax";
+export { applyRoPE } from "./applyRoPE";
 export { embeddingLookup } from "./embeddingLookup";
+export { elementwiseMultiply } from "./elementwiseMultiply";
 export { gelu } from "./gelu";
 export { layerNorm } from "./layerNorm";
 export { matrixVectorMultiply } from "./matrixVectorMultiply";
 export { residualAdd } from "./residualAdd";
+export { rmsNorm } from "./rmsNorm";
+export { silu } from "./silu";
 export { softmax } from "./softmax";

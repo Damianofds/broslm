@@ -4,10 +4,10 @@ import type {
   LayerNormWeights,
   TensorView,
 } from "./loader";
-import { layerNorm } from "./primitives/layerNorm";
-import { matrixVectorMultiply } from "./primitives/matrixVectorMultiply";
-import { residualAdd } from "./primitives/residualAdd";
-import { softmax } from "./primitives/softmax";
+import { layerNorm } from "../primitives/layerNorm";
+import { matrixVectorMultiply } from "../primitives/matrixVectorMultiply";
+import { residualAdd } from "../primitives/residualAdd";
+import { softmax } from "../primitives/softmax";
 
 export interface CausalSelfAttentionConfig {
   hiddenSize: number;

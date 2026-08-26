@@ -8,8 +8,8 @@ import {
 import type { LayerKvCache } from "./attentionCache";
 import type { LayerNormWeights, TransformerLayerWeights } from "./loader";
 import { gptNeoMlpWeights, mlp, type MlpConfig } from "./mlp";
-import { layerNorm } from "./primitives/layerNorm";
-import { residualAdd } from "./primitives/residualAdd";
+import { layerNorm } from "../primitives/layerNorm";
+import { residualAdd } from "../primitives/residualAdd";
 
 export interface TransformerLayerConfig extends CausalSelfAttentionConfig, MlpConfig {
   layerNormEpsilon: number;

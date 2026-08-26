@@ -1,6 +1,6 @@
 # broSLM
 
-This folder contains the TypeScript and React browser app for broSLM. The app loads a raw TinyStories GPT-Neo export inside a dedicated inference Web Worker and shows each loading stage in the browser.
+This folder contains the TypeScript and React browser app for broSLM. The app loads either a raw TinyStories GPT-Neo export or an optional Qwen2.5 0.5B GGUF model inside a dedicated inference Web Worker and shows each loading stage in the browser.
 
 Vite is the build tool for the whole browser deliverable. It runs the dev server, bundles the React page, bundles the worker and shared TypeScript engine code, and copies the selected raw model export into `dist/models/` for production preview or deployment.
 
@@ -12,6 +12,7 @@ Vite is the build tool for the whole browser deliverable. It runs the dev server
   - `weights.json`
   - `weights.bin`
 - The browser prompt demo uses `public/tokenizer/tinystories-tokenizer.json`.
+- Optional Qwen2 runs use `../models/qwen2.5-0.5b-instruct-q4_0/model.gguf`.
 
 ## Install
 
@@ -32,8 +33,9 @@ http://localhost:5173/
 ```
 
 The page is a three-section scroll experience: overview, model loading and
-inspection, then the textarea chat demo. Click `Load model` in the second
-section, then generate from the final section after the model is ready.
+inspection, then the textarea chat demo. Select TinyStories or Qwen in the
+second section, click `Start`, then generate from the final section after the
+model is ready.
 
 ## Build
 
@@ -59,9 +61,10 @@ npm run typecheck
 npm test
 ```
 
-The test suite uses Vitest and covers the TypeScript engine primitives, attention,
-MLP, transformer layer, and the TinyStories forward-pass smoke test. Tests live
-under `engine/test/`.
+The test suite uses Vitest and covers the TypeScript engine primitives, GPT-Neo
+attention/MLP/transformer behavior, Qwen2 GGUF/quantization/attention/model
+behavior, and the TinyStories forward-pass smoke test. Tests live under
+`engine/test/`.
 
 Run the TinyStories smoke test by itself:
 
@@ -126,6 +129,7 @@ npm run preview
 ## Notes
 
 - The UI thread only starts and observes the load.
-- The model is retained inside `src/modelWorker.ts`, which imports `engine/src/loader.ts`.
+- The model is retained inside `src/modelWorker.ts`, which imports `engine/src/gpt-neo/loader.ts`.
 - The active model export is configured in `src/modelExport.ts`.
+- Qwen2 support is available from the second-section model selector. Qwen uses a hidden chat template for generation while keeping the textarea text clean.
 - Vite serves the local `../models` directory at `/models` during development and copies the selected export during production builds.

@@ -3,7 +3,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
-import { allocateModelKvCache } from "../src/attentionCache";
+import { allocateModelKvCache } from "../src/gpt-neo/attentionCache";
 import {
   allocateRuntimeScratch,
   bindModelWeights,
@@ -14,8 +14,8 @@ import {
   validateWeightsBuffer,
   validateWeightsIndex,
   type WeightsIndex,
-} from "../src/loader";
-import { lastTokenLogits, nextToken, nextTokenWithCache } from "../src/model";
+} from "../src/gpt-neo/loader";
+import { lastTokenLogits, nextToken, nextTokenWithCache } from "../src/gpt-neo/model";
 
 const promptIds = [464, 1310, 2576, 1043, 257];
 const alternatePromptIds = [13787, 2227, 284, 1382, 257];
