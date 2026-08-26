@@ -6,6 +6,11 @@ import {
 } from "./attentionCache";
 import type { LoadedQwen2Model, QwenTensorView, TensorView } from "./loader";
 import {
+  hasQwen2ResidentGpuCache,
+  qwen2DecodeTokenLogitsResidentGpu,
+  qwen2PrefillLogitsResidentGpu,
+} from "./gpuModel";
+import {
   embeddingLookupQwen,
   embeddingLookupQwenGpu,
   matrixVectorMultiplyQwen,
@@ -15,9 +20,7 @@ import {
   qwen2TransformerLayer,
   qwen2TransformerLayerGpu,
   qwen2TransformerLayerIncremental,
-  qwen2TransformerLayerIncrementalGpu,
   qwen2TransformerLayerPrefill,
-  qwen2TransformerLayerPrefillGpu,
 } from "./transformerLayer";
 import { rmsNorm } from "../primitives/rmsNorm";
 import { rmsNormGpu } from "../primitives/rmsNorm";
@@ -286,7 +289,11 @@ async function qwen2LastTokenLogitsWithCacheGpu(
     );
   }
 
-  if (!cachePrefixMatches(cache.inputIds, inputIds) || cache.inputIds.length === inputIds.length) {
+  if (
+    !cachePrefixMatches(cache.inputIds, inputIds) ||
+    cache.inputIds.length === inputIds.length ||
+    !hasQwen2ResidentGpuCache(model, cache, runtime)
+  ) {
     return prefillLogitsGpu(model, inputIds, cache, runtime);
   }
 
@@ -306,38 +313,7 @@ async function prefillLogitsGpu(
   cache: Qwen2ModelKvCache,
   runtime: WebGpuRuntime,
 ): Promise<Float32Array> {
-  resetQwen2ModelKvCache(cache);
-
-  const sequenceLength = inputIds.length;
-  const { hiddenSize } = model.config;
-  let hiddenState = await embedInputIdsGpu(model, inputIds, runtime);
-
-  for (let layerIndex = 0; layerIndex < model.weights.layers.length; layerIndex += 1) {
-    const layerWeights = model.weights.layers[layerIndex];
-    const layerCache = cache.layers[layerIndex];
-    if (!layerWeights || !layerCache) {
-      throw new Error(`missing layer/cache at index ${layerIndex}`);
-    }
-    hiddenState = await qwen2TransformerLayerPrefillGpu(
-      runtime,
-      hiddenState,
-      sequenceLength,
-      model.config,
-      layerWeights,
-      layerCache,
-    );
-  }
-
-  const lastTokenOffset = (sequenceLength - 1) * hiddenSize;
-  const finalHidden = await rmsNormGpu(runtime, hiddenState, model.weights.finalNorm.weight, {
-    inputOffset: lastTokenOffset,
-    featureSize: hiddenSize,
-    epsilon: model.config.rmsNormEpsilon,
-  });
-
-  const logits = await matrixVectorMultiplyQwenGpu(runtime, model.weights.lmHead, finalHidden);
-  cache.inputIds.push(...inputIds);
-  return logits;
+  return qwen2PrefillLogitsResidentGpu(model, inputIds, cache, runtime);
 }
 
 function decodeTokenLogits(
@@ -382,31 +358,7 @@ async function decodeTokenLogitsGpu(
   cache: Qwen2ModelKvCache,
   runtime: WebGpuRuntime,
 ): Promise<Float32Array> {
-  const { hiddenSize } = model.config;
-  let hiddenState = await embedTokenGpu(model, tokenId, runtime);
-
-  for (let layerIndex = 0; layerIndex < model.weights.layers.length; layerIndex += 1) {
-    const layerWeights = model.weights.layers[layerIndex];
-    const layerCache = cache.layers[layerIndex];
-    if (!layerWeights || !layerCache) {
-      throw new Error(`missing layer/cache at index ${layerIndex}`);
-    }
-    hiddenState = await qwen2TransformerLayerIncrementalGpu(
-      runtime,
-      hiddenState,
-      position,
-      model.config,
-      layerWeights,
-      layerCache,
-    );
-  }
-
-  const finalHidden = await rmsNormGpu(runtime, hiddenState, model.weights.finalNorm.weight, {
-    featureSize: hiddenSize,
-    epsilon: model.config.rmsNormEpsilon,
-  });
-
-  return matrixVectorMultiplyQwenGpu(runtime, model.weights.lmHead, finalHidden);
+  return qwen2DecodeTokenLogitsResidentGpu(model, tokenId, position, cache, runtime);
 }
 
 function embedToken(model: LoadedQwen2Model, tokenId: number): Float32Array {
