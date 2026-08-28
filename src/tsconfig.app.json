@@ -27,6 +27,8 @@
     "modelCatalog.ts",
     "modelName.ts",
     "modelWorker.ts",
+    "simpleMarkdown.ts",
+    "simpleMarkdown.test.ts",
     "tokenizer.ts",
     "tokenizer.test.ts",
     "vite-env.d.ts",

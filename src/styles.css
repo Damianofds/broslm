@@ -635,14 +635,98 @@ h3 {
 }
 
 .chat-textarea-label textarea {
-  min-height: 260px;
+  height: 54px;
+  min-height: 54px;
+  max-height: 54px;
   resize: none;
-  overflow: hidden;
-  padding: 18px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 13px 18px;
   font-family:
     "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
   font-size: clamp(1rem, 1.45vw, 1.25rem);
-  line-height: 1.58;
+  line-height: 1.35;
+  white-space: pre;
+}
+
+.chat-output-field {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.chat-output-label {
+  color: var(--text);
+  font-size: 0.75rem;
+  font-weight: 900;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.chat-markdown-preview {
+  min-height: 160px;
+  padding: 18px;
+  border: 1px solid color-mix(in srgb, var(--line) 74%, transparent);
+  border-radius: 8px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--shade) 28%, var(--bg));
+  font-size: clamp(1rem, 1.35vw, 1.18rem);
+  font-weight: 620;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.chat-markdown-preview.empty {
+  min-height: 120px;
+}
+
+.chat-markdown-preview p,
+.chat-markdown-preview ul,
+.chat-markdown-preview ol {
+  margin: 0;
+}
+
+.chat-markdown-preview p + p,
+.chat-markdown-preview p + ul,
+.chat-markdown-preview p + ol,
+.chat-markdown-preview ul + p,
+.chat-markdown-preview ol + p,
+.chat-markdown-preview ul + ul,
+.chat-markdown-preview ol + ol {
+  margin-top: 0.75rem;
+}
+
+.chat-markdown-preview ul,
+.chat-markdown-preview ol {
+  display: grid;
+  gap: 0.35rem;
+  padding-left: 1.35rem;
+}
+
+.chat-markdown-preview li::marker {
+  color: var(--accent);
+  font-weight: 950;
+}
+
+.chat-markdown-preview strong {
+  color: var(--line);
+  font-weight: 950;
+}
+
+.chat-markdown-preview em {
+  color: var(--accent);
+  font-style: italic;
+}
+
+.chat-markdown-preview code {
+  padding: 0.08rem 0.3rem;
+  border: 1px solid color-mix(in srgb, var(--line) 58%, transparent);
+  border-radius: 4px;
+  color: var(--line);
+  background: var(--bg);
+  font-family:
+    "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 0.92em;
 }
 
 .chat-controls {
@@ -921,7 +1005,21 @@ h3 {
   }
 
   .chat-textarea-label textarea {
-    min-height: clamp(150px, 28svh, 190px);
+    height: 42px;
+    min-height: 42px;
+    max-height: 42px;
+    padding: 9px 12px;
+    font-size: 0.9rem;
+    line-height: 1.35;
+  }
+
+  .chat-output-field {
+    margin-top: 8px;
+    gap: 6px;
+  }
+
+  .chat-markdown-preview {
+    min-height: 96px;
     padding: 12px;
     font-size: 0.9rem;
     line-height: 1.45;
@@ -934,6 +1032,7 @@ h3 {
   }
 
   .chat-textarea-label > span,
+  .chat-output-label,
   .token-limit-label {
     font-size: 0.64rem;
   }

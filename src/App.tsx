@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { detectWebGpuSupport } from "./engine/src/runtime/webgpu";
 import {
   qwen2WebGpuPrefillSafetyError,
@@ -10,6 +10,11 @@ import {
   type ByteLevelBpeTokenizer,
 } from "./tokenizer";
 import { createModelCacheFetch } from "./modelCache";
+import {
+  parseSimpleMarkdown,
+  type SimpleMarkdownBlock,
+  type SimpleMarkdownInline,
+} from "./simpleMarkdown";
 import {
   defaultModelId,
   formatPromptForModel,
@@ -78,7 +83,9 @@ export default function App() {
   const [summary, setSummary] = useState<AppLoadedModelSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tokenizerError, setTokenizerError] = useState<string | null>(null);
-  const [chatText, setChatText] = useState("Once upon a time");
+  const [chatText, setChatText] = useState(
+    "What hare the 3 design must have for an Executive Dashboard?",
+  );
   const [maxNewTokens, setMaxNewTokens] = useState(defaultMaxNewTokens);
   const [temperature, setTemperature] = useState(defaultTemperature);
   const [topK, setTopK] = useState(defaultTopK);
@@ -86,6 +93,7 @@ export default function App() {
   const [generationError, setGenerationError] = useState<string | null>(null);
   const [inputTokenCount, setInputTokenCount] = useState<number | null>(null);
   const [generatedTokenIds, setGeneratedTokenIds] = useState<number[]>([]);
+  const [generatedText, setGeneratedText] = useState("");
   const [generationThroughput, setGenerationThroughput] = useState<GenerationThroughput>({
     prefillTokensPerSecond: null,
     decodeTokensPerSecond: null,
@@ -150,15 +158,6 @@ export default function App() {
     return () => window.clearTimeout(timeout);
   }, [activeSteps.length, configRevealReady, summary, visibleStepIndex]);
 
-  useEffect(() => {
-    const textarea = chatTextareaRef.current;
-    if (!textarea) {
-      return;
-    }
-    textarea.style.height = "auto";
-    textarea.style.height = `${textarea.scrollHeight}px`;
-  }, [chatText]);
-
   const chatTokenPreview = useMemo(() => {
     if (!tokenizerRef.current || chatText.length === 0) {
       return null;
@@ -221,6 +220,7 @@ export default function App() {
     setGenerationState("idle");
     setGenerationError(null);
     setGeneratedTokenIds([]);
+    setGeneratedText("");
     setInputTokenCount(null);
     resetGenerationThroughput();
     if (selectedModelId === "tinystories") {
@@ -410,6 +410,7 @@ export default function App() {
     setGenerationState("idle");
     setGenerationError(null);
     setGeneratedTokenIds([]);
+    setGeneratedText("");
     setInputTokenCount(null);
     resetGenerationThroughput();
   }
@@ -470,6 +471,7 @@ export default function App() {
 
     setInputTokenCount(inputIds.length);
     setGeneratedTokenIds([]);
+    setGeneratedText("");
     resetGenerationThroughput();
     setGenerationError(null);
     setGenerationState("generating");
@@ -490,16 +492,11 @@ export default function App() {
 
         nextInputIds.push(tokenId);
         nextGeneratedTokenIds.push(tokenId);
-        setGeneratedTokenIds([...nextGeneratedTokenIds]);
-        setChatText(
-          normalizeLineBreaks(
-            baseText +
-              visibleGeneratedTextForModel(
-                selectedModelId,
-                tokenizer.decode(nextGeneratedTokenIds),
-              ),
-          ),
+        const nextGeneratedText = normalizeLineBreaks(
+          visibleGeneratedTextForModel(selectedModelId, tokenizer.decode(nextGeneratedTokenIds)),
         );
+        setGeneratedTokenIds([...nextGeneratedTokenIds]);
+        setGeneratedText(nextGeneratedText);
       }
 
       if (generationRunRef.current === runId) {
@@ -614,6 +611,7 @@ export default function App() {
           canGenerate={canGenerate}
           chatText={chatText}
           decodeTokensPerSecond={generationThroughput.decodeTokensPerSecond}
+          generatedText={generatedText}
           generatedTokenCount={generatedTokenIds.length}
           generationError={generationError}
           generationState={generationState}
@@ -995,6 +993,7 @@ function ChatSection({
   canGenerate,
   chatText,
   decodeTokensPerSecond,
+  generatedText,
   generatedTokenCount,
   generationError,
   generationState,
@@ -1016,6 +1015,7 @@ function ChatSection({
   canGenerate: boolean;
   chatText: string;
   decodeTokensPerSecond: number | null;
+  generatedText: string;
   generatedTokenCount: number;
   generationError: string | null;
   generationState: GenerationState;
@@ -1053,14 +1053,26 @@ function ChatSection({
           }}
         >
           <label className="chat-textarea-label">
-            <span>Prompt and completion</span>
+            <span>Prompt</span>
             <textarea
               ref={textareaRef}
+              rows={1}
               value={chatText}
               onChange={(event) => onChatTextChange(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter") {
+                  return;
+                }
+                event.preventDefault();
+                if (canGenerate) {
+                  onGenerate();
+                }
+              }}
               spellCheck={false}
+              wrap="off"
             />
           </label>
+          <ChatMarkdownPreview generationState={generationState} text={generatedText} />
 
           <div className="chat-controls">
             <GenerationControl
@@ -1117,6 +1129,96 @@ function ChatSection({
       </div>
     </section>
   );
+}
+
+function ChatMarkdownPreview({
+  generationState,
+  text,
+}: {
+  generationState: GenerationState;
+  text: string;
+}) {
+  const markdown = useMemo(() => parseSimpleMarkdown(text), [text]);
+  const normalizedText = normalizeLineBreaks(text);
+
+  return (
+    <div className="chat-output-field">
+      <span className="chat-output-label">Output</span>
+      <div
+        className={`chat-markdown-preview${normalizedText.length === 0 ? " empty" : ""}`}
+        aria-busy={generationState === "generating"}
+        aria-label="Generated output"
+        aria-live="polite"
+      >
+        {normalizedText.length > 0 &&
+          (markdown.hasMarkdownSyntax
+            ? markdown.blocks.map((block, index) => renderMarkdownBlock(block, `block-${index}`))
+            : renderPlainOutput(normalizedText))}
+      </div>
+    </div>
+  );
+}
+
+function renderPlainOutput(text: string): ReactNode {
+  return (
+    <p>
+      {text.split("\n").map((line, index) => (
+        <Fragment key={`plain-line-${index}`}>
+          {index > 0 && <br />}
+          {line}
+        </Fragment>
+      ))}
+    </p>
+  );
+}
+
+function renderMarkdownBlock(block: SimpleMarkdownBlock, key: string): ReactNode {
+  if (block.kind === "unordered-list") {
+    return (
+      <ul key={key}>
+        {block.items.map((item, index) => (
+          <li key={`${key}-item-${index}`}>{renderMarkdownInlines(item, `${key}-${index}`)}</li>
+        ))}
+      </ul>
+    );
+  }
+
+  if (block.kind === "ordered-list") {
+    return (
+      <ol key={key}>
+        {block.items.map((item, index) => (
+          <li key={`${key}-item-${index}`}>{renderMarkdownInlines(item, `${key}-${index}`)}</li>
+        ))}
+      </ol>
+    );
+  }
+
+  return (
+    <p key={key}>
+      {block.lines.map((line, index) => (
+        <Fragment key={`${key}-line-${index}`}>
+          {index > 0 && <br />}
+          {renderMarkdownInlines(line, `${key}-${index}`)}
+        </Fragment>
+      ))}
+    </p>
+  );
+}
+
+function renderMarkdownInlines(inlines: readonly SimpleMarkdownInline[], keyPrefix: string): ReactNode[] {
+  return inlines.map((inline, index) => {
+    const key = `${keyPrefix}-inline-${index}`;
+    if (inline.kind === "strong") {
+      return <strong key={key}>{inline.text}</strong>;
+    }
+    if (inline.kind === "emphasis") {
+      return <em key={key}>{inline.text}</em>;
+    }
+    if (inline.kind === "code") {
+      return <code key={key}>{inline.text}</code>;
+    }
+    return <Fragment key={key}>{inline.text}</Fragment>;
+  });
 }
 
 function GenerationControl({
