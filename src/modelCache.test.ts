@@ -23,6 +23,26 @@ describe("createModelCacheFetch", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
+  it("returns cold network responses before the cache write finishes", async () => {
+    let releaseCacheWrite: () => void = () => undefined;
+    const cacheWriteGate = new Promise<void>((resolve) => {
+      releaseCacheWrite = resolve;
+    });
+    const cacheStorage = new MemoryCacheStorage({ beforePut: () => cacheWriteGate });
+    const fetchImpl = vi.fn<typeof fetch>(async () => new Response("streamed model bytes"));
+    const cachedFetch = createModelCacheFetch({ cacheStorage, fetchImpl });
+    const url = "https://example.test/models/current/weights.bin";
+
+    const response = await cachedFetch(url);
+
+    await expect(response.text()).resolves.toBe("streamed model bytes");
+    await expect(cacheStorage.match(url)).resolves.toBeUndefined();
+
+    releaseCacheWrite();
+    const cachedResponse = await waitForCachedResponse(cacheStorage, url);
+    await expect(cachedResponse.text()).resolves.toBe("streamed model bytes");
+  });
+
   it("does not cache failed responses", async () => {
     const cacheStorage = new MemoryCacheStorage();
     const fetchImpl = vi
@@ -108,6 +128,7 @@ class MemoryCacheStorage implements CacheStorage {
 
 interface MemoryCacheOptions {
   failWrites?: boolean;
+  beforePut?: () => Promise<void>;
 }
 
 class MemoryCache implements Cache {
@@ -153,6 +174,9 @@ class MemoryCache implements Cache {
     if (this.options.failWrites) {
       throw new Error("Cache quota exceeded");
     }
+    if (this.options.beforePut) {
+      await this.options.beforePut();
+    }
     this.responsesByUrl.set(requestUrl(request), response.clone());
   }
 }
@@ -162,4 +186,18 @@ function requestUrl(request: RequestInfo | URL): string {
     return request.url;
   }
   return new URL(request).toString();
+}
+
+async function waitForCachedResponse(
+  cacheStorage: CacheStorage,
+  url: string,
+): Promise<Response> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const response = await cacheStorage.match(url);
+    if (response) {
+      return response;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  throw new Error(`Timed out waiting for ${url} to be cached`);
 }

@@ -17,12 +17,12 @@ describe("modelCatalog", () => {
     );
   });
 
-  it("points Qwen at the documented local GGUF path", () => {
+  it("points Qwen directly at the official Hugging Face GGUF", () => {
     expect(modelCatalog.qwen.baseUrl).toContain("/models/qwen2.5-0.5b-instruct-q4_0/");
-    expect(modelCatalog.qwen.ggufPath).toBe("model.gguf");
-    expect(modelCatalog.qwen.ggufFallbackUrls).toEqual([
+    expect(modelCatalog.qwen.ggufPath).toBe(
       "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_0.gguf",
-    ]);
+    );
+    expect(modelCatalog.qwen.ggufFallbackUrls).toBeUndefined();
   });
 
   it("formats Qwen prompts with a hidden chat template", () => {

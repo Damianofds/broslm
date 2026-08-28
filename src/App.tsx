@@ -477,7 +477,7 @@ export default function App() {
     try {
       for (let tokenIndex = 0; tokenIndex < targetNewTokens; tokenIndex += 1) {
         const tokenId = await requestNextToken(nextInputIds, {
-          resetCache: selectedModelId === "qwen" && tokenIndex === 0,
+          resetCache: tokenIndex === 0,
           temperature,
           topK,
         });
@@ -875,14 +875,15 @@ function LoadingFrame({
   return (
     <div className="loading-frame-inner">
       <div className="progress-track" aria-label="Model loading progress">
-        <div className="progress-fill" style={{ width: `${stepPercent(visibleStepIndex, steps)}%` }} />
+        <div
+          className="progress-fill"
+          style={{ width: `${stepPercent(visibleStepIndex, steps, progress)}%` }}
+        />
       </div>
 
       <p className="current-message">
         {transientProgressMessage ?? currentStepMessage(visibleStepIndex, loadState, steps)}
-        {!transientProgressMessage && progress?.loadedBytes && progress.totalBytes
-          ? ` / ${formatBytes(progress.loadedBytes)} of ${formatBytes(progress.totalBytes)}`
-          : ""}
+        {!transientProgressMessage ? progressByteLabel(progress) : ""}
       </p>
 
       <ol className="step-list">
@@ -1437,11 +1438,16 @@ function stepClassName(index: number, visibleStepIndex: number): string {
   return "";
 }
 
-function stepPercent(visibleStepIndex: number, steps: readonly AppLoadStep[]): number {
+function stepPercent(
+  visibleStepIndex: number,
+  steps: readonly AppLoadStep[],
+  progress: AppLoaderProgress | null,
+): number {
   if (visibleStepIndex < 0) {
     return 0;
   }
-  return Math.min(100, ((visibleStepIndex + 1) / steps.length) * 100);
+  const activeStepFraction = progressFractionForStep(visibleStepIndex, steps, progress);
+  return Math.min(100, ((visibleStepIndex + activeStepFraction) / steps.length) * 100);
 }
 
 function currentStepMessage(
@@ -1453,6 +1459,47 @@ function currentStepMessage(
     return steps[visibleStepIndex]?.label ?? statusTitle(loadState);
   }
   return statusTitle(loadState);
+}
+
+function progressFractionForStep(
+  visibleStepIndex: number,
+  steps: readonly AppLoadStep[],
+  progress: AppLoaderProgress | null,
+): number {
+  const activeStep = steps[visibleStepIndex];
+  if (!activeStep || !progress || !activeStep.stages.includes(progress.stage)) {
+    return 1;
+  }
+  if (progress.stage.endsWith("download-started")) {
+    return 0;
+  }
+  if (
+    typeof progress.loadedBytes === "number" &&
+    typeof progress.totalBytes === "number" &&
+    progress.totalBytes > 0
+  ) {
+    return clampUnit(progress.loadedBytes / progress.totalBytes);
+  }
+  return 1;
+}
+
+function progressByteLabel(progress: AppLoaderProgress | null): string {
+  if (!progress || typeof progress.loadedBytes !== "number") {
+    return "";
+  }
+
+  if (typeof progress.totalBytes === "number" && progress.totalBytes > 0) {
+    return ` / ${formatBytes(progress.loadedBytes)} of ${formatBytes(progress.totalBytes)}`;
+  }
+
+  return ` / ${formatBytes(progress.loadedBytes)}`;
+}
+
+function clampUnit(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.max(0, Math.min(1, value));
 }
 
 function formatBytes(bytes: number): string {

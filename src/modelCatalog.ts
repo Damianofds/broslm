@@ -194,8 +194,7 @@ export const modelCatalog: Record<ModelId, ModelCatalogEntry> = {
       cpuFallback: false,
       minimumStorageBufferBindingSize: 144_643_072,
     },
-    ggufPath: "model.gguf",
-    ggufFallbackUrls: [qwenOfficialQ4_0GgufUrl],
+    ggufPath: qwenOfficialQ4_0GgufUrl,
   },
 };
 

@@ -1,4 +1,9 @@
-import { allocateModelKvCache, type ModelKvCache } from "./engine/src/gpt-neo/attentionCache";
+import {
+  allocateModelKvCache,
+  cachePrefixMatches,
+  resetModelKvCache,
+  type ModelKvCache,
+} from "./engine/src/gpt-neo/attentionCache";
 import {
   loadModel as loadGptNeoModel,
   summarizeLoadedModel,
@@ -117,18 +122,7 @@ async function handleNextTokenMessage(
 
     let result: WorkerNextTokenResult;
     if (workerLoadedModel.modelId === "tinystories") {
-      const nextTokenResult = await nextGptNeoTokenWithCacheBackend(
-        workerLoadedModel.model,
-        message.inputIds,
-        workerLoadedModel.cache,
-        {
-          backend: workerLoadedModel.backend,
-          runtime: workerLoadedModel.runtime,
-          temperature: message.temperature,
-          topK: message.topK,
-        },
-      );
-      result = { tokenId: nextTokenResult.tokenId };
+      result = await runGptNeoNextToken(workerLoadedModel, message);
     } else {
       result = await runQwen2NextToken(workerLoadedModel, message, () => {
         ownsActiveQwenRequest = true;
@@ -154,6 +148,35 @@ async function handleNextTokenMessage(
       activeQwenInferenceRequestId = null;
     }
   }
+}
+
+async function runGptNeoNextToken(
+  workerModel: Extract<WorkerLoadedModel, { modelId: "tinystories" }>,
+  message: Extract<AppWorkerRequest, { type: "next-token" }>,
+): Promise<WorkerNextTokenResult> {
+  if (message.resetCache) {
+    resetModelKvCache(workerModel.cache);
+  }
+
+  const performanceProfile = gptNeoInferencePerformanceProfile(workerModel.cache, message);
+  const startedAt = nowMs();
+  const result = await nextGptNeoTokenWithCacheBackend(
+    workerModel.model,
+    message.inputIds,
+    workerModel.cache,
+    {
+      backend: workerModel.backend,
+      runtime: workerModel.runtime,
+      temperature: message.temperature,
+      topK: message.topK,
+    },
+  );
+  const elapsedMs = nowMs() - startedAt;
+
+  return {
+    tokenId: result.tokenId,
+    performance: createInferencePerformance(performanceProfile, elapsedMs),
+  };
 }
 
 async function runQwen2NextToken(
@@ -190,13 +213,25 @@ async function runQwen2NextToken(
 
   return {
     tokenId: result.tokenId,
-    performance: {
-      phase: performanceProfile.phase,
-      tokenCount: performanceProfile.tokenCount,
-      elapsedMs,
-      tokensPerSecond: tokensPerSecond(performanceProfile.tokenCount, elapsedMs),
-    },
+    performance: createInferencePerformance(performanceProfile, elapsedMs),
   };
+}
+
+function gptNeoInferencePerformanceProfile(
+  cache: ModelKvCache,
+  message: Extract<AppWorkerRequest, { type: "next-token" }>,
+): Pick<AppInferencePerformance, "phase" | "tokenCount"> {
+  const phase =
+    message.resetCache ||
+    !cachePrefixMatches(cache.inputIds, message.inputIds) ||
+    cache.inputIds.length === message.inputIds.length
+      ? "prefill"
+      : "decode";
+  const tokenCount =
+    phase === "prefill"
+      ? message.inputIds.length
+      : Math.max(1, message.inputIds.length - cache.inputIds.length);
+  return { phase, tokenCount };
 }
 
 function qwen2InferencePerformanceProfile(
@@ -211,6 +246,18 @@ function qwen2InferencePerformanceProfile(
       ? message.inputIds.length
       : Math.max(1, message.inputIds.length - cache.inputIds.length);
   return { phase, tokenCount };
+}
+
+function createInferencePerformance(
+  performanceProfile: Pick<AppInferencePerformance, "phase" | "tokenCount">,
+  elapsedMs: number,
+): AppInferencePerformance {
+  return {
+    phase: performanceProfile.phase,
+    tokenCount: performanceProfile.tokenCount,
+    elapsedMs,
+    tokensPerSecond: tokensPerSecond(performanceProfile.tokenCount, elapsedMs),
+  };
 }
 
 function tokensPerSecond(tokenCount: number, elapsedMs: number): number {

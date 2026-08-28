@@ -502,8 +502,7 @@ function validateGgufMagic(buffer: ArrayBuffer, url: string): string | null {
 
   return (
     `Downloaded ${url}, but it is not a GGUF file (magic ${JSON.stringify(magic)}). ` +
-      "The Qwen model file is probably missing and the server returned HTML. " +
-      "Place it at models/qwen2.5-0.5b-instruct-q4_0/model.gguf or allow the official Hugging Face fallback."
+      "The configured Qwen model URL probably returned an HTML page instead of model bytes."
   );
 }
 

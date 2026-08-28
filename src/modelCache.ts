@@ -33,7 +33,7 @@ export function createModelCacheFetch(options: ModelCacheFetchOptions = {}): typ
 
     const response = await fetchImpl(request);
     if (response.ok && cache) {
-      await putModelCache(cache, request, response);
+      void putModelCache(cache, request, response);
     }
     return response;
   };

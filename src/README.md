@@ -12,7 +12,7 @@ Vite is the build tool for the whole browser deliverable. It runs the dev server
   - `weights.json`
   - `weights.bin`
 - The browser prompt demo uses `public/tokenizer/tinystories-tokenizer.json`.
-- Optional Qwen2 runs use `../models/qwen2.5-0.5b-instruct-q4_0/model.gguf`.
+- Qwen2 runs download the official Q4_0 GGUF directly from Hugging Face.
 
 ## Install
 
