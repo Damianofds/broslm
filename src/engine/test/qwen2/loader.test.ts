@@ -116,6 +116,63 @@ describe("Qwen2 loader metadata binding", () => {
     expect(weights.layers[0]?.mlp.downProjWeight.name).toBe("blk.0.ffn_down.weight");
     expect(weights.lmHead.name).toBe("output.weight");
   });
+
+  it("uses token embeddings as the LM head when output.weight is omitted for tied embeddings", () => {
+    const tensorInfos = ggufTensorInfos();
+    tensorInfos.delete("output.weight");
+    const config = qwen2ConfigFromGguf(
+      ggufFile(
+        metadataMap([
+          ["general.architecture", "qwen2"],
+          ["qwen2.embedding_length", 2],
+          ["qwen2.feed_forward_length", 2],
+          ["qwen2.block_count", 1],
+          ["qwen2.attention.head_count", 1],
+          ["qwen2.attention.head_count_kv", 1],
+          ["qwen2.context_length", 8],
+          ["qwen2.attention.layer_norm_rms_epsilon", 1e-6],
+          ["qwen2.rope.freq_base", 10000],
+        ]),
+        tensorInfos,
+      ),
+    );
+    const tensors = tensorViews(tensorInfos);
+
+    validateQwen2TensorSet(config, ggufFile(new Map(), tensorInfos), tensors);
+    const weights = bindQwen2ModelWeights(config, tensors);
+
+    expect(weights.lmHead).toBe(weights.tokenEmbedding);
+  });
+
+  it("still requires output.weight when embeddings are not tied", () => {
+    const tensorInfos = ggufTensorInfos();
+    tensorInfos.delete("output.weight");
+    const config = {
+      ...qwen2ConfigFromGguf(
+        ggufFile(
+          metadataMap([
+            ["general.architecture", "qwen2"],
+            ["qwen2.embedding_length", 2],
+            ["qwen2.feed_forward_length", 2],
+            ["qwen2.block_count", 1],
+            ["qwen2.attention.head_count", 1],
+            ["qwen2.attention.head_count_kv", 1],
+            ["qwen2.context_length", 8],
+            ["qwen2.attention.layer_norm_rms_epsilon", 1e-6],
+            ["qwen2.rope.freq_base", 10000],
+          ]),
+          tensorInfos,
+        ),
+      ),
+      tiedWordEmbeddings: false,
+    } as const;
+    const tensors = tensorViews(tensorInfos);
+
+    expect(() => validateQwen2TensorSet(config, ggufFile(new Map(), tensorInfos), tensors)).toThrow(
+      "output.weight",
+    );
+    expect(() => bindQwen2ModelWeights(config, tensors)).toThrow("output.weight");
+  });
 });
 
 function ggufTensorInfos(): Map<string, GgufTensorInfo> {
@@ -138,9 +195,9 @@ function ggufTensorInfos(): Map<string, GgufTensorInfo> {
   ]);
 }
 
-function tensorViews(): ReadonlyMap<string, QwenTensorView> {
+function tensorViews(infos = ggufTensorInfos()): ReadonlyMap<string, QwenTensorView> {
   const tensors = new Map<string, QwenTensorView>();
-  for (const [name, info] of ggufTensorInfos()) {
+  for (const [name, info] of infos) {
     tensors.set(name, tensor(name, logicalShape(info.dimensions), new Float32Array(product(info.dimensions))));
   }
   return tensors;

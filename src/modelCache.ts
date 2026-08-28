@@ -1,10 +1,9 @@
-import { currentModelExportName } from "./modelExport";
 import {
   modelAssetCacheHitHeaderValue,
   modelAssetCacheStatusHeader,
 } from "./engine/src/modelAssetFetch";
 
-const cacheName = `broslm-model-${currentModelExportName}`;
+const cacheName = "broslm-qwen2-gguf-v1";
 
 export interface ModelCacheFetchOptions {
   fetchImpl?: typeof fetch;

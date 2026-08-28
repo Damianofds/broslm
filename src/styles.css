@@ -315,8 +315,11 @@ h3 {
   display: grid;
   gap: 8px;
   width: min(760px, 100%);
-  margin-top: 14px;
   text-align: left;
+}
+
+.start-load-frame .model-selector-field {
+  margin-bottom: clamp(18px, 3vh, 30px);
 }
 
 .model-selector-field span {

@@ -1,11 +1,12 @@
 import { cpSync, createReadStream, existsSync, mkdirSync, statSync } from "node:fs";
 import { extname, join, resolve } from "node:path";
 import { defineConfig, type Plugin } from "vite";
-import { currentModelExportName } from "./modelName";
 
 const modelsRoot = resolve(__dirname, "../models");
-const selectedModelRoot = resolve(modelsRoot, currentModelExportName);
-const optionalModelFolderNames = ["qwen2.5-0.5b-instruct-q4_0"];
+const optionalModelFolderNames = [
+  "qwen2.5-0.5b-instruct-q4_0",
+  "qwen2.5-0.5b-instruct-iq1_s",
+];
 
 export default defineConfig({
   base: process.env.GITHUB_PAGES === "true" ? "./" : "/",
@@ -20,16 +21,8 @@ function bundleSelectedModelPlugin(): Plugin {
   return {
     name: "bundle-selected-model",
     closeBundle() {
-      if (!existsSync(selectedModelRoot)) {
-        throw new Error(`Selected model export is missing: ${selectedModelRoot}`);
-      }
-
       const outputModelsRoot = resolve(__dirname, "dist/models");
       mkdirSync(outputModelsRoot, { recursive: true });
-      cpSync(selectedModelRoot, resolve(outputModelsRoot, currentModelExportName), {
-        recursive: true,
-        force: true,
-      });
       for (const folderName of optionalModelFolderNames) {
         const optionalModelRoot = resolve(modelsRoot, folderName);
         if (!existsSync(optionalModelRoot)) {

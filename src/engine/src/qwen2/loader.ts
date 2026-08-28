@@ -271,13 +271,19 @@ export function bindQwen2ModelWeights(
     });
   }
 
+  const tokenEmbedding = requireTensor(tensors, "token_embd.weight");
+  const lmHead = tensors.get("output.weight") ?? (config.tiedWordEmbeddings ? tokenEmbedding : undefined);
+  if (!lmHead) {
+    throw new Error("GGUF is missing expected Qwen2 tensor: output.weight");
+  }
+
   return {
-    tokenEmbedding: requireTensor(tensors, "token_embd.weight"),
+    tokenEmbedding,
     layers,
     finalNorm: {
       weight: requireFloat32Tensor(tensors, "output_norm.weight"),
     },
-    lmHead: requireTensor(tensors, "output.weight"),
+    lmHead,
   };
 }
 
@@ -327,6 +333,12 @@ export function validateQwen2TensorSet(
     }
     assertShape(name, tensor.shape, expectedShape);
   }
+  const outputWeight = tensors.get("output.weight");
+  if (outputWeight) {
+    assertShape("output.weight", outputWeight.shape, [config.vocabularySize, config.hiddenSize]);
+  } else if (!config.tiedWordEmbeddings) {
+    throw new Error("GGUF is missing expected Qwen2 tensor: output.weight");
+  }
   for (const name of f32TensorNames(config)) {
     if (gguf.tensors.get(name)?.type !== GGML_TYPE_F32) {
       throw new Error(`${name} must be F32`);
@@ -341,7 +353,6 @@ export function getExpectedQwen2TensorShapes(config: Qwen2Config): Map<string, n
   const intermediate = config.intermediateSize;
 
   shapes.set("token_embd.weight", [config.vocabularySize, hidden]);
-  shapes.set("output.weight", [config.vocabularySize, hidden]);
   shapes.set("output_norm.weight", [hidden]);
   for (let layer = 0; layer < config.numberOfLayers; layer += 1) {
     const prefix = `blk.${layer}`;

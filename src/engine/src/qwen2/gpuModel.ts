@@ -758,6 +758,13 @@ function tensorBuffer(runtime: WebGpuRuntime, tensor: TensorView): GPUBuffer {
 }
 
 function qwenTensorBuffer(runtime: WebGpuRuntime, tensor: QwenTensorView): GPUBuffer {
+  if (
+    !isFloat32TensorView(tensor) &&
+    tensor.type !== "q4_0" &&
+    tensor.type !== "q8_0"
+  ) {
+    throw new Error(`${tensor.name} uses ${tensor.type.toUpperCase()} quantization, which is only supported on the CPU backend.`);
+  }
   return createStaticStorageBuffer(runtime, tensor.data);
 }
 
@@ -828,7 +835,7 @@ function encodeQwen2EmbeddingSequence(
       options.sequenceLength,
       embeddingSize,
       rowByteLength,
-      options.embedding.type === "q4_0" ? 4 : 8,
+      quantizedTypeCode(options.embedding),
       entryCount,
       0,
       0,
@@ -913,7 +920,7 @@ function encodeQwen2MatrixMultiplySequence(
       options.sequenceLength,
       options.inputBaseOffset ?? 0,
       rowByteLength,
-      options.weight.type === "q4_0" ? 4 : 8,
+      quantizedTypeCode(options.weight),
       resolvedBias.hasBias ? 1 : 0,
       0,
     ]),
@@ -1058,7 +1065,7 @@ function encodeQwen2QkvProjectionSequence(
       options.sequenceLength,
       options.inputBaseOffset ?? 0,
       rowByteLength,
-      options.qWeight.type === "q4_0" ? 4 : 8,
+      quantizedTypeCode(options.qWeight),
       0,
     ]),
   );
@@ -1430,10 +1437,20 @@ function quantizedRowByteLength(
   tensor: Exclude<QwenTensorView, TensorView>,
   inputSize: number,
 ): number {
+  if (tensor.type !== "q4_0" && tensor.type !== "q8_0") {
+    throw new Error(`${tensor.name} uses ${tensor.type.toUpperCase()} quantization, which is only supported on the CPU backend.`);
+  }
   if (!Number.isInteger(inputSize) || inputSize <= 0 || inputSize % 32 !== 0) {
     throw new Error(`${tensor.type} length must be a positive multiple of 32, got ${inputSize}`);
   }
   return tensor.type === "q4_0" ? (inputSize / 32) * 18 : (inputSize / 32) * 34;
+}
+
+function quantizedTypeCode(tensor: Exclude<QwenTensorView, TensorView>): number {
+  if (tensor.type !== "q4_0" && tensor.type !== "q8_0") {
+    throw new Error(`${tensor.name} uses ${tensor.type.toUpperCase()} quantization, which is only supported on the CPU backend.`);
+  }
+  return tensor.type === "q4_0" ? 4 : 8;
 }
 
 const qwen2F32EmbeddingSequenceShader = `

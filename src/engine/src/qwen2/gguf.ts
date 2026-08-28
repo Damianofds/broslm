@@ -34,7 +34,13 @@ export const GGUF_TYPE_FLOAT64 = 12;
 export const GGML_TYPE_F32 = 0;
 export const GGML_TYPE_F16 = 1;
 export const GGML_TYPE_Q4_0 = 2;
+export const GGML_TYPE_Q5_0 = 6;
+export const GGML_TYPE_Q5_1 = 7;
 export const GGML_TYPE_Q8_0 = 8;
+export const GGML_TYPE_Q2_K = 10;
+export const GGML_TYPE_IQ1_S = 19;
+export const GGML_TYPE_IQ4_NL = 20;
+export const GGML_TYPE_IQ1_M = 29;
 
 const DEFAULT_ALIGNMENT = 32;
 
@@ -163,9 +169,21 @@ function calculateTensorByteLength(
     case GGML_TYPE_F16:
       return elements * 2;
     case GGML_TYPE_Q4_0:
-      return quantizedByteLength(name, elements, 32, 18);
+      return quantizedByteLength(name, dimensions, 32, 18);
+    case GGML_TYPE_Q5_0:
+      return quantizedByteLength(name, dimensions, 32, 22);
+    case GGML_TYPE_Q5_1:
+      return quantizedByteLength(name, dimensions, 32, 24);
     case GGML_TYPE_Q8_0:
-      return quantizedByteLength(name, elements, 32, 34);
+      return quantizedByteLength(name, dimensions, 32, 34);
+    case GGML_TYPE_Q2_K:
+      return quantizedByteLength(name, dimensions, 256, 84);
+    case GGML_TYPE_IQ1_S:
+      return quantizedByteLength(name, dimensions, 256, 50);
+    case GGML_TYPE_IQ4_NL:
+      return quantizedByteLength(name, dimensions, 32, 18);
+    case GGML_TYPE_IQ1_M:
+      return quantizedByteLength(name, dimensions, 256, 56);
     default:
       throw new Error(`Unsupported GGUF tensor type ${type} for ${name}`);
   }
@@ -173,14 +191,16 @@ function calculateTensorByteLength(
 
 function quantizedByteLength(
   name: string,
-  elements: number,
+  dimensions: readonly number[],
   blockSize: number,
   typeSize: number,
 ): number {
-  if (elements % blockSize !== 0) {
-    throw new Error(`${name} has ${elements} elements, not divisible by quant block ${blockSize}`);
+  const rowLength = dimensions[0] ?? 0;
+  if (!Number.isInteger(rowLength) || rowLength <= 0) {
+    throw new Error(`${name} has invalid quantized row length ${rowLength}`);
   }
-  return (elements / blockSize) * typeSize;
+  const rowCount = dimensions.slice(1).reduce((total, value) => total * value, 1);
+  return rowCount * Math.ceil(rowLength / blockSize) * typeSize;
 }
 
 function product(values: readonly number[]): number {

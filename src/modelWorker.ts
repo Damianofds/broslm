@@ -1,17 +1,4 @@
 import {
-  allocateModelKvCache,
-  cachePrefixMatches,
-  resetModelKvCache,
-  type ModelKvCache,
-} from "./engine/src/gpt-neo/attentionCache";
-import {
-  loadModel as loadGptNeoModel,
-  summarizeLoadedModel,
-  type LoadedModel as LoadedGptNeoModel,
-  type LoaderProgress as GptNeoLoaderProgress,
-} from "./engine/src/gpt-neo/loader";
-import { nextTokenWithCacheBackend as nextGptNeoTokenWithCacheBackend } from "./engine/src/gpt-neo/model";
-import {
   allocateQwen2ModelKvCache,
   resetQwen2ModelKvCache,
   type Qwen2ModelKvCache,
@@ -39,7 +26,6 @@ import {
 import { createQwen2TokenizerPartsFromGgufMetadata } from "./engine/src/qwen2/tokenizer";
 import {
   modelCatalog,
-  normalizeGptNeoSummary,
   type AppLoadedModelSummary,
   type AppInferencePerformance,
   type AppLoaderProgress,
@@ -57,21 +43,13 @@ interface ModelWorkerScope {
   postMessage(message: AppWorkerResponse): void;
 }
 
-type WorkerLoadedModel =
-  | {
-      modelId: "tinystories";
-      model: LoadedGptNeoModel;
-      cache: ModelKvCache;
-      backend: InferenceBackend;
-      runtime?: WebGpuRuntime;
-    }
-  | {
-      modelId: "qwen";
-      model: LoadedQwen2Model;
-      cache: Qwen2ModelKvCache;
-      backend: InferenceBackend;
-      runtime?: WebGpuRuntime;
-    };
+type WorkerLoadedModel = {
+  modelId: AppWorkerRequest["modelId"];
+  model: LoadedQwen2Model;
+  cache: Qwen2ModelKvCache;
+  backend: InferenceBackend;
+  runtime?: WebGpuRuntime;
+};
 
 interface WorkerNextTokenResult {
   tokenId: number;
@@ -120,14 +98,9 @@ async function handleNextTokenMessage(
       );
     }
 
-    let result: WorkerNextTokenResult;
-    if (workerLoadedModel.modelId === "tinystories") {
-      result = await runGptNeoNextToken(workerLoadedModel, message);
-    } else {
-      result = await runQwen2NextToken(workerLoadedModel, message, () => {
-        ownsActiveQwenRequest = true;
-      });
-    }
+    const result = await runQwen2NextToken(workerLoadedModel, message, () => {
+      ownsActiveQwenRequest = true;
+    });
 
     selfScope.postMessage({
       type: "next-token-result",
@@ -150,42 +123,13 @@ async function handleNextTokenMessage(
   }
 }
 
-async function runGptNeoNextToken(
-  workerModel: Extract<WorkerLoadedModel, { modelId: "tinystories" }>,
-  message: Extract<AppWorkerRequest, { type: "next-token" }>,
-): Promise<WorkerNextTokenResult> {
-  if (message.resetCache) {
-    resetModelKvCache(workerModel.cache);
-  }
-
-  const performanceProfile = gptNeoInferencePerformanceProfile(workerModel.cache, message);
-  const startedAt = nowMs();
-  const result = await nextGptNeoTokenWithCacheBackend(
-    workerModel.model,
-    message.inputIds,
-    workerModel.cache,
-    {
-      backend: workerModel.backend,
-      runtime: workerModel.runtime,
-      temperature: message.temperature,
-      topK: message.topK,
-    },
-  );
-  const elapsedMs = nowMs() - startedAt;
-
-  return {
-    tokenId: result.tokenId,
-    performance: createInferencePerformance(performanceProfile, elapsedMs),
-  };
-}
-
 async function runQwen2NextToken(
-  workerModel: Extract<WorkerLoadedModel, { modelId: "qwen" }>,
+  workerModel: WorkerLoadedModel,
   message: Extract<AppWorkerRequest, { type: "next-token" }>,
   markActive: () => void,
 ): Promise<WorkerNextTokenResult> {
   if (activeQwenInferenceRequestId) {
-    throw new Error("Qwen WebGPU inference is still running. Wait for the current token to finish.");
+    throw new Error("Generation is still running. Wait for the current token to finish.");
   }
 
   activeQwenInferenceRequestId = message.requestId ?? "qwen-inference";
@@ -215,23 +159,6 @@ async function runQwen2NextToken(
     tokenId: result.tokenId,
     performance: createInferencePerformance(performanceProfile, elapsedMs),
   };
-}
-
-function gptNeoInferencePerformanceProfile(
-  cache: ModelKvCache,
-  message: Extract<AppWorkerRequest, { type: "next-token" }>,
-): Pick<AppInferencePerformance, "phase" | "tokenCount"> {
-  const phase =
-    message.resetCache ||
-    !cachePrefixMatches(cache.inputIds, message.inputIds) ||
-    cache.inputIds.length === message.inputIds.length
-      ? "prefill"
-      : "decode";
-  const tokenCount =
-    phase === "prefill"
-      ? message.inputIds.length
-      : Math.max(1, message.inputIds.length - cache.inputIds.length);
-  return { phase, tokenCount };
 }
 
 function qwen2InferencePerformanceProfile(
@@ -272,7 +199,7 @@ function nowMs(): number {
 }
 
 function validateQwen2WebGpuWorkload(
-  workerModel: Extract<WorkerLoadedModel, { modelId: "qwen" }>,
+  workerModel: WorkerLoadedModel,
   message: Extract<AppWorkerRequest, { type: "next-token" }>,
 ): void {
   if (workerModel.backend !== "webgpu") {
@@ -295,7 +222,7 @@ function validateQwen2WebGpuWorkload(
 }
 
 function logQwen2WebGpuWorkload(
-  workerModel: Extract<WorkerLoadedModel, { modelId: "qwen" }>,
+  workerModel: WorkerLoadedModel,
   message: Extract<AppWorkerRequest, { type: "next-token" }>,
 ): void {
   if (workerModel.backend !== "webgpu") {
@@ -355,34 +282,6 @@ async function loadRequestedModel(
           })
         : undefined;
 
-    if (message.modelId === "tinystories") {
-      const loadedModel = await loadGptNeoModel({
-        baseUrl: message.baseUrl,
-        configPath: message.configPath,
-        weightsIndexPath: message.weightsIndexPath,
-        weightsBinaryPath: message.weightsBinaryPath,
-        scratchSequenceLength: message.scratchSequenceLength,
-        fetchImpl,
-        onProgress: (progress) => postProgress(selfScope, message, progress),
-      });
-
-      workerLoadedModel = {
-        modelId: "tinystories",
-        model: loadedModel,
-        cache: allocateModelKvCache(loadedModel.config),
-        backend,
-        runtime,
-      };
-      selfScope.postMessage({
-        type: "model-ready",
-        requestId: message.requestId,
-        modelId: "tinystories",
-        backend,
-        summary: normalizeGptNeoSummary(summarizeLoadedModel(loadedModel), backend),
-      });
-      return;
-    }
-
     const loadedModel = await loadQwen2Model({
       baseUrl: message.baseUrl,
       ggufPath: message.ggufPath,
@@ -393,7 +292,7 @@ async function loadRequestedModel(
     const tokenizerParts = createQwen2TokenizerPartsFromGgufMetadata(loadedModel.gguf.metadata);
 
     workerLoadedModel = {
-      modelId: "qwen",
+      modelId: message.modelId,
       model: loadedModel,
       cache: allocateQwen2ModelKvCache(
         loadedModel.config,
@@ -407,9 +306,9 @@ async function loadRequestedModel(
     selfScope.postMessage({
       type: "model-ready",
       requestId: message.requestId,
-      modelId: "qwen",
+      modelId: message.modelId,
       backend,
-      summary: summarizeQwenForApp(loadedModel, backend),
+      summary: summarizeQwenForApp(loadedModel, backend, message.modelId),
       tokenizer: {
         kind: "qwen2-gguf",
         parts: tokenizerParts,
@@ -440,7 +339,7 @@ async function resolveRequestedBackend(
 function postProgress(
   selfScope: ModelWorkerScope,
   message: Extract<AppWorkerRequest, { type: "load-model" }>,
-  progress: GptNeoLoaderProgress | Qwen2LoaderProgress,
+  progress: Qwen2LoaderProgress,
 ): void {
   selfScope.postMessage({
     type: "model-progress",
@@ -456,12 +355,14 @@ function postProgress(
 function summarizeQwenForApp(
   model: LoadedQwen2Model,
   backend: InferenceBackend = "cpu",
+  modelId?: AppWorkerRequest["modelId"],
 ): AppLoadedModelSummary {
+  const resolvedModelId = modelId ?? "qwen";
   const summary = summarizeLoadedQwen2Model(model);
   return {
     kind: "qwen2",
-    modelId: "qwen",
-    modelLabel: modelCatalog.qwen.label,
+    modelId: resolvedModelId,
+    modelLabel: modelCatalog[resolvedModelId].label,
     backend,
     architecture: summary.architecture,
     dtype: describeGgufDtype(model),
@@ -518,8 +419,20 @@ function ggmlTypeLabel(type: number): string {
       return "F16";
     case 2:
       return "Q4_0";
+    case 6:
+      return "Q5_0";
+    case 7:
+      return "Q5_1";
     case 8:
       return "Q8_0";
+    case 10:
+      return "Q2_K";
+    case 19:
+      return "IQ1_S";
+    case 20:
+      return "IQ4_NL";
+    case 29:
+      return "IQ1_M";
     default:
       return `type${type}`;
   }

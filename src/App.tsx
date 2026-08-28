@@ -6,10 +6,8 @@ import {
 } from "./engine/src/qwen2/webgpuSafety";
 import {
   createQwen2ByteLevelBpeTokenizer,
-  loadByteLevelBpeTokenizer,
   type ByteLevelBpeTokenizer,
 } from "./tokenizer";
-import { createModelCacheFetch } from "./modelCache";
 import {
   parseSimpleMarkdown,
   type SimpleMarkdownBlock,
@@ -65,10 +63,9 @@ export default function App() {
   const tokenizerRef = useRef<ByteLevelBpeTokenizer | null>(null);
   const tokenizerModelIdRef = useRef<ModelId | null>(null);
   const selectedModelIdRef = useRef<ModelId>(defaultModelId);
-  const cachedFetchRef = useRef<typeof fetch | null>(null);
   const pendingNextTokenRequestsRef = useRef<Map<string, PendingNextTokenRequest>>(new Map());
   const generationRunRef = useRef(0);
-  const qwenGenerationInFlightRef = useRef(false);
+  const generationInFlightRef = useRef(false);
   const decodeThroughputRef = useRef<DecodeThroughputAccumulator>({ tokenCount: 0, elapsedMs: 0 });
   const chatTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -223,10 +220,6 @@ export default function App() {
     setGeneratedText("");
     setInputTokenCount(null);
     resetGenerationThroughput();
-    if (selectedModelId === "tinystories") {
-      void ensureTokenizerLoaded(selectedModelId);
-    }
-
     workerRef.current?.terminate();
     const worker = new Worker(new URL("./modelWorker.ts", import.meta.url), {
       type: "module",
@@ -266,25 +259,23 @@ export default function App() {
         setSummary(message.summary);
         setActualStepIndex(modelLoadSteps[message.modelId].length - 1);
         setLoadState("ready");
-        if (message.modelId === "qwen") {
-          try {
-            if (message.tokenizer?.kind !== "qwen2-gguf") {
-              throw new Error("Qwen tokenizer metadata was missing from the worker response.");
-            }
-            tokenizerRef.current = createQwen2ByteLevelBpeTokenizer(message.tokenizer.parts);
-            tokenizerModelIdRef.current = "qwen";
-            setTokenizerState("ready");
-            setTokenizerError(null);
-          } catch (tokenizerBuildError: unknown) {
-            tokenizerRef.current = null;
-            tokenizerModelIdRef.current = null;
-            setTokenizerState("error");
-            setTokenizerError(
-              tokenizerBuildError instanceof Error
-                ? tokenizerBuildError.message
-                : String(tokenizerBuildError),
-            );
+        try {
+          if (message.tokenizer?.kind !== "qwen2-gguf") {
+            throw new Error("Qwen tokenizer metadata was missing from the worker response.");
           }
+          tokenizerRef.current = createQwen2ByteLevelBpeTokenizer(message.tokenizer.parts);
+          tokenizerModelIdRef.current = message.modelId;
+          setTokenizerState("ready");
+          setTokenizerError(null);
+        } catch (tokenizerBuildError: unknown) {
+          tokenizerRef.current = null;
+          tokenizerModelIdRef.current = null;
+          setTokenizerState("error");
+          setTokenizerError(
+            tokenizerBuildError instanceof Error
+              ? tokenizerBuildError.message
+              : String(tokenizerBuildError),
+          );
         }
         return;
       }
@@ -339,42 +330,6 @@ export default function App() {
     } satisfies AppWorkerRequest);
   }
 
-  async function ensureTokenizerLoaded(modelId: ModelId) {
-    const model = modelCatalog[modelId];
-    if (!model.tokenizerUrl) {
-      return;
-    }
-    if (tokenizerRef.current && tokenizerModelIdRef.current === modelId) {
-      setTokenizerState("ready");
-      return;
-    }
-
-    setTokenizerState("loading");
-    setTokenizerError(null);
-    try {
-      const tokenizer = await loadByteLevelBpeTokenizer(model.tokenizerUrl, getCachedFetch());
-      if (selectedModelIdRef.current !== modelId) {
-        return;
-      }
-      tokenizerRef.current = tokenizer;
-      tokenizerModelIdRef.current = modelId;
-      setTokenizerState("ready");
-    } catch (loadError: unknown) {
-      if (selectedModelIdRef.current !== modelId) {
-        return;
-      }
-      tokenizerRef.current = null;
-      tokenizerModelIdRef.current = null;
-      setTokenizerState("error");
-      setTokenizerError(loadError instanceof Error ? loadError.message : String(loadError));
-    }
-  }
-
-  function getCachedFetch(): typeof fetch {
-    cachedFetchRef.current ??= createModelCacheFetch();
-    return cachedFetchRef.current;
-  }
-
   function selectModel(nextModelId: ModelId) {
     const nextModel = modelCatalog[nextModelId];
     if (
@@ -422,9 +377,9 @@ export default function App() {
       setGenerationError("Model and tokenizer must be ready before generation.");
       return;
     }
-    if (selectedModelId === "qwen" && qwenGenerationInFlightRef.current) {
+    if (generationInFlightRef.current) {
       setGenerationState("error");
-      setGenerationError("Qwen generation is still finishing its previous GPU request.");
+      setGenerationError("Generation is still finishing its previous request.");
       return;
     }
 
@@ -439,7 +394,7 @@ export default function App() {
     const modelPrompt = formatPromptForModel(selectedModelId, baseText);
     const inputIds = tokenizer.encode(modelPrompt);
     const availableNewTokens = summary.config.maximumSequenceLength - inputIds.length;
-    const qwenSafetyError = qwenGpuBlockingPromptError(selectedModelId, summary, inputIds.length);
+    const qwenSafetyError = qwenGpuBlockingPromptError(summary, inputIds.length);
     if (qwenSafetyError) {
       setGenerationState("error");
       setGenerationError(qwenSafetyError);
@@ -458,16 +413,14 @@ export default function App() {
     const targetNewTokens = Math.min(
       maxNewTokens,
       availableNewTokens,
-      qwenGpuAvailableNewTokens(selectedModelId, summary, inputIds.length),
+      qwenGpuAvailableNewTokens(summary, inputIds.length),
     );
     if (targetNewTokens <= 0) {
       setGenerationState("error");
       setGenerationError("Qwen WebGPU safety limit leaves no room for new tokens.");
       return;
     }
-    if (selectedModelId === "qwen") {
-      qwenGenerationInFlightRef.current = true;
-    }
+    generationInFlightRef.current = true;
 
     setInputTokenCount(inputIds.length);
     setGeneratedTokenIds([]);
@@ -511,9 +464,7 @@ export default function App() {
         generationError instanceof Error ? generationError.message : String(generationError),
       );
     } finally {
-      if (selectedModelId === "qwen") {
-        qwenGenerationInFlightRef.current = false;
-      }
+      generationInFlightRef.current = false;
     }
   }
 
@@ -524,7 +475,7 @@ export default function App() {
       new Error("Generation stopped"),
     );
     setGenerationState("done");
-    qwenGenerationInFlightRef.current = false;
+    generationInFlightRef.current = false;
   }
 
   function resetGenerationThroughput() {
@@ -782,6 +733,13 @@ function StartLoadFrame({
 }) {
   return (
     <div className="start-load-frame">
+      <ModelSelector
+        disabled={modelSelectDisabled}
+        selectedModelId={selectedModelId}
+        webgpuAvailability={webgpuAvailability}
+        webgpuMaxStorageBufferBindingSize={webgpuMaxStorageBufferBindingSize}
+        onModelIdChange={onModelIdChange}
+      />
       <button
         className="load-button"
         disabled={
@@ -797,13 +755,6 @@ function StartLoadFrame({
       >
         Start
       </button>
-      <ModelSelector
-        disabled={modelSelectDisabled}
-        selectedModelId={selectedModelId}
-        webgpuAvailability={webgpuAvailability}
-        webgpuMaxStorageBufferBindingSize={webgpuMaxStorageBufferBindingSize}
-        onModelIdChange={onModelIdChange}
-      />
       <p className="frame-copy">
         The browser will fetch the model weights, validate them, and keep the network quiet after
         the worker is ready.
@@ -829,9 +780,9 @@ function ModelSelector({
 }) {
   return (
     <label className="model-selector-field">
-      <span>Model</span>
+      <span>Select a model</span>
       <select
-        aria-label="Model"
+        aria-label="Select a model"
         disabled={disabled}
         onChange={(event) => onModelIdChange(event.currentTarget.value as ModelId)}
         value={selectedModelId}
@@ -966,18 +917,6 @@ function ConfigFrame({
 }
 
 function LayerStrip({ summary }: { summary: AppLoadedModelSummary }) {
-  if (summary.kind === "gpt-neo") {
-    return (
-      <div className="attention-strip" aria-label="Attention layer types">
-        {summary.config.attentionLayers.map((kind, index) => (
-          <span className={kind} key={`${kind}-${index}`} title={`Layer ${index}: ${kind}`}>
-            {index}
-          </span>
-        ))}
-      </div>
-    );
-  }
-
   return (
     <div className="attention-strip" aria-label="Qwen GQA layers">
       {Array.from({ length: summary.layers }, (_, index) => (
@@ -1339,13 +1278,11 @@ function generationTitle(generationState: GenerationState): string {
 }
 
 function qwenGpuBlockingPromptError(
-  selectedModelId: ModelId,
   summary: AppLoadedModelSummary | null,
   tokenCount: number | null,
 ): string | null {
   if (
-    selectedModelId !== "qwen" ||
-    summary?.kind !== "qwen2" ||
+    !summary ||
     summary.backend !== "webgpu" ||
     tokenCount === null
   ) {
@@ -1366,11 +1303,10 @@ function qwenGpuBlockingPromptError(
 }
 
 function qwenGpuAvailableNewTokens(
-  selectedModelId: ModelId,
   summary: AppLoadedModelSummary,
   promptTokenCount: number,
 ): number {
-  if (selectedModelId !== "qwen" || summary.kind !== "qwen2" || summary.backend !== "webgpu") {
+  if (summary.backend !== "webgpu") {
     return Number.MAX_SAFE_INTEGER;
   }
   return Math.max(0, qwen2WebGpuSafetyLimits.maxSequenceTokens - promptTokenCount);
@@ -1448,14 +1384,15 @@ function modelRuntimeLabel(
   webgpuAvailability: WebGpuAvailability,
   webgpuMaxStorageBufferBindingSize: number | null,
 ): string {
+  if (model.backendPolicy.webgpu === "unsupported") {
+    return "CPU only";
+  }
+
   if (webgpuAvailability === "checking") {
     return model.backendPolicy.cpuFallback ? "checking GPU, CPU fallback" : "checking GPU";
   }
 
   if (webgpuAvailability === "available") {
-    if (model.backendPolicy.webgpu === "unsupported") {
-      return "CPU only";
-    }
     if (!modelWebGpuRequirementsMet(model, webgpuMaxStorageBufferBindingSize)) {
       return "GPU limit too low";
     }
@@ -1621,84 +1558,36 @@ function formatBytes(bytes: number): string {
 }
 
 function modelConfigRows(summary: AppLoadedModelSummary): Array<{ label: string; value: string }> {
-  if (summary.kind === "qwen2") {
-    const { config } = summary;
-    return [
-      { label: "Model", value: summary.modelLabel },
-      { label: "Backend", value: summary.backend.toUpperCase() },
-      { label: "Architecture", value: summary.architecture },
-      { label: "Dtype", value: summary.dtype },
-      { label: "Layers", value: formatInteger(summary.layers) },
-      { label: "Hidden size", value: formatInteger(summary.hiddenSize) },
-      { label: "Vocabulary", value: formatInteger(summary.vocabularySize) },
-      { label: "Max sequence", value: formatInteger(config.maximumSequenceLength) },
-      { label: "Intermediate", value: formatInteger(config.intermediateSize) },
-      { label: "Query heads", value: formatInteger(config.numberOfHeads) },
-      { label: "KV heads", value: formatInteger(config.numberOfKeyValueHeads) },
-      { label: "Head dim", value: formatInteger(config.headDimension) },
-      { label: "KV hidden", value: formatInteger(config.keyValueHiddenSize) },
-      { label: "RoPE theta", value: formatInteger(config.ropeTheta) },
-      { label: "RMS eps", value: String(config.rmsNormEpsilon) },
-      { label: "BOS / EOS / PAD", value: `${config.bosTokenId} / ${config.eosTokenId} / ${config.padTokenId ?? "null"}` },
-      { label: "Tied embeddings", value: config.tiedWordEmbeddings ? "yes" : "no" },
-    ];
-  }
-
   const { config } = summary;
   return [
     { label: "Model", value: summary.modelLabel },
     { label: "Backend", value: summary.backend.toUpperCase() },
     { label: "Architecture", value: summary.architecture },
-    { label: "Dtype", value: summary.dtype },
+    { label: "Quantization", value: summary.dtype },
     { label: "Layers", value: formatInteger(summary.layers) },
     { label: "Hidden size", value: formatInteger(summary.hiddenSize) },
-    { label: "Vocabulary", value: formatInteger(summary.vocabularySize) },
-    { label: "Max sequence", value: formatInteger(config.maximumSequenceLength) },
-    { label: "Intermediate", value: formatInteger(config.intermediateSize) },
-    { label: "Heads", value: formatInteger(config.numberOfHeads) },
-    { label: "Head dim", value: formatInteger(config.headDimension) },
-    { label: "Activation", value: config.activation },
-    { label: "Window size", value: formatInteger(config.windowSize) },
-    { label: "Layer norm eps", value: String(config.layerNormEpsilon) },
-    { label: "BOS / EOS / PAD", value: `${config.bosTokenId} / ${config.eosTokenId} / ${config.padTokenId ?? "null"}` },
-    { label: "Tied embeddings", value: config.tiedWordEmbeddings ? "yes" : "no" },
+    { label: "Vocab size", value: formatInteger(summary.vocabularySize) },
+    { label: "Context length", value: formatInteger(config.maximumSequenceLength) },
+    { label: "Attention heads", value: formatInteger(config.numberOfHeads) },
+    { label: "KV heads", value: formatInteger(config.numberOfKeyValueHeads) },
+    { label: "GGUF source", value: modelCatalog[summary.modelId].ggufPath ?? "model.gguf" },
   ];
 }
 
 function tensorConfigRows(summary: AppLoadedModelSummary): Array<{ label: string; value: string }> {
-  const tokenEmbedding =
-    summary.kind === "qwen2"
-      ? tensorByName(summary, "token_embd.weight")
-      : tensorByName(summary, "transformer.wte.weight");
-  const positionEmbedding =
-    summary.kind === "qwen2" ? null : tensorByName(summary, "transformer.wpe.weight");
-  const lmHead =
-    summary.kind === "qwen2" ? tensorByName(summary, "output.weight") : tensorByName(summary, "lm_head.weight");
-  const finalNorm =
-    summary.kind === "qwen2"
-      ? tensorByName(summary, "output_norm.weight")
-      : tensorByName(summary, "transformer.ln_f.weight");
+  const tokenEmbedding = tensorByName(summary, "token_embd.weight");
+  const lmHead = tensorByName(summary, "output.weight") ?? tokenEmbedding;
+  const finalNorm = tensorByName(summary, "output_norm.weight");
 
-  const rows = [
+  return [
     { label: "Tensor count", value: formatInteger(summary.tensorCount) },
     { label: "Weight bytes", value: formatBytes(summary.totalByteLength) },
+    { label: "KV hidden", value: formatInteger(summary.keyValueHiddenSize) },
     { label: "Token embedding", value: tokenEmbedding ? formatShape(tokenEmbedding.shape) : "-" },
     { label: "LM head", value: lmHead ? formatShape(lmHead.shape) : "-" },
     { label: "Final norm", value: finalNorm ? formatShape(finalNorm.shape) : "-" },
     { label: "Largest tensor", value: largestTensorLabel(summary) },
   ];
-
-  if (summary.kind === "gpt-neo") {
-    rows.splice(2, 0, { label: "Scratch sequence", value: formatInteger(summary.scratchSequenceLength) });
-    rows.splice(4, 0, {
-      label: "Position embedding",
-      value: positionEmbedding ? formatShape(positionEmbedding.shape) : "-",
-    });
-  } else {
-    rows.splice(2, 0, { label: "KV hidden", value: formatInteger(summary.keyValueHiddenSize) });
-  }
-
-  return rows;
 }
 
 function tensorByName(summary: AppLoadedModelSummary, name: string) {

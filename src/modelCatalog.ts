@@ -1,19 +1,12 @@
 import type {
-  LoadedModelSummary as GptNeoLoadedModelSummary,
-  LoaderProgress as GptNeoLoaderProgress,
-  ModelConfig as GptNeoModelConfig,
-  TensorVisualization as GptNeoTensorVisualization,
-} from "./engine/src/gpt-neo/loader";
-import type {
   Qwen2Config,
   Qwen2LoaderProgress,
 } from "./engine/src/qwen2/loader";
 import type { InferenceBackend, InferenceBackendPreference } from "./engine/src/runtime/webgpu";
-import { currentModelExportName } from "./modelName";
 import type { Qwen2TokenizerParts } from "./tokenizer";
 
-export type ModelId = "tinystories" | "qwen";
-export type PromptMode = "raw" | "qwen-chat";
+export type ModelId = "qwen" | "qwen_cpu_small";
+export type PromptMode = "qwen-chat";
 
 export interface ModelCatalogEntry {
   id: ModelId;
@@ -43,7 +36,7 @@ export interface AppTensorSummary {
   elementCount: number;
 }
 
-export type AppLoaderStage = GptNeoLoaderProgress["stage"] | Qwen2LoaderProgress["stage"];
+export type AppLoaderStage = Qwen2LoaderProgress["stage"];
 
 export interface AppLoaderProgress {
   modelId: ModelId;
@@ -75,22 +68,14 @@ interface BaseAppLoadedModelSummary {
   tensors: AppTensorSummary[];
 }
 
-export interface TinyStoriesLoadedModelSummary extends BaseAppLoadedModelSummary {
-  kind: "gpt-neo";
-  modelId: "tinystories";
-  scratchSequenceLength: number;
-  config: GptNeoModelConfig;
-  tensors: Array<AppTensorSummary & GptNeoTensorVisualization>;
-}
-
 export interface QwenLoadedModelSummary extends BaseAppLoadedModelSummary {
   kind: "qwen2";
-  modelId: "qwen";
+  modelId: ModelId;
   keyValueHiddenSize: number;
   config: Qwen2Config;
 }
 
-export type AppLoadedModelSummary = TinyStoriesLoadedModelSummary | QwenLoadedModelSummary;
+export type AppLoadedModelSummary = QwenLoadedModelSummary;
 
 export type AppInferencePhase = "prefill" | "decode";
 
@@ -164,28 +149,18 @@ export type AppWorkerResponse =
 const publicBaseUrl = import.meta.env.BASE_URL;
 
 export const qwenModelFolderName = "qwen2.5-0.5b-instruct-q4_0";
+export const qwenCpuSmallModelFolderName = "qwen2.5-0.5b-instruct-iq1_s";
 export const qwenOfficialQ4_0GgufUrl =
   "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_0.gguf";
-export const defaultModelId: ModelId = "tinystories";
+export const qwenCpuSmallIQ1_SGgufUrl =
+  "https://huggingface.co/legraphista/Qwen2.5-0.5B-Instruct-IMat-GGUF/resolve/main/Qwen2.5-0.5B-Instruct.IQ1_S.gguf";
+export const defaultModelId: ModelId = "qwen";
 
 export const modelCatalog: Record<ModelId, ModelCatalogEntry> = {
-  tinystories: {
-    id: "tinystories",
-    label: "TinyStories GPT-Neo",
-    shortLabel: "TinyStories",
-    baseUrl: `${publicBaseUrl}models/${currentModelExportName}/`,
-    promptMode: "raw",
-    backendPolicy: {
-      defaultPreference: "auto",
-      webgpu: "preferred",
-      cpuFallback: true,
-    },
-    tokenizerUrl: `${publicBaseUrl}tokenizer/tinystories-tokenizer.json`,
-  },
   qwen: {
     id: "qwen",
-    label: "Qwen2.5 0.5B (Beta)",
-    shortLabel: "Qwen",
+    label: "Qwen2.5 0.5B Q4_0",
+    shortLabel: "Qwen Q4_0",
     baseUrl: `${publicBaseUrl}models/${qwenModelFolderName}/`,
     promptMode: "qwen-chat",
     backendPolicy: {
@@ -196,30 +171,39 @@ export const modelCatalog: Record<ModelId, ModelCatalogEntry> = {
     },
     ggufPath: qwenOfficialQ4_0GgufUrl,
   },
+  qwen_cpu_small: {
+    id: "qwen_cpu_small",
+    label: "Qwen2.5 0.5B IQ1_S CPU",
+    shortLabel: "Qwen CPU",
+    baseUrl: `${publicBaseUrl}models/${qwenCpuSmallModelFolderName}/`,
+    promptMode: "qwen-chat",
+    backendPolicy: {
+      defaultPreference: "cpu",
+      webgpu: "unsupported",
+      cpuFallback: true,
+    },
+    ggufPath: qwenCpuSmallIQ1_SGgufUrl,
+  },
 };
 
 export const modelOptions: readonly ModelCatalogEntry[] = [
-  modelCatalog.tinystories,
   modelCatalog.qwen,
+  modelCatalog.qwen_cpu_small,
 ];
 
 export const modelLoadSteps: Record<ModelId, readonly AppLoadStep[]> = {
-  tinystories: [
-    { key: "descriptors", stages: ["descriptors-download-started"], label: "Start descriptor downloads" },
-    { key: "descriptors-downloaded", stages: ["descriptors-downloaded"], label: "Receive config and tensor index" },
-    { key: "descriptors-validated", stages: ["descriptors-validated"], label: "Validate architecture and tensor metadata" },
+  qwen: [
     {
-      key: "weights-download",
-      stages: ["weights-download-started", "weights-download-progress", "weights-downloaded"],
-      label: "Download raw FP32 weights",
+      key: "gguf-download",
+      stages: ["gguf-download-started", "gguf-download-progress"],
+      label: "Download GGUF model file",
     },
-    { key: "weights-validated", stages: ["weights-validated"], label: "Validate weight buffer boundaries" },
-    { key: "tensor-views", stages: ["tensor-views-created"], label: "Create zero-copy tensor views" },
-    { key: "weights-bound", stages: ["weights-bound"], label: "Bind tensors into GPT-Neo layers" },
-    { key: "scratch", stages: ["scratch-allocated"], label: "Allocate inference scratch buffers" },
+    { key: "gguf-downloaded", stages: ["gguf-downloaded"], label: "Receive GGUF bytes" },
+    { key: "gguf-parsed", stages: ["gguf-parsed"], label: "Parse GGUF metadata and tensor table" },
+    { key: "weights-bound", stages: ["weights-bound"], label: "Bind tensors into Qwen2 layers" },
     { key: "ready", stages: ["ready"], label: "Keep model resident in the worker" },
   ],
-  qwen: [
+  qwen_cpu_small: [
     {
       key: "gguf-download",
       stages: ["gguf-download-started", "gguf-download-progress"],
@@ -233,10 +217,6 @@ export const modelLoadSteps: Record<ModelId, readonly AppLoadStep[]> = {
 };
 
 export function formatPromptForModel(modelId: ModelId, prompt: string): string {
-  if (modelCatalog[modelId].promptMode !== "qwen-chat") {
-    return prompt;
-  }
-
   return (
     "<|im_start|>system\n" +
     "You are a helpful assistant.<|im_end|>\n" +
@@ -246,25 +226,7 @@ export function formatPromptForModel(modelId: ModelId, prompt: string): string {
 }
 
 export function visibleGeneratedTextForModel(modelId: ModelId, decodedText: string): string {
-  if (modelCatalog[modelId].promptMode !== "qwen-chat") {
-    return decodedText;
-  }
-
   return decodedText.replace(/<\|[^|]+?\|>/g, "");
-}
-
-export function normalizeGptNeoSummary(
-  summary: GptNeoLoadedModelSummary,
-  backend: InferenceBackend = "cpu",
-): TinyStoriesLoadedModelSummary {
-  return {
-    ...summary,
-    kind: "gpt-neo",
-    modelId: "tinystories",
-    modelLabel: modelCatalog.tinystories.label,
-    backend,
-    tensors: summary.tensors,
-  };
 }
 
 export function stepIndexForProgressStage(

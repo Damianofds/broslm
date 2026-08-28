@@ -21,11 +21,9 @@
   "include": [
     "App.tsx",
     "main.tsx",
-    "modelExport.ts",
     "modelCache.ts",
     "modelCache.test.ts",
     "modelCatalog.ts",
-    "modelName.ts",
     "modelWorker.ts",
     "simpleMarkdown.ts",
     "simpleMarkdown.test.ts",
