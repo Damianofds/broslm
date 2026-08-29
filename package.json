@@ -1,0 +1,65 @@
+{
+  "name": "broslm",
+  "version": "0.1.0",
+  "description": "Qwen2 GGUF inference for TypeScript applications in browsers and Node.js",
+  "type": "module",
+  "license": "MIT",
+  "author": "Damianofds",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Damianofds/broslm.git"
+  },
+  "homepage": "https://github.com/Damianofds/broslm#readme",
+  "keywords": [
+    "llm",
+    "qwen2",
+    "gguf",
+    "webgpu",
+    "inference",
+    "typescript"
+  ],
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "types": "./dist/browser.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/browser.d.ts",
+      "browser": "./dist/browser.js",
+      "node": "./dist/node.js",
+      "default": "./dist/browser.js"
+    }
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "pack:check": "npm pack --dry-run",
+    "pack:smoke": "npm run build && node scripts/package-smoke.mjs",
+    "prepare": "npm run build"
+  },
+  "peerDependencies": {
+    "webgpu": "^0.4.0"
+  },
+  "peerDependenciesMeta": {
+    "webgpu": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.14",
+    "@webgpu/types": "^0.1.69",
+    "tsup": "^8.5.0",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}
