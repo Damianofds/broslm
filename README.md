@@ -53,6 +53,23 @@ broslm.dispose();
 
 Use `generate` instead of `stream` when only the completed result is needed. Loading and generation accept an `AbortSignal`; `subscribe` adds additional typed event listeners and returns an unsubscribe function.
 
+Prompts can also be structured as Qwen ChatML conversations. A custom system message and prior assistant turns are optional; the final message must be from the user.
+
+```ts
+const result = await broslm.generate([
+  { role: "system", content: "Answer as a concise TypeScript expert." },
+  { role: "user", content: "What are conditional exports?" },
+  { role: "assistant", content: "They select package entry points by environment." },
+  { role: "user", content: "Show a minimal example." },
+], {
+  maxTokens: 120,
+});
+
+console.log(result.text);
+```
+
+A string prompt remains supported and is converted internally to a single user message. Both forms use the same generation, streaming, token-counting, and cancellation APIs.
+
 ## Models
 
 | ID | Model | Backend | Source |

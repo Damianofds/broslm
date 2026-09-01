@@ -3,6 +3,14 @@ import type { InferenceBackend, ModelId } from "./models";
 export type BroslmState = "idle" | "loading" | "ready" | "generating" | "error" | "disposed";
 export type GenerationPhase = "prefill" | "decode";
 export type GenerationFinishReason = "eos" | "max_tokens";
+export type ChatRole = "system" | "user" | "assistant";
+
+export interface ChatMessage {
+  readonly role: ChatRole;
+  readonly content: string;
+}
+
+export type PromptInput = string | readonly ChatMessage[];
 
 export interface TensorSummary {
   name: string;

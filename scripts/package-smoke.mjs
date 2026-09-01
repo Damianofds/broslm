@@ -4,10 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const directory = mkdtempSync(join(tmpdir(), "broslm-package-smoke-"));
+const packageMetadata = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+);
 
 try {
   execFileSync("npm", ["pack", "--pack-destination", directory], { stdio: "inherit" });
-  const tarball = join(directory, "broslm-0.1.0.tgz");
+  const tarball = join(directory, `${packageMetadata.name}-${packageMetadata.version}.tgz`);
   execFileSync("npm", ["init", "-y"], { cwd: directory, stdio: "ignore" });
   execFileSync("npm", ["install", tarball, "--ignore-scripts"], {
     cwd: directory,
@@ -28,7 +31,10 @@ try {
   const installedPackage = JSON.parse(
     readFileSync(join(directory, "node_modules", "broslm", "package.json"), "utf8"),
   );
-  if (installedPackage.name !== "broslm" || installedPackage.version !== "0.1.0") {
+  if (
+    installedPackage.name !== packageMetadata.name ||
+    installedPackage.version !== packageMetadata.version
+  ) {
     throw new Error("Packed package metadata is incorrect.");
   }
 } finally {

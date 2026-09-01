@@ -10,6 +10,7 @@ import {
   type Qwen2LoaderProgress,
 } from "./qwen2/loader";
 import { qwen2NextTokenWithCacheBackend } from "./qwen2/model";
+import { formatQwen2Prompt } from "./qwen2/chat";
 import { createQwen2TokenizerFromGgufMetadata } from "./qwen2/tokenizer";
 import {
   qwen2WebGpuCacheSequenceLength,
@@ -25,6 +26,7 @@ import {
 import type { ByteLevelBpeTokenizer } from "./tokenizer";
 import type {
   BroslmState,
+  ChatMessage,
   GenerationChunk,
   GenerationFinishReason,
   GenerationOptions,
@@ -33,6 +35,7 @@ import type {
   LoadedModelSummary,
   LoadModelOptions,
   ModelSupport,
+  PromptInput,
 } from "./types";
 
 export interface BroslmOptions {
@@ -46,8 +49,11 @@ export interface Broslm {
   checkModelSupport(modelId: ModelId): Promise<ModelSupport>;
   loadModel(modelId: ModelId, options?: LoadModelOptions): Promise<LoadedModelSummary>;
   countPromptTokens(prompt: string): number;
+  countPromptTokens(messages: readonly ChatMessage[]): number;
   generate(prompt: string, options?: GenerationOptions): Promise<GenerationResult>;
+  generate(messages: readonly ChatMessage[], options?: GenerationOptions): Promise<GenerationResult>;
   stream(prompt: string, options?: GenerationOptions): AsyncGenerator<GenerationChunk, void>;
+  stream(messages: readonly ChatMessage[], options?: GenerationOptions): AsyncGenerator<GenerationChunk, void>;
   dispose(): void;
 }
 
@@ -250,13 +256,13 @@ class DefaultBroslmClient implements Broslm {
     }
   }
 
-  countPromptTokens(prompt: string): number {
+  countPromptTokens(input: PromptInput): number {
     this.ensureReady();
-    return this.tokenizer?.encode(formatPrompt(prompt)).length ?? 0;
+    return this.tokenizer?.encode(formatQwen2Prompt(input)).length ?? 0;
   }
 
-  async generate(prompt: string, options: GenerationOptions = {}): Promise<GenerationResult> {
-    for await (const _chunk of this.stream(prompt, options)) {
+  async generate(input: PromptInput, options: GenerationOptions = {}): Promise<GenerationResult> {
+    for await (const _chunk of this.streamInput(input, options)) {
       // The stream owns generation; the final result is retained when it completes.
     }
     if (!this.lastGenerationResult) {
@@ -265,14 +271,16 @@ class DefaultBroslmClient implements Broslm {
     return this.lastGenerationResult;
   }
 
-  async *stream(
-    prompt: string,
-    options: GenerationOptions = {},
+  stream(input: PromptInput, options: GenerationOptions = {}): AsyncGenerator<GenerationChunk, void> {
+    return this.streamInput(input, options);
+  }
+
+  private async *streamInput(
+    input: PromptInput,
+    options: GenerationOptions,
   ): AsyncGenerator<GenerationChunk, void> {
     this.ensureReady();
-    if (prompt.length === 0) {
-      throw new BroslmError("INVALID_ARGUMENT", "Prompt is empty.");
-    }
+    const formattedPrompt = formatQwen2Prompt(input);
 
     const model = this.model;
     const modelId = this.modelId;
@@ -288,7 +296,7 @@ class DefaultBroslmClient implements Broslm {
     this.lastGenerationResult = null;
     this.currentState = "generating";
     const startedAt = nowMs();
-    const inputIds = tokenizer.encode(formatPrompt(prompt));
+    const inputIds = tokenizer.encode(formattedPrompt);
     const maxTokens = resolveMaximumNewTokens(options.maxTokens);
     const availableContext = model.config.maximumSequenceLength - inputIds.length;
     if (availableContext <= 0) {
@@ -562,16 +570,6 @@ function requireModelDescriptor(modelId: ModelId) {
     throw new BroslmError("INVALID_ARGUMENT", `Unknown model id: ${String(modelId)}`);
   }
   return descriptor;
-}
-
-function formatPrompt(prompt: string): string {
-  const normalized = prompt.replace(/\r\n?/g, "\n").replace(/\n+/g, "\n");
-  return (
-    "<|im_start|>system\n" +
-    "You are a helpful assistant.<|im_end|>\n" +
-    `<|im_start|>user\n${normalized}<|im_end|>\n` +
-    "<|im_start|>assistant\n"
-  );
 }
 
 function visibleGeneratedText(decodedText: string): string {

@@ -10,6 +10,8 @@ export {
 } from "./models";
 export type {
   BroslmState,
+  ChatMessage,
+  ChatRole,
   GenerationChunk,
   GenerationFinishReason,
   GenerationOptions,
@@ -19,6 +21,7 @@ export type {
   LoadedModelSummary,
   LoadModelOptions,
   ModelSupport,
+  PromptInput,
   TensorSummary,
   WebGpuLimitSummary,
 } from "./types";

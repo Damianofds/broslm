@@ -1,6 +1,6 @@
 {
   "name": "broslm",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Qwen2 GGUF inference for TypeScript applications in browsers and Node.js",
   "type": "module",
   "license": "MIT",

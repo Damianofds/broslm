@@ -7,6 +7,7 @@ import { BroslmError } from "../src/errors";
 import type { BroslmEnvironment } from "../src/environment";
 import type { BroslmEvent } from "../src/events";
 import type { LoadedQwen2Model } from "../src/qwen2/loader";
+import type { ByteLevelBpeTokenizer } from "../src/tokenizer";
 
 describe("broSLM client", () => {
   it("loads, emits lifecycle events, and generates through the high-level API", async () => {
@@ -70,6 +71,42 @@ describe("broSLM client", () => {
     expect(events.some((event) => event.type === "operation-cancelled")).toBe(true);
   });
 
+  it("uses the same structured prompt for token counting and generation", async () => {
+    const encode = vi.fn(() => [1, 2]);
+    const client = createBroslmClient(testEnvironment(), {}, testDependencies(encode));
+    const messages = [
+      { role: "system", content: "Be concise." },
+      { role: "user", content: "Hello\n\nworld" },
+    ] as const;
+    await client.loadModel("qwen_cpu_small");
+
+    expect(client.countPromptTokens(messages)).toBe(2);
+    await client.generate(messages, { maxTokens: 1 });
+    for await (const _chunk of client.stream(messages, { maxTokens: 1 })) {
+      // The EOS-only fixture produces no visible chunks.
+    }
+
+    expect(encode).toHaveBeenCalledTimes(3);
+    expect(encode).toHaveBeenNthCalledWith(
+      1,
+      "<|im_start|>system\nBe concise.<|im_end|>\n" +
+        "<|im_start|>user\nHello\n\nworld<|im_end|>\n" +
+        "<|im_start|>assistant\n",
+    );
+    expect(encode.mock.calls[1]).toEqual(encode.mock.calls[0]);
+    expect(encode.mock.calls[2]).toEqual(encode.mock.calls[0]);
+  });
+
+  it("rejects invalid structured prompts before generation", async () => {
+    const client = createBroslmClient(testEnvironment(), {}, testDependencies());
+    await client.loadModel("qwen_cpu_small");
+
+    await expect(client.generate([], { maxTokens: 1 })).rejects.toMatchObject({
+      code: "INVALID_ARGUMENT",
+    });
+    expect(client.state).toBe("ready");
+  });
+
   it("disposes resources and rejects subsequent operations", async () => {
     const release = vi.fn();
     const client = createBroslmClient(testEnvironment(release), {}, testDependencies());
@@ -93,7 +130,9 @@ function testEnvironment(release = vi.fn()): BroslmEnvironment {
   };
 }
 
-function testDependencies(): BroslmClientDependencies {
+function testDependencies(
+  encode: ByteLevelBpeTokenizer["encode"] = () => [1, 2],
+): BroslmClientDependencies {
   return {
     loadQwen2Model: vi.fn(async (options) => {
       options.onProgress?.({ stage: "gguf-download-started", message: "start" });
@@ -110,7 +149,7 @@ function testDependencies(): BroslmClientDependencies {
     createTokenizer: vi.fn(() => ({
       vocabularySize: 10,
       eosTokenId: 9,
-      encode: () => [1, 2],
+      encode,
       decode: () => "hello",
     })),
     allocateCache: vi.fn((config, maximumSequenceLength = config.maximumSequenceLength) => ({
