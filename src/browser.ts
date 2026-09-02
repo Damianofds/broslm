@@ -13,6 +13,5 @@ function createBrowserEnvironment(): BroslmEnvironment {
     fetchImpl: createModelCacheFetch(),
     getWebGpuTarget: async () =>
       typeof navigator === "undefined" || !("gpu" in navigator) ? undefined : navigator,
-    release: () => undefined,
   };
 }

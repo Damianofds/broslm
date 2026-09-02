@@ -4,7 +4,6 @@ import {
   createStaticStorageBuffer,
   detectWebGpuSupport,
   isWebGpuApiAvailable,
-  resolveInferenceBackend,
   runComputeShader,
 } from "../../src/runtime/webgpu";
 
@@ -126,55 +125,6 @@ describe("WebGPU runtime detection", () => {
         requiredStorageBufferBindingSize: 144_643_072,
       }),
     ).rejects.toThrow("maxStorageBufferBindingSize");
-  });
-});
-
-describe("resolveInferenceBackend", () => {
-  it("resolves auto to WebGPU when available", () => {
-    expect(
-      resolveInferenceBackend({
-        preference: "auto",
-        webgpuAvailable: true,
-      }),
-    ).toBe("webgpu");
-  });
-
-  it("resolves auto to CPU when WebGPU is unavailable and optional", () => {
-    expect(
-      resolveInferenceBackend({
-        preference: "auto",
-        webgpuAvailable: false,
-      }),
-    ).toBe("cpu");
-  });
-
-  it("rejects required WebGPU when unavailable", () => {
-    expect(() =>
-      resolveInferenceBackend({
-        preference: "auto",
-        webgpuAvailable: false,
-        webgpuRequired: true,
-      }),
-    ).toThrow("This model requires WebGPU");
-  });
-
-  it("honors explicit CPU", () => {
-    expect(
-      resolveInferenceBackend({
-        preference: "cpu",
-        webgpuAvailable: true,
-        webgpuRequired: true,
-      }),
-    ).toBe("cpu");
-  });
-
-  it("rejects explicit WebGPU when unavailable", () => {
-    expect(() =>
-      resolveInferenceBackend({
-        preference: "webgpu",
-        webgpuAvailable: false,
-      }),
-    ).toThrow("WebGPU backend was requested");
   });
 });
 

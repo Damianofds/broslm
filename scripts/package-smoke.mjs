@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -16,26 +16,22 @@ try {
     cwd: directory,
     stdio: "ignore",
   });
-  writeFileSync(
-    join(directory, "smoke.mjs"),
-    [
-      'import { createBroslm, modelOptions } from "broslm";',
-      "const client = createBroslm();",
-      'const support = await client.checkModelSupport("qwen_cpu_small");',
-      'if (!support.supported || modelOptions.length !== 2) process.exit(1);',
-      "client.dispose();",
-    ].join("\n"),
-  );
-  execFileSync(process.execPath, [join(directory, "smoke.mjs")], { stdio: "inherit" });
-
-  const installedPackage = JSON.parse(
-    readFileSync(join(directory, "node_modules", "broslm", "package.json"), "utf8"),
-  );
+  const installedRoot = join(directory, "node_modules", "broslm");
+  const installedPackage = JSON.parse(readFileSync(join(installedRoot, "package.json"), "utf8"));
   if (
     installedPackage.name !== packageMetadata.name ||
     installedPackage.version !== packageMetadata.version
   ) {
     throw new Error("Packed package metadata is incorrect.");
+  }
+  if (installedPackage.exports?.["."]?.node || existsSync(join(installedRoot, "dist", "node.js"))) {
+    throw new Error("Packed package must not expose a Node runtime.");
+  }
+  if (
+    !existsSync(join(installedRoot, "dist", "browser.js")) ||
+    !existsSync(join(installedRoot, "dist", "browser.d.ts"))
+  ) {
+    throw new Error("Packed package is missing its browser runtime.");
   }
 } finally {
   rmSync(directory, { recursive: true, force: true });

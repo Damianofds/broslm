@@ -21,9 +21,3 @@ jobs:
       - run: npm run build
       - run: npm run pack:check
       - run: node scripts/package-smoke.mjs
-      - name: Select Node 18 consumer runtime
-        uses: actions/setup-node@v4
-        with:
-          node-version: 18
-      - name: Import built package on Node 18
-        run: node --input-type=module -e "import('./dist/node.js').then(async ({ createBroslm }) => { const client = createBroslm(); const support = await client.checkModelSupport('qwen_cpu_small'); client.dispose(); if (!support.supported) process.exit(1); })"

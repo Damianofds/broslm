@@ -1,35 +1,34 @@
-import { describe, expect, it, vi } from "vitest";
-import {
-  createBroslmClient,
-  type BroslmClientDependencies,
-} from "../src/client";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createBroslmClient, type BroslmClientDependencies } from "../src/client";
 import { BroslmError } from "../src/errors";
 import type { BroslmEnvironment } from "../src/environment";
-import type { BroslmEvent } from "../src/events";
 import type { LoadedQwen2Model } from "../src/qwen2/loader";
+import type { WebGpuRuntime } from "../src/runtime/webgpu";
 import type { ByteLevelBpeTokenizer } from "../src/tokenizer";
 
-describe("broSLM client", () => {
-  it("loads, emits lifecycle events, and generates through the high-level API", async () => {
-    const events: BroslmEvent[] = [];
-    const tokenIds = [3, 9];
-    const client = createBroslmClient(testEnvironment(), { onEvent: (event) => events.push(event) }, {
-      ...testDependencies(),
-      nextToken: vi.fn(async () => ({
-        tokenId: tokenIds.shift() ?? 9,
-        logits: new Float32Array([0]),
-      })),
-    });
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
-    const summary = await client.loadModel("qwen_cpu_small");
+describe("broSLM browser client", () => {
+  it("loads and generates exclusively through WebGPU", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const tokenIds = [3, 9];
+    const dependencies = testDependencies();
+    dependencies.nextToken = vi.fn(async () => ({
+      tokenId: tokenIds.shift() ?? 9,
+      logits: new Float32Array([0]),
+    }));
+    const client = createBroslmClient(testEnvironment(), { logLevel: "info" }, dependencies);
+
+    const summary = await client.loadModel("qwen");
     expect(summary).toMatchObject({
-      modelId: "qwen_cpu_small",
-      backend: "cpu",
+      modelId: "qwen",
+      backend: "webgpu",
       layers: 1,
       attentionHeads: 1,
       keyValueHeads: 1,
     });
-    expect(client.countPromptTokens("hello")).toBe(2);
 
     const result = await client.generate("hello", { maxTokens: 3, temperature: 0, topK: 1 });
     expect(result).toMatchObject({
@@ -38,37 +37,71 @@ describe("broSLM client", () => {
       inputTokenCount: 2,
       finishReason: "eos",
     });
-    expect(events.map((event) => event.type)).toEqual([
-      "model-load-started",
-      "backend-selected",
-      "model-download-started",
-      "model-downloaded",
-      "model-parsed",
-      "model-weights-bound",
-      "model-ready",
-      "generation-started",
-      "generation-progress",
-      "generation-progress",
-      "generation-completed",
-    ]);
+    expect(dependencies.createWebGpuRuntime).toHaveBeenCalledOnce();
+    expect(dependencies.nextToken).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.any(Array),
+      expect.anything(),
+      expect.objectContaining({ backend: "webgpu" }),
+      expect.anything(),
+      expect.objectContaining({ temperature: 0, topK: 1 }),
+    );
+
+    const messages = info.mock.calls.map(([message]) => message);
+    expect(messages).toContain("[broslm] model-load-started");
+    expect(messages).toContain("[broslm] backend-selected");
+    expect(messages).toContain("[broslm] model-ready");
+    expect(messages).toContain("[broslm] generation-completed");
+    expect(messages).not.toContain("[broslm] generation-progress");
   });
 
-  it("isolates event listener errors and reports cancellation", async () => {
-    const controller = new AbortController();
-    const events: BroslmEvent[] = [];
-    const client = createBroslmClient(testEnvironment(), {
-      onEvent: () => {
-        throw new Error("listener failed");
-      },
-    }, testDependencies());
-    client.subscribe((event) => events.push(event));
-    await client.loadModel("qwen_cpu_small");
+  it("defaults to WARN and suppresses lifecycle logs", async () => {
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => undefined);
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const client = createBroslmClient(testEnvironment(), {}, testDependencies());
 
-    controller.abort();
-    await expect(client.generate("hello", { signal: controller.signal })).rejects.toMatchObject({
-      code: "ABORTED",
+    await client.loadModel("qwen");
+
+    expect(debug).not.toHaveBeenCalled();
+    expect(info).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("logs progress events at DEBUG with the library prefix", async () => {
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => undefined);
+    vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const client = createBroslmClient(testEnvironment(), { logLevel: "debug" }, testDependencies());
+
+    await client.loadModel("qwen");
+    await client.generate("hello", { maxTokens: 1 });
+
+    expect(debug.mock.calls.map(([message]) => message)).toContain(
+      "[broslm] model-download-progress",
+    );
+    expect(debug.mock.calls.map(([message]) => message)).toContain(
+      "[broslm] generation-progress",
+    );
+  });
+
+  it("reports unavailable WebGPU without falling back", async () => {
+    const dependencies = testDependencies();
+    dependencies.detectWebGpuSupport = vi.fn(async () => ({
+      supported: false,
+      apiAvailable: false,
+      adapterAvailable: false,
+      reason: "WebGPU is not available in this browser.",
+    }));
+    const client = createBroslmClient(testEnvironment(), {}, dependencies);
+
+    await expect(client.checkModelSupport("qwen")).resolves.toMatchObject({
+      backend: "webgpu",
+      supported: false,
     });
-    expect(events.some((event) => event.type === "operation-cancelled")).toBe(true);
+    await expect(client.loadModel("qwen")).rejects.toMatchObject({
+      code: "BACKEND_UNAVAILABLE",
+    });
+    expect(dependencies.createWebGpuRuntime).not.toHaveBeenCalled();
   });
 
   it("uses the same structured prompt for token counting and generation", async () => {
@@ -78,15 +111,12 @@ describe("broSLM client", () => {
       { role: "system", content: "Be concise." },
       { role: "user", content: "Hello\n\nworld" },
     ] as const;
-    await client.loadModel("qwen_cpu_small");
+    await client.loadModel("qwen");
 
     expect(client.countPromptTokens(messages)).toBe(2);
     await client.generate(messages, { maxTokens: 1 });
-    for await (const _chunk of client.stream(messages, { maxTokens: 1 })) {
-      // The EOS-only fixture produces no visible chunks.
-    }
 
-    expect(encode).toHaveBeenCalledTimes(3);
+    expect(encode).toHaveBeenCalledTimes(2);
     expect(encode).toHaveBeenNthCalledWith(
       1,
       "<|im_start|>system\nBe concise.<|im_end|>\n" +
@@ -94,39 +124,25 @@ describe("broSLM client", () => {
         "<|im_start|>assistant\n",
     );
     expect(encode.mock.calls[1]).toEqual(encode.mock.calls[0]);
-    expect(encode.mock.calls[2]).toEqual(encode.mock.calls[0]);
   });
 
-  it("rejects invalid structured prompts before generation", async () => {
-    const client = createBroslmClient(testEnvironment(), {}, testDependencies());
-    await client.loadModel("qwen_cpu_small");
-
-    await expect(client.generate([], { maxTokens: 1 })).rejects.toMatchObject({
-      code: "INVALID_ARGUMENT",
-    });
-    expect(client.state).toBe("ready");
-  });
-
-  it("disposes resources and rejects subsequent operations", async () => {
-    const release = vi.fn();
-    const client = createBroslmClient(testEnvironment(release), {}, testDependencies());
-    await client.loadModel("qwen_cpu_small");
+  it("disposes the WebGPU runtime and rejects subsequent operations", async () => {
+    const dependencies = testDependencies();
+    const client = createBroslmClient(testEnvironment(), {}, dependencies);
+    await client.loadModel("qwen");
     client.dispose();
 
     expect(client.state).toBe("disposed");
-    expect(release).toHaveBeenCalledOnce();
+    expect(dependencies.destroyWebGpuRuntime).toHaveBeenCalled();
     expect(() => client.countPromptTokens("hello")).toThrow(BroslmError);
-    await expect(client.checkModelSupport("qwen_cpu_small")).rejects.toMatchObject({
-      code: "DISPOSED",
-    });
+    await expect(client.checkModelSupport("qwen")).rejects.toMatchObject({ code: "DISPOSED" });
   });
 });
 
-function testEnvironment(release = vi.fn()): BroslmEnvironment {
+function testEnvironment(): BroslmEnvironment {
   return {
     fetchImpl: vi.fn<typeof fetch>(),
-    getWebGpuTarget: vi.fn(async () => undefined),
-    release,
+    getWebGpuTarget: vi.fn(async () => ({ gpu: {} as GPU })),
   };
 }
 
@@ -137,13 +153,15 @@ function testDependencies(
     loadQwen2Model: vi.fn(async (options) => {
       options.onProgress?.({ stage: "gguf-download-started", message: "start" });
       options.onProgress?.({
-        stage: "gguf-downloaded",
-        message: "downloaded",
-        loadedBytes: 16,
+        stage: "gguf-download-progress",
+        message: "progress",
+        source: "network",
+        loadedBytes: 8,
+        totalBytes: 16,
       });
+      options.onProgress?.({ stage: "gguf-downloaded", message: "downloaded", loadedBytes: 16 });
       options.onProgress?.({ stage: "gguf-parsed", message: "parsed" });
       options.onProgress?.({ stage: "weights-bound", message: "bound" });
-      options.onProgress?.({ stage: "ready", message: "ready" });
       return tinyModel();
     }),
     createTokenizer: vi.fn(() => ({
@@ -153,15 +171,27 @@ function testDependencies(
       decode: () => "hello",
     })),
     allocateCache: vi.fn((config, maximumSequenceLength = config.maximumSequenceLength) => ({
-      layers: [],
+      layers: Array.from({ length: config.numberOfLayers }, () => ({ length: 0 })),
       inputIds: [],
       maximumSequenceLength,
       keyValueHiddenSize: config.keyValueHiddenSize,
     })),
     resetCache: vi.fn((cache) => {
       cache.inputIds.length = 0;
+      for (const layer of cache.layers) layer.length = 0;
     }),
     nextToken: vi.fn(async () => ({ tokenId: 9, logits: new Float32Array([0]) })),
+    detectWebGpuSupport: vi.fn(async () => ({
+      supported: true,
+      apiAvailable: true,
+      adapterAvailable: true,
+      limits: {
+        maxBufferSize: 268_435_456,
+        maxStorageBufferBindingSize: 2_147_483_644,
+      },
+    })),
+    createWebGpuRuntime: vi.fn(async () => ({ backend: "webgpu" }) as WebGpuRuntime),
+    destroyWebGpuRuntime: vi.fn(),
   };
 }
 

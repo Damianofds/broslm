@@ -1,8 +1,6 @@
 import type { Qwen2Config } from "./loader";
 
 export interface Qwen2LayerKvCache {
-  keys: Float32Array;
-  values: Float32Array;
   length: number;
 }
 
@@ -26,11 +24,8 @@ export function allocateQwen2ModelKvCache(
     );
   }
 
-  const layerElements = maximumSequenceLength * config.keyValueHiddenSize;
   return {
     layers: Array.from({ length: config.numberOfLayers }, () => ({
-      keys: new Float32Array(layerElements),
-      values: new Float32Array(layerElements),
       length: 0,
     })),
     inputIds: [],

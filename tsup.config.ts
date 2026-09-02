@@ -3,7 +3,6 @@ import { defineConfig } from "tsup";
 export default defineConfig({
   entry: {
     browser: "src/browser.ts",
-    node: "src/node.ts",
   },
   format: ["esm"],
   target: "es2022",
@@ -12,5 +11,4 @@ export default defineConfig({
   sourcemap: true,
   clean: true,
   treeshake: true,
-  external: ["webgpu"],
 });

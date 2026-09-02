@@ -1,6 +1,6 @@
 import { BroslmError } from "./errors";
-import type { BroslmEvent, BroslmEventListener } from "./events";
 import type { BroslmEnvironment } from "./environment";
+import { createBroslmLogger, type BroslmLogger, type BroslmLogLevel } from "./logger";
 import { modelCatalog, type ModelId } from "./models";
 import { allocateQwen2ModelKvCache, resetQwen2ModelKvCache, type Qwen2ModelKvCache } from "./qwen2/attentionCache";
 import type { GgufTensorInfo } from "./qwen2/gguf";
@@ -9,7 +9,7 @@ import {
   type LoadedQwen2Model,
   type Qwen2LoaderProgress,
 } from "./qwen2/loader";
-import { qwen2NextTokenWithCacheBackend } from "./qwen2/model";
+import { qwen2NextTokenWithCacheGpu } from "./qwen2/model";
 import { formatQwen2Prompt } from "./qwen2/chat";
 import { createQwen2TokenizerFromGgufMetadata } from "./qwen2/tokenizer";
 import {
@@ -39,13 +39,12 @@ import type {
 } from "./types";
 
 export interface BroslmOptions {
-  onEvent?: BroslmEventListener;
+  logLevel?: BroslmLogLevel;
 }
 
 export interface Broslm {
   readonly state: BroslmState;
   readonly loadedModel: LoadedModelSummary | null;
-  subscribe(listener: BroslmEventListener): () => void;
   checkModelSupport(modelId: ModelId): Promise<ModelSupport>;
   loadModel(modelId: ModelId, options?: LoadModelOptions): Promise<LoadedModelSummary>;
   countPromptTokens(prompt: string): number;
@@ -62,21 +61,21 @@ export interface BroslmClientDependencies {
   createTokenizer: typeof createQwen2TokenizerFromGgufMetadata;
   allocateCache: typeof allocateQwen2ModelKvCache;
   resetCache: typeof resetQwen2ModelKvCache;
-  nextToken: typeof qwen2NextTokenWithCacheBackend;
+  nextToken: typeof qwen2NextTokenWithCacheGpu;
+  detectWebGpuSupport: typeof detectWebGpuSupport;
+  createWebGpuRuntime: typeof createWebGpuRuntime;
+  destroyWebGpuRuntime: typeof destroyWebGpuRuntime;
 }
-
-type UntimedBroslmEvent = BroslmEvent extends infer Event
-  ? Event extends { timestampMs: number }
-    ? Omit<Event, "timestampMs">
-    : never
-  : never;
 
 const defaultDependencies: BroslmClientDependencies = {
   loadQwen2Model,
   createTokenizer: createQwen2TokenizerFromGgufMetadata,
   allocateCache: allocateQwen2ModelKvCache,
   resetCache: resetQwen2ModelKvCache,
-  nextToken: qwen2NextTokenWithCacheBackend,
+  nextToken: qwen2NextTokenWithCacheGpu,
+  detectWebGpuSupport,
+  createWebGpuRuntime,
+  destroyWebGpuRuntime,
 };
 
 export function createBroslmClient(
@@ -95,7 +94,7 @@ class DefaultBroslmClient implements Broslm {
   private tokenizer: ByteLevelBpeTokenizer | null = null;
   private cache: Qwen2ModelKvCache | null = null;
   private runtime: WebGpuRuntime | undefined;
-  private listeners = new Set<BroslmEventListener>();
+  private readonly logger: BroslmLogger;
   private activeAbortController: AbortController | null = null;
   private lastGenerationResult: GenerationResult | null = null;
 
@@ -104,9 +103,7 @@ class DefaultBroslmClient implements Broslm {
     options: BroslmOptions,
     private readonly dependencies: BroslmClientDependencies,
   ) {
-    if (options.onEvent) {
-      this.listeners.add(options.onEvent);
-    }
+    this.logger = createBroslmLogger(options.logLevel);
   }
 
   get state(): BroslmState {
@@ -117,22 +114,12 @@ class DefaultBroslmClient implements Broslm {
     return this.summary;
   }
 
-  subscribe(listener: BroslmEventListener): () => void {
-    this.ensureNotDisposed();
-    this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
-  }
-
   async checkModelSupport(modelId: ModelId): Promise<ModelSupport> {
     this.ensureNotDisposed();
     const descriptor = requireModelDescriptor(modelId);
-    if (descriptor.backend === "cpu") {
-      return { modelId, backend: "cpu", supported: true };
-    }
-
     try {
       const target = await this.environment.getWebGpuTarget();
-      const support = await detectWebGpuSupport(target);
+      const support = await this.dependencies.detectWebGpuSupport(target);
       if (!support.supported) {
         return {
           modelId,
@@ -185,21 +172,18 @@ class DefaultBroslmClient implements Broslm {
 
     try {
       throwIfAborted(controller.signal);
-      let runtime: WebGpuRuntime | undefined;
-      if (descriptor.backend === "webgpu") {
-        const support = await this.checkModelSupport(modelId);
-        if (!support.supported) {
-          throw new BroslmError(
-            "BACKEND_UNAVAILABLE",
-            support.reason ?? "This model requires WebGPU, but no compatible adapter is available.",
-          );
-        }
-        throwIfAborted(controller.signal);
-        const target = await this.environment.getWebGpuTarget();
-        runtime = await createWebGpuRuntime(target, {
-          requiredStorageBufferBindingSize: descriptor.minimumStorageBufferBindingSize,
-        });
+      const support = await this.checkModelSupport(modelId);
+      if (!support.supported) {
+        throw new BroslmError(
+          "BACKEND_UNAVAILABLE",
+          support.reason ?? "This model requires WebGPU, but no compatible adapter is available.",
+        );
       }
+      throwIfAborted(controller.signal);
+      const target = await this.environment.getWebGpuTarget();
+      const runtime = await this.dependencies.createWebGpuRuntime(target, {
+        requiredStorageBufferBindingSize: descriptor.minimumStorageBufferBindingSize,
+      });
       this.runtime = runtime;
       this.emit({
         type: "backend-selected",
@@ -218,10 +202,7 @@ class DefaultBroslmClient implements Broslm {
       throwIfAborted(controller.signal);
 
       const tokenizer = this.dependencies.createTokenizer(model.gguf.metadata);
-      const maximumCacheLength =
-        descriptor.backend === "webgpu"
-          ? qwen2WebGpuCacheSequenceLength(model.config.maximumSequenceLength)
-          : model.config.maximumSequenceLength;
+      const maximumCacheLength = qwen2WebGpuCacheSequenceLength(model.config.maximumSequenceLength);
 
       this.model = model;
       this.modelId = modelId;
@@ -317,9 +298,7 @@ class DefaultBroslmClient implements Broslm {
     const targetTokens = Math.min(
       maxTokens,
       availableContext,
-      this.runtime
-        ? Math.max(0, qwen2WebGpuSafetyLimits.maxSequenceTokens - inputIds.length)
-        : Number.MAX_SAFE_INTEGER,
+      Math.max(0, qwen2WebGpuSafetyLimits.maxSequenceTokens - inputIds.length),
     );
     if (targetTokens <= 0) {
       this.currentState = "ready";
@@ -348,12 +327,21 @@ class DefaultBroslmClient implements Broslm {
         const phase = tokenIndex === 0 ? "prefill" : "decode";
         const profiledTokenCount = phase === "prefill" ? inputIds.length : 1;
         const tokenStartedAt = nowMs();
-        const result = await this.dependencies.nextToken(model, nextInputIds, cache, {
-          backend: this.runtime ? "webgpu" : "cpu",
-          runtime: this.runtime,
-          temperature: options.temperature ?? 0.95,
-          topK: options.topK ?? 10,
-        });
+        const runtime = this.runtime;
+        if (!runtime) {
+          throw new BroslmError("BACKEND_UNAVAILABLE", "The WebGPU runtime is not initialized.");
+        }
+        const result = await this.dependencies.nextToken(
+          model,
+          nextInputIds,
+          cache,
+          runtime,
+          this.logger,
+          {
+            temperature: options.temperature ?? 0.95,
+            topK: options.topK ?? 10,
+          },
+        );
         throwIfAborted(controller.signal);
         const performance = createPerformance(phase, profiledTokenCount, nowMs() - tokenStartedAt);
         this.emit({
@@ -432,9 +420,7 @@ class DefaultBroslmClient implements Broslm {
     this.activeAbortController?.abort(new BroslmError("DISPOSED", "broSLM was disposed."));
     this.activeAbortController = null;
     this.releaseLoadedModel();
-    this.environment.release();
     this.currentState = "disposed";
-    this.listeners.clear();
   }
 
   private ensureReady(): void {
@@ -451,7 +437,7 @@ class DefaultBroslmClient implements Broslm {
   }
 
   private releaseLoadedModel(): void {
-    destroyWebGpuRuntime(this.runtime);
+    this.dependencies.destroyWebGpuRuntime(this.runtime);
     this.runtime = undefined;
     this.model = null;
     this.modelId = null;
@@ -499,14 +485,14 @@ class DefaultBroslmClient implements Broslm {
     }
   }
 
-  private emit(event: UntimedBroslmEvent): void {
-    const timedEvent = { ...event, timestampMs: Date.now() } as BroslmEvent;
-    for (const listener of this.listeners) {
-      try {
-        listener(timedEvent);
-      } catch {
-        // Observability must not alter inference behavior.
-      }
+  private emit(event: { type: string; [key: string]: unknown }): void {
+    const { type, ...context } = event;
+    if (type.endsWith("-progress")) {
+      this.logger.debug(type, context);
+    } else if (type === "operation-error") {
+      this.logger.error(type, context);
+    } else {
+      this.logger.info(type, context);
     }
   }
 }
@@ -552,15 +538,8 @@ function describeGgufDtype(model: LoadedQwen2Model): string {
 function ggmlTypeLabel(type: number): string {
   return ({
     0: "F32",
-    1: "F16",
     2: "Q4_0",
-    6: "Q5_0",
-    7: "Q5_1",
     8: "Q8_0",
-    10: "Q2_K",
-    19: "IQ1_S",
-    20: "IQ4_NL",
-    29: "IQ1_M",
   } as Record<number, string>)[type] ?? `type${type}`;
 }
 

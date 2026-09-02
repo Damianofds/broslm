@@ -1,5 +1,6 @@
 import type { Qwen2ModelKvCache } from "./attentionCache";
 import { resetQwen2ModelKvCache } from "./attentionCache";
+import type { BroslmLogger } from "../logger";
 import type { LoadedQwen2Model, TensorView } from "./loader";
 import { isFloat32TensorView, type QwenTensorView } from "./quantizedTensor";
 import { qwen2WebGpuPrefillSafetyError } from "./webgpuSafety";
@@ -34,7 +35,7 @@ interface ResidentQwen2GpuModelCache {
   layers: ResidentQwen2GpuLayerCache[];
 }
 
-const residentQwen2GpuCacheByCpuCache = new WeakMap<
+const residentQwen2GpuCacheByMetadata = new WeakMap<
   Qwen2ModelKvCache,
   ResidentQwen2GpuModelCache
 >();
@@ -70,6 +71,7 @@ export async function qwen2PrefillLogitsResidentGpu(
   inputIds: readonly number[],
   cache: Qwen2ModelKvCache,
   runtime: WebGpuRuntime,
+  logger: BroslmLogger,
 ): Promise<Float32Array> {
   const safetyError = qwen2WebGpuPrefillSafetyError(inputIds.length);
   if (safetyError) {
@@ -304,24 +306,24 @@ export async function qwen2PrefillLogitsResidentGpu(
   profileQwen2PrefillStep(profile, "submit", () => {
     submitResidentQwen2GpuContext(runtime, context);
   });
-  const logitsCpu = await profileQwen2PrefillAsyncStep(profile, "logitsReadback", () =>
+  const logitsResult = await profileQwen2PrefillAsyncStep(profile, "logitsReadback", () =>
     readFloat32Buffer(runtime, logits, model.config.vocabularySize),
   );
 
   for (let layerIndex = 0; layerIndex < cache.layers.length; layerIndex += 1) {
-    const cpuLayerCache = cache.layers[layerIndex];
+    const layerMetadata = cache.layers[layerIndex];
     const gpuLayerCache = gpuCache.layers[layerIndex];
-    if (!cpuLayerCache || !gpuLayerCache) {
-      throw new Error(`missing Qwen2 CPU/GPU cache at layer ${layerIndex}`);
+    if (!layerMetadata || !gpuLayerCache) {
+      throw new Error(`missing Qwen2 cache at layer ${layerIndex}`);
     }
-    cpuLayerCache.length = sequenceLength;
+    layerMetadata.length = sequenceLength;
     gpuLayerCache.length = sequenceLength;
   }
   cache.inputIds.push(...inputIds);
   gpuCache.inputIds.push(...inputIds);
   destroyBuffers(...context.temps);
-  logQwen2PrefillProfile(profile);
-  return logitsCpu;
+  logQwen2PrefillProfile(profile, logger);
+  return logitsResult;
 }
 
 export async function qwen2DecodeTokenLogitsResidentGpu(
@@ -374,14 +376,14 @@ export async function qwen2DecodeTokenLogitsResidentGpu(
   for (let layerIndex = 0; layerIndex < model.weights.layers.length; layerIndex += 1) {
     const layerWeights = model.weights.layers[layerIndex];
     const gpuLayerCache = gpuCache.layers[layerIndex];
-    const cpuLayerCache = cache.layers[layerIndex];
-    if (!layerWeights || !gpuLayerCache || !cpuLayerCache) {
+    const layerMetadata = cache.layers[layerIndex];
+    if (!layerWeights || !gpuLayerCache || !layerMetadata) {
       throw new Error(`missing Qwen2 layer/cache at index ${layerIndex}`);
     }
-    if (gpuLayerCache.length !== position || cpuLayerCache.length !== position) {
+    if (gpuLayerCache.length !== position || layerMetadata.length !== position) {
       throw new Error(
         `Qwen2 cache length mismatch at layer ${layerIndex}: GPU ${gpuLayerCache.length}, ` +
-          `CPU ${cpuLayerCache.length}, expected ${position}`,
+          `metadata ${layerMetadata.length}, expected ${position}`,
       );
     }
 
@@ -529,20 +531,20 @@ export async function qwen2DecodeTokenLogitsResidentGpu(
   });
 
   runtime.device.queue.submit([context.encoder.finish()]);
-  const logitsCpu = await readFloat32Buffer(runtime, logits, model.config.vocabularySize);
+  const result = await readFloat32Buffer(runtime, logits, model.config.vocabularySize);
 
   for (let layerIndex = 0; layerIndex < cache.layers.length; layerIndex += 1) {
-    const cpuLayerCache = cache.layers[layerIndex];
+    const layerMetadata = cache.layers[layerIndex];
     const gpuLayerCache = gpuCache.layers[layerIndex];
-    if (!cpuLayerCache || !gpuLayerCache) {
-      throw new Error(`missing Qwen2 CPU/GPU cache at layer ${layerIndex}`);
+    if (!layerMetadata || !gpuLayerCache) {
+      throw new Error(`missing Qwen2 cache at layer ${layerIndex}`);
     }
-    cpuLayerCache.length = position + 1;
+    layerMetadata.length = position + 1;
     gpuLayerCache.length = position + 1;
   }
   gpuCache.inputIds.push(tokenId);
   destroyBuffers(...context.temps);
-  return logitsCpu;
+  return result;
 }
 
 export function hasQwen2ResidentGpuCache(
@@ -550,7 +552,7 @@ export function hasQwen2ResidentGpuCache(
   cache: Qwen2ModelKvCache,
   runtime: WebGpuRuntime,
 ): boolean {
-  const gpuCache = residentQwen2GpuCacheByCpuCache.get(cache);
+  const gpuCache = residentQwen2GpuCacheByMetadata.get(cache);
   return Boolean(gpuCache && residentQwen2GpuCacheMatches(model, cache, runtime, gpuCache));
 }
 
@@ -618,8 +620,8 @@ function addQwen2PrefillTiming(
   profile.totals[step] = (profile.totals[step] ?? 0) + elapsedMs;
 }
 
-function logQwen2PrefillProfile(profile: Qwen2PrefillProfile): void {
-  console.info("[broslm] Qwen WebGPU prefill timing", {
+function logQwen2PrefillProfile(profile: Qwen2PrefillProfile, logger: BroslmLogger): void {
+  logger.debug("webgpu-prefill-profile", {
     promptTokens: profile.promptTokens,
     layers: profile.layers,
     fusedQkvLayers: profile.fusedQkvLayers,
@@ -654,7 +656,7 @@ function getOrCreateResidentQwen2GpuCache(
   cache: Qwen2ModelKvCache,
   runtime: WebGpuRuntime,
 ): ResidentQwen2GpuModelCache {
-  const existing = residentQwen2GpuCacheByCpuCache.get(cache);
+  const existing = residentQwen2GpuCacheByMetadata.get(cache);
   if (existing && residentQwen2GpuCacheShapeMatches(model, cache, runtime, existing)) {
     return existing;
   }
@@ -676,7 +678,7 @@ function getOrCreateResidentQwen2GpuCache(
       length: 0,
     })),
   };
-  residentQwen2GpuCacheByCpuCache.set(cache, gpuCache);
+  residentQwen2GpuCacheByMetadata.set(cache, gpuCache);
   return gpuCache;
 }
 
@@ -698,7 +700,7 @@ function requireResidentQwen2GpuCache(
   cache: Qwen2ModelKvCache,
   runtime: WebGpuRuntime,
 ): ResidentQwen2GpuModelCache {
-  const gpuCache = residentQwen2GpuCacheByCpuCache.get(cache);
+  const gpuCache = residentQwen2GpuCacheByMetadata.get(cache);
   if (!gpuCache || !residentQwen2GpuCacheMatches(model, cache, runtime, gpuCache)) {
     throw new Error("Qwen2 WebGPU decode requires a resident GPU cache initialized by prefill.");
   }
@@ -723,9 +725,9 @@ function residentQwen2GpuCacheMatches(
     }
   }
   for (let layerIndex = 0; layerIndex < cache.layers.length; layerIndex += 1) {
-    const cpuLayer = cache.layers[layerIndex];
+    const layerMetadata = cache.layers[layerIndex];
     const gpuLayer = gpuCache.layers[layerIndex];
-    if (!cpuLayer || !gpuLayer || cpuLayer.length !== gpuLayer.length) {
+    if (!layerMetadata || !gpuLayer || layerMetadata.length !== gpuLayer.length) {
       return false;
     }
   }
@@ -758,13 +760,6 @@ function tensorBuffer(runtime: WebGpuRuntime, tensor: TensorView): GPUBuffer {
 }
 
 function qwenTensorBuffer(runtime: WebGpuRuntime, tensor: QwenTensorView): GPUBuffer {
-  if (
-    !isFloat32TensorView(tensor) &&
-    tensor.type !== "q4_0" &&
-    tensor.type !== "q8_0"
-  ) {
-    throw new Error(`${tensor.name} uses ${tensor.type.toUpperCase()} quantization, which is only supported on the CPU backend.`);
-  }
   return createStaticStorageBuffer(runtime, tensor.data);
 }
 
@@ -1437,9 +1432,6 @@ function quantizedRowByteLength(
   tensor: Exclude<QwenTensorView, TensorView>,
   inputSize: number,
 ): number {
-  if (tensor.type !== "q4_0" && tensor.type !== "q8_0") {
-    throw new Error(`${tensor.name} uses ${tensor.type.toUpperCase()} quantization, which is only supported on the CPU backend.`);
-  }
   if (!Number.isInteger(inputSize) || inputSize <= 0 || inputSize % 32 !== 0) {
     throw new Error(`${tensor.type} length must be a positive multiple of 32, got ${inputSize}`);
   }
@@ -1447,9 +1439,6 @@ function quantizedRowByteLength(
 }
 
 function quantizedTypeCode(tensor: Exclude<QwenTensorView, TensorView>): number {
-  if (tensor.type !== "q4_0" && tensor.type !== "q8_0") {
-    throw new Error(`${tensor.name} uses ${tensor.type.toUpperCase()} quantization, which is only supported on the CPU backend.`);
-  }
   return tensor.type === "q4_0" ? 4 : 8;
 }
 

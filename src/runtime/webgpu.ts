@@ -1,6 +1,3 @@
-export type InferenceBackend = "cpu" | "webgpu";
-export type InferenceBackendPreference = "auto" | InferenceBackend;
-
 export interface WebGpuSupportStatus {
   supported: boolean;
   apiAvailable: boolean;
@@ -27,12 +24,6 @@ export interface WebGpuRuntimeOptions {
 }
 
 export type WebGpuNavigator = Pick<Navigator, "gpu">;
-
-export interface BackendResolutionOptions {
-  preference?: InferenceBackendPreference;
-  webgpuRequired?: boolean;
-  webgpuAvailable: boolean;
-}
 
 export const webGpuBufferUsage = {
   mapRead: 1,
@@ -159,26 +150,6 @@ function summarizeAdapterLimits(adapter: GPUAdapter): WebGpuLimitSummary {
     maxBufferSize: adapter.limits.maxBufferSize,
     maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
   };
-}
-
-export function resolveInferenceBackend(options: BackendResolutionOptions): InferenceBackend {
-  const preference = options.preference ?? "auto";
-  if (preference === "cpu") {
-    return "cpu";
-  }
-  if (preference === "webgpu") {
-    if (!options.webgpuAvailable) {
-      throw new Error("WebGPU backend was requested, but WebGPU is not available.");
-    }
-    return "webgpu";
-  }
-  if (options.webgpuAvailable) {
-    return "webgpu";
-  }
-  if (options.webgpuRequired) {
-    throw new Error("This model requires WebGPU, but WebGPU is not available.");
-  }
-  return "cpu";
 }
 
 export function createStorageBuffer(

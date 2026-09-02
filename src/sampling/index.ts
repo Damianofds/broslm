@@ -1,5 +1,3 @@
-import { argmax } from "../primitives/argmax";
-
 export interface SamplingOptions {
   temperature?: number;
   topK?: number;
@@ -58,6 +56,22 @@ function clampTopK(topK: number, vocabularySize: number): number {
     return 1;
   }
   return Math.max(1, Math.min(vocabularySize, Math.round(topK)));
+}
+
+function argmax(values: Float32Array): number {
+  if (values.length === 0) {
+    throw new Error("argmax requires at least one value");
+  }
+  let bestIndex = 0;
+  for (let index = 1; index < values.length; index += 1) {
+    if (
+      (values[index] ?? Number.NEGATIVE_INFINITY) >
+      (values[bestIndex] ?? Number.NEGATIVE_INFINITY)
+    ) {
+      bestIndex = index;
+    }
+  }
+  return bestIndex;
 }
 
 function topKLogits(logits: Float32Array, topK: number): Array<{ tokenId: number; logit: number }> {

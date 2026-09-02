@@ -1,5 +1,5 @@
 export { BroslmError, type BroslmErrorCode } from "./errors";
-export type { BroslmEvent, BroslmEventListener } from "./events";
+export type { BroslmLogLevel } from "./logger";
 export {
   defaultModelId,
   modelCatalog,

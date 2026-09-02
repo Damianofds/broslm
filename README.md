@@ -1,44 +1,37 @@
 # broSLM
 
-broSLM runs Qwen2-family GGUF models from TypeScript in modern browsers and Node.js. It owns model acquisition, tokenization, CPU/WebGPU inference, sampling, KV-cache lifecycle, and generation observability.
+broSLM runs Qwen2.5 0.5B Instruct Q4_0 entirely in the browser with WebGPU. It owns model download and browser caching, tokenization, GPU inference, sampling, KV-cache lifecycle, and streaming generation.
 
 The browser testbed lives in [Damianofds/broslm-fe-testbed](https://github.com/Damianofds/broslm-fe-testbed).
 
+## Requirements
+
+- A browser with WebGPU support and a compatible GPU adapter.
+- `maxStorageBufferBindingSize` of at least 144,643,072 bytes.
+- A Web Worker is strongly recommended so inference does not block the UI thread.
+
+broSLM has no CPU fallback and does not support server-side or Node.js inference.
+
 ## Install
 
-The package is currently distributed from its versioned Git tag:
+Install directly from the repository:
 
 ```bash
-npm install github:Damianofds/broslm#v0.1.0
+npm install github:Damianofds/broslm
 ```
-
-Node GPU inference also needs the optional Dawn binding:
-
-```bash
-npm install webgpu
-```
-
-CPU inference and browser applications do not install or bundle `webgpu`.
 
 ## Use
-
-Browser and Node applications use the same import. Browser applications should run generation inside a Web Worker so inference does not block the UI thread.
 
 ```ts
 import { createBroslm } from "broslm";
 
-const broslm = createBroslm({
-  onEvent(event) {
-    console.log(event.type, event);
-  },
-});
-
-const support = await broslm.checkModelSupport("qwen_cpu_small");
+const broslm = createBroslm();
+const support = await broslm.checkModelSupport("qwen");
 if (!support.supported) {
   throw new Error(support.reason);
 }
 
-await broslm.loadModel("qwen_cpu_small");
+await broslm.loadModel("qwen");
 
 for await (const update of broslm.stream("Explain grouped-query attention.", {
   maxTokens: 120,
@@ -51,39 +44,42 @@ for await (const update of broslm.stream("Explain grouped-query attention.", {
 broslm.dispose();
 ```
 
-Use `generate` instead of `stream` when only the completed result is needed. Loading and generation accept an `AbortSignal`; `subscribe` adds additional typed event listeners and returns an unsubscribe function.
+Use `generate` instead of `stream` when only the completed result is needed. Loading and generation accept an `AbortSignal`.
 
-Prompts can also be structured as Qwen ChatML conversations. A custom system message and prior assistant turns are optional; the final message must be from the user.
+Prompts can also be structured as Qwen ChatML conversations. The final message must be from the user.
 
 ```ts
 const result = await broslm.generate([
   { role: "system", content: "Answer as a concise TypeScript expert." },
-  { role: "user", content: "What are conditional exports?" },
-  { role: "assistant", content: "They select package entry points by environment." },
-  { role: "user", content: "Show a minimal example." },
-], {
-  maxTokens: 120,
-});
+  { role: "user", content: "What is a conditional export?" },
+]);
 
 console.log(result.text);
 ```
 
-A string prompt remains supported and is converted internally to a single user message. Both forms use the same generation, streaming, token-counting, and cancellation APIs.
+## Logging
 
-## Models
+Library logging defaults to `warn`. Configure it when creating the client:
+
+```ts
+const broslm = createBroslm({ logLevel: "info" });
+```
+
+Available levels are `error`, `warn`, `info`, and `debug`. INFO includes lifecycle events except names ending in `-progress`; DEBUG includes progress events as well. Every library message starts with `[broslm]`.
+
+## Model
+
+broSLM supports one model profile:
 
 | ID | Model | Backend | Source |
 | --- | --- | --- | --- |
-| `qwen` | Qwen2.5 0.5B Instruct Q4_0 | WebGPU only | Official Qwen GGUF |
-| `qwen_cpu_small` | Qwen2.5 0.5B Instruct IQ1_S | CPU only | legraphista IMat GGUF |
+| `qwen` | Qwen2.5 0.5B Instruct Q4_0 | WebGPU | Official Qwen GGUF |
 
-Model weights are downloaded from Hugging Face and are not included in this npm package. Each model remains subject to its upstream license.
-
-In browsers, successful model responses are cached with CacheStorage when available. Node uses direct fetch without persistent caching. A future acquisition provider can replace the direct-download implementation without changing the inference API.
+The weights are downloaded from Hugging Face and cached with browser CacheStorage when available. They are not included in this npm package and remain subject to their upstream license.
 
 ## Development
 
-Requires Node.js 18 or newer.
+Node.js is used only for the development toolchain:
 
 ```bash
 npm install
@@ -93,7 +89,7 @@ npm run build
 npm run pack:smoke
 ```
 
-The package is ESM-only. Conditional exports select the browser or Node runtime while retaining the same public API. `webgpu` is loaded dynamically only when Node requests the GPU model.
+The published package is ESM-only and exposes a single browser runtime.
 
 ## License
 

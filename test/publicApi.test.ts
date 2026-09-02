@@ -7,11 +7,11 @@ import {
 } from "../src/browser";
 
 describe("public package API", () => {
-  it("exposes the two stable Qwen model profiles", () => {
+  it("exposes only the Qwen2.5 0.5B WebGPU profile", () => {
     expect(defaultModelId).toBe("qwen");
-    expect(modelOptions.map((model) => model.id)).toEqual(["qwen", "qwen_cpu_small"]);
+    expect(modelOptions.map((model) => model.id)).toEqual(["qwen"]);
     expect(modelCatalog.qwen.backend).toBe("webgpu");
-    expect(modelCatalog.qwen_cpu_small.backend).toBe("cpu");
+    expect(modelCatalog.qwen.quantization).toBe("Q4_0");
   });
 
   it("creates a disposable browser client without touching WebGPU", () => {

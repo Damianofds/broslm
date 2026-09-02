@@ -32,15 +32,8 @@ export const GGUF_TYPE_INT64 = 11;
 export const GGUF_TYPE_FLOAT64 = 12;
 
 export const GGML_TYPE_F32 = 0;
-export const GGML_TYPE_F16 = 1;
 export const GGML_TYPE_Q4_0 = 2;
-export const GGML_TYPE_Q5_0 = 6;
-export const GGML_TYPE_Q5_1 = 7;
 export const GGML_TYPE_Q8_0 = 8;
-export const GGML_TYPE_Q2_K = 10;
-export const GGML_TYPE_IQ1_S = 19;
-export const GGML_TYPE_IQ4_NL = 20;
-export const GGML_TYPE_IQ1_M = 29;
 
 const DEFAULT_ALIGNMENT = 32;
 
@@ -166,24 +159,10 @@ function calculateTensorByteLength(
   switch (type) {
     case GGML_TYPE_F32:
       return elements * 4;
-    case GGML_TYPE_F16:
-      return elements * 2;
     case GGML_TYPE_Q4_0:
       return quantizedByteLength(name, dimensions, 32, 18);
-    case GGML_TYPE_Q5_0:
-      return quantizedByteLength(name, dimensions, 32, 22);
-    case GGML_TYPE_Q5_1:
-      return quantizedByteLength(name, dimensions, 32, 24);
     case GGML_TYPE_Q8_0:
       return quantizedByteLength(name, dimensions, 32, 34);
-    case GGML_TYPE_Q2_K:
-      return quantizedByteLength(name, dimensions, 256, 84);
-    case GGML_TYPE_IQ1_S:
-      return quantizedByteLength(name, dimensions, 256, 50);
-    case GGML_TYPE_IQ4_NL:
-      return quantizedByteLength(name, dimensions, 32, 18);
-    case GGML_TYPE_IQ1_M:
-      return quantizedByteLength(name, dimensions, 256, 56);
     default:
       throw new Error(`Unsupported GGUF tensor type ${type} for ${name}`);
   }
