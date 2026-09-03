@@ -1,44 +1,56 @@
 import { describe, expect, it } from "vitest";
-import { planQuantizedGemvDispatch } from "../../src/qwen2/gpuDispatch";
+import {
+  planQuantizedMatrixDispatch,
+  shouldUseFusedQkvProjection,
+  shouldUseSplitAttentionDecode,
+} from "../../src/qwen2/gpuDispatch";
 
-describe("quantized GEMV dispatch planning", () => {
+describe("Qwen GPU dispatch policy", () => {
   const deviceLimit = 65_535;
 
-  it("splits the production vocabulary across two legal dimensions", () => {
-    expect(planQuantizedGemvDispatch(151_936, deviceLimit)).toEqual({
-      shader: "cooperative",
-      workgroups: [65_535, 3],
-      rowsPerDispatch: 65_535,
+  it("uses a compact scalar dispatch for the production LM head", () => {
+    expect(planQuantizedMatrixDispatch(151_936, 1, deviceLimit)).toEqual({
+      workgroups: [2_374],
     });
   });
 
-  it.each([
-    [deviceLimit - 1, [deviceLimit - 1, 1]],
-    [deviceLimit, [deviceLimit, 1]],
-    [deviceLimit + 1, [deviceLimit, 2]],
-  ])("plans output size %i within the device limit", (outputSize, workgroups) => {
-    const plan = planQuantizedGemvDispatch(outputSize, deviceLimit);
+  it("keeps the largest supported prefill projection within the device limit", () => {
+    expect(planQuantizedMatrixDispatch(4_864, 256, deviceLimit)).toEqual({
+      workgroups: [19_456],
+    });
+  });
 
-    expect(plan.shader).toBe("cooperative");
-    expect(plan.workgroups).toEqual(workgroups);
+  it("rejects an oversized scalar dispatch before WebGPU encoding", () => {
+    expect(() => planQuantizedMatrixDispatch(4_864, 1_024, deviceLimit)).toThrow(
+      /\[77824, 1, 1\].*65535/,
+    );
+  });
+
+  it("fuses compatible QKV projections for prefill and decode", () => {
     expect(
-      plan.workgroups.every(
-        (dimension) => dimension !== undefined && dimension <= deviceLimit,
-      ),
+      shouldUseFusedQkvProjection({ sequenceLength: 32, weightsCompatible: true }),
+    ).toBe(true);
+    expect(
+      shouldUseFusedQkvProjection({ sequenceLength: 1, weightsCompatible: true }),
     ).toBe(true);
   });
 
-  it("uses the scalar kernel only when the cooperative grid cannot fit", () => {
-    expect(planQuantizedGemvDispatch(5, 2)).toEqual({
-      shader: "scalar",
-      workgroups: [1],
-      rowsPerDispatch: 2,
-    });
+  it("keeps offset and incompatible projections separate", () => {
+    expect(
+      shouldUseFusedQkvProjection({ sequenceLength: 32, weightsCompatible: false }),
+    ).toBe(false);
+    expect(
+      shouldUseFusedQkvProjection({
+        sequenceLength: 32,
+        kOutputBaseOffset: 128,
+        weightsCompatible: true,
+      }),
+    ).toBe(false);
   });
 
-  it("rejects an output that neither dispatch layout can fit", () => {
-    expect(() => planQuantizedGemvDispatch(129, 2)).toThrow(
-      /output size 129.*limit 2.*\[2, 65\].*\[3, 1\]/,
-    );
+  it("uses direct attention for one tile and split attention above it", () => {
+    expect(shouldUseSplitAttentionDecode(0, 256)).toBe(false);
+    expect(shouldUseSplitAttentionDecode(255, 256)).toBe(false);
+    expect(shouldUseSplitAttentionDecode(256, 256)).toBe(true);
   });
 });

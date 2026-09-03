@@ -1,50 +1,63 @@
-export interface QuantizedGemvDispatchPlan {
-  shader: "cooperative" | "scalar";
-  workgroups: readonly [number, number?];
-  rowsPerDispatch: number;
+export interface QuantizedMatrixDispatchPlan {
+  workgroups: readonly [number];
 }
 
-const scalarGemvWorkgroupSize = 64;
+const quantizedMatrixWorkgroupSize = 64;
 
-export function planQuantizedGemvDispatch(
+export function planQuantizedMatrixDispatch(
   outputSize: number,
+  sequenceLength: number,
   maxComputeWorkgroupsPerDimension: number,
-): QuantizedGemvDispatchPlan {
-  if (!Number.isInteger(outputSize) || outputSize <= 0) {
-    throw new RangeError(`quantized GEMV output size must be a positive integer, got ${outputSize}`);
+): QuantizedMatrixDispatchPlan {
+  for (const [name, value] of [
+    ["outputSize", outputSize],
+    ["sequenceLength", sequenceLength],
+    ["maxComputeWorkgroupsPerDimension", maxComputeWorkgroupsPerDimension],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new RangeError(`${name} must be a positive safe integer, got ${value}`);
+    }
   }
-  if (
-    !Number.isInteger(maxComputeWorkgroupsPerDimension) ||
-    maxComputeWorkgroupsPerDimension <= 0
-  ) {
+
+  const outputElements = outputSize * sequenceLength;
+  if (!Number.isSafeInteger(outputElements)) {
     throw new RangeError(
-      `maxComputeWorkgroupsPerDimension must be a positive integer, got ` +
-        `${maxComputeWorkgroupsPerDimension}`,
+      `quantized matrix output element count is not a safe integer: ` +
+        `${outputSize} * ${sequenceLength}`,
     );
   }
-
-  const rowsPerDispatch = Math.min(outputSize, maxComputeWorkgroupsPerDimension);
-  const rowDispatches = Math.ceil(outputSize / rowsPerDispatch);
-  if (rowDispatches <= maxComputeWorkgroupsPerDimension) {
-    return {
-      shader: "cooperative",
-      workgroups: [rowsPerDispatch, rowDispatches],
-      rowsPerDispatch,
-    };
+  const workgroups = Math.ceil(outputElements / quantizedMatrixWorkgroupSize);
+  if (workgroups > maxComputeWorkgroupsPerDimension) {
+    throw new RangeError(
+      `quantized matrix dispatch [${workgroups}, 1, 1] exceeds ` +
+        `maxComputeWorkgroupsPerDimension (${maxComputeWorkgroupsPerDimension})`,
+    );
   }
+  return { workgroups: [workgroups] };
+}
 
-  const scalarWorkgroups = Math.ceil(outputSize / scalarGemvWorkgroupSize);
-  if (scalarWorkgroups <= maxComputeWorkgroupsPerDimension) {
-    return {
-      shader: "scalar",
-      workgroups: [scalarWorkgroups],
-      rowsPerDispatch,
-    };
-  }
-
-  throw new RangeError(
-    `quantized GEMV output size ${outputSize} cannot fit within the WebGPU dispatch limit ` +
-      `${maxComputeWorkgroupsPerDimension}: requested cooperative grid ` +
-      `[${rowsPerDispatch}, ${rowDispatches}] and scalar grid [${scalarWorkgroups}, 1]`,
+export function shouldUseFusedQkvProjection(options: {
+  sequenceLength: number;
+  qOutputBaseOffset?: number;
+  kOutputBaseOffset?: number;
+  vOutputBaseOffset?: number;
+  weightsCompatible: boolean;
+}): boolean {
+  return (
+    options.sequenceLength > 0 &&
+    (options.qOutputBaseOffset ?? 0) === 0 &&
+    (options.kOutputBaseOffset ?? 0) === 0 &&
+    (options.vOutputBaseOffset ?? 0) === 0 &&
+    options.weightsCompatible
   );
+}
+
+export function shouldUseSplitAttentionDecode(position: number, tileSize: number): boolean {
+  if (!Number.isSafeInteger(position) || position < 0) {
+    throw new RangeError(`position must be a non-negative safe integer, got ${position}`);
+  }
+  if (!Number.isSafeInteger(tileSize) || tileSize <= 0) {
+    throw new RangeError(`tileSize must be a positive safe integer, got ${tileSize}`);
+  }
+  return position + 1 > tileSize;
 }

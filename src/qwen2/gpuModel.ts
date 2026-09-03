@@ -3,7 +3,11 @@ import { resetQwen2ModelKvCache } from "./attentionCache";
 import type { BroslmLogger } from "../logger";
 import type { LoadedQwen2Model, TensorView } from "./loader";
 import { isFloat32TensorView, type QwenTensorView } from "./quantizedTensor";
-import { planQuantizedGemvDispatch } from "./gpuDispatch";
+import {
+  planQuantizedMatrixDispatch,
+  shouldUseFusedQkvProjection,
+  shouldUseSplitAttentionDecode,
+} from "./gpuDispatch";
 import { qwen2WebGpuPrefillSafetyError } from "./webgpuSafety";
 import {
   createStaticStorageBuffer,
@@ -81,7 +85,6 @@ const residentQwen2GpuCacheByMetadata = new WeakMap<
   ResidentQwen2GpuModelCache
 >();
 const qkvBiasDataByQueryBias = new WeakMap<object, Float32Array>();
-const quantizedTensorGpuBuffers = new WeakMap<object, WeakMap<WebGpuRuntime, GPUBuffer>>();
 
 type Qwen2PrefillProfileStep =
   | "embedding"
@@ -941,32 +944,7 @@ function tensorBuffer(runtime: WebGpuRuntime, tensor: TensorView): GPUBuffer {
 }
 
 function qwenTensorBuffer(runtime: WebGpuRuntime, tensor: QwenTensorView): GPUBuffer {
-  if (isFloat32TensorView(tensor)) {
-    return createStaticStorageBuffer(runtime, tensor.data);
-  }
-  let buffersByRuntime = quantizedTensorGpuBuffers.get(tensor);
-  const existing = buffersByRuntime?.get(runtime);
-  if (existing) {
-    return existing;
-  }
-  const sourceBlockBytes = tensor.type === "q4_0" ? 18 : 34;
-  const destinationBlockBytes = tensor.type === "q4_0" ? 20 : 36;
-  const blockCount = tensor.data.byteLength / sourceBlockBytes;
-  const repacked = new Uint8Array(blockCount * destinationBlockBytes);
-  for (let block = 0; block < blockCount; block += 1) {
-    const sourceOffset = block * sourceBlockBytes;
-    const destinationOffset = block * destinationBlockBytes;
-    repacked.set(tensor.data.subarray(sourceOffset, sourceOffset + 2), destinationOffset);
-    repacked.set(
-      tensor.data.subarray(sourceOffset + 2, sourceOffset + sourceBlockBytes),
-      destinationOffset + 4,
-    );
-  }
-  const buffer = createStorageBuffer(runtime, repacked);
-  buffersByRuntime ??= new WeakMap();
-  buffersByRuntime.set(runtime, buffer);
-  quantizedTensorGpuBuffers.set(tensor, buffersByRuntime);
-  return buffer;
+  return createStaticStorageBuffer(runtime, tensor.data);
 }
 
 function biasBuffer(
@@ -1261,12 +1239,11 @@ function encodeQwen2MatrixMultiplySequence(
   }
 
   const rowByteLength = quantizedRowByteLength(options.weight, options.inputSize);
-  const gemvDispatch = options.sequenceLength === 1
-    ? planQuantizedGemvDispatch(
-        options.outputSize,
-        runtime.device.limits.maxComputeWorkgroupsPerDimension,
-      )
-    : undefined;
+  const dispatch = planQuantizedMatrixDispatch(
+    options.outputSize,
+    options.sequenceLength,
+    runtime.device.limits.maxComputeWorkgroupsPerDimension,
+  );
   const params = paramsBuffer(
     context,
     runtime,
@@ -1279,17 +1256,12 @@ function encodeQwen2MatrixMultiplySequence(
       quantizedTypeCode(options.weight),
       resolvedBias.hasBias ? 1 : 0,
       options.outputBaseOffset ?? 0,
-      gemvDispatch?.rowsPerDispatch ?? 0,
     ]),
   );
   encodeComputeShader(
     runtime,
     context.encoder,
-    gemvDispatch
-      ? gemvDispatch.shader === "cooperative"
-        ? qwen2QuantizedMatrixVectorCooperativeShader
-        : qwen2QuantizedMatrixMultiplySequenceShader
-      : qwen2QuantizedMatrixMultiplyTiledShader,
+    qwen2QuantizedMatrixMultiplySequenceShader,
     [
       { binding: 0, resource: { buffer: qwenTensorBuffer(runtime, options.weight) } },
       { binding: 1, resource: { buffer: options.input } },
@@ -1297,9 +1269,7 @@ function encodeQwen2MatrixMultiplySequence(
       { binding: 3, resource: params },
       { binding: 4, resource: { buffer: options.output } },
     ],
-    gemvDispatch
-      ? gemvDispatch.workgroups
-      : [Math.ceil(options.outputSize / 8), Math.ceil(options.sequenceLength / 4)],
+    dispatch.workgroups,
   );
 }
 
@@ -1328,17 +1298,19 @@ function encodeQwen2QkvProjectionSequence(
   },
 ): boolean {
   validateQkvProjectionShapes(options);
-  // The fused sequence kernel maps one invocation to one output scalar. During
-  // decode, three cooperative GEMV dispatches expose much more parallelism for
-  // each dot product than that prefill-oriented layout.
-  if (
-    options.sequenceLength === 1 ||
-    options.sequenceLength > 1 ||
-    (options.qOutputBaseOffset ?? 0) !== 0 ||
-    (options.kOutputBaseOffset ?? 0) !== 0 ||
-    (options.vOutputBaseOffset ?? 0) !== 0 ||
-    !canFuseQwen2QkvProjection(options.qWeight, options.kWeight, options.vWeight)
-  ) {
+  // A single QKV dispatch avoids two pipeline launches whenever all three
+  // outputs start at zero. Offset writes into an f32 KV cache stay separate.
+  if (!shouldUseFusedQkvProjection({
+    sequenceLength: options.sequenceLength,
+    qOutputBaseOffset: options.qOutputBaseOffset,
+    kOutputBaseOffset: options.kOutputBaseOffset,
+    vOutputBaseOffset: options.vOutputBaseOffset,
+    weightsCompatible: canFuseQwen2QkvProjection(
+      options.qWeight,
+      options.kWeight,
+      options.vWeight,
+    ),
+  })) {
     encodeQwen2MatrixMultiplySequence(context, runtime, {
       input: options.input,
       inputBaseOffset: options.inputBaseOffset,
@@ -1623,9 +1595,41 @@ function encodeCausalGqaAttentionDecode(
   },
 ): void {
   if (options.headDimension !== 64) {
-    throw new Error(`split-KV decode requires Qwen2.5 headDimension 64, got ${options.headDimension}`);
+    throw new Error(`decode attention requires Qwen2.5 headDimension 64, got ${options.headDimension}`);
   }
   const tileSize = 256;
+  if (!shouldUseSplitAttentionDecode(options.position, tileSize)) {
+    const params = paramsBuffer(
+      context,
+      runtime,
+      new Uint32Array([
+        1,
+        options.hiddenSize,
+        options.numberOfHeads,
+        options.numberOfKeyValueHeads,
+        options.headDimension,
+        options.keyValueHiddenSize,
+        options.position,
+        0,
+      ]),
+    );
+    encodeComputeShader(
+      runtime,
+      context.encoder,
+      options.kvPrecision === "f16"
+        ? qwen2CausalGqaAttentionF16Shader
+        : qwen2CausalGqaAttentionShader,
+      [
+        { binding: 0, resource: { buffer: options.q } },
+        { binding: 1, resource: { buffer: options.k } },
+        { binding: 2, resource: { buffer: options.v } },
+        { binding: 3, resource: params },
+        { binding: 4, resource: { buffer: options.output } },
+      ],
+      [1, options.numberOfHeads],
+    );
+    return;
+  }
   const tileCount = Math.ceil((options.position + 1) / tileSize);
   const partialStats = context.decodeScratch?.attentionPartialStats ?? tempBuffer(
     context,
@@ -1879,7 +1883,7 @@ function quantizedRowByteLength(
   if (!Number.isInteger(inputSize) || inputSize <= 0 || inputSize % 32 !== 0) {
     throw new Error(`${tensor.type} length must be a positive multiple of 32, got ${inputSize}`);
   }
-  return tensor.type === "q4_0" ? (inputSize / 32) * 20 : (inputSize / 32) * 36;
+  return tensor.type === "q4_0" ? (inputSize / 32) * 18 : (inputSize / 32) * 34;
 }
 
 function quantizedTypeCode(tensor: Exclude<QwenTensorView, TensorView>): number {
@@ -2151,15 +2155,15 @@ fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
   let rowOffset = tokenId * params.rowByteLength;
   let block = dimension / 32u;
   let blockIndex = dimension % 32u;
-  let blockOffset = rowOffset + block * select(20u, 36u, params.quantType == 8u);
-  let scale = unpack2x16float(words[blockOffset / 4u]).x;
+  let blockOffset = rowOffset + block * select(18u, 34u, params.quantType == 8u);
+  let scale = f16ToF32(byteAt(blockOffset), byteAt(blockOffset + 1u));
 
   if (params.quantType == 4u) {
-    let packed = byteAt(blockOffset + 4u + (blockIndex % 16u));
+    let packed = byteAt(blockOffset + 2u + (blockIndex % 16u));
     let quantized = select((packed >> 4u) & 0x0fu, packed & 0x0fu, blockIndex < 16u);
     output[index] = f32(i32(quantized) - 8) * scale;
   } else {
-    output[index] = signedByteAt(blockOffset + 4u + blockIndex) * scale;
+    output[index] = signedByteAt(blockOffset + 2u + blockIndex) * scale;
   }
 }
 `;
@@ -2339,8 +2343,8 @@ fn qDot(row: u32, inputOffset: u32) -> f32 {
   var sum = 0.0;
   var sourceOffset = row * params.rowByteLength;
   for (var base = 0u; base < params.inputSize; base = base + 32u) {
-    let scale = unpack2x16float(qWeightWords[sourceOffset / 4u]).x;
-    sourceOffset = sourceOffset + 4u;
+    let scale = f16ToF32(qByteAt(sourceOffset), qByteAt(sourceOffset + 1u));
+    sourceOffset = sourceOffset + 2u;
 
     if (params.quantType == 4u) {
       for (var packedIndex = 0u; packedIndex < 16u; packedIndex = packedIndex + 1u) {
@@ -2365,8 +2369,8 @@ fn kDot(row: u32, inputOffset: u32) -> f32 {
   var sum = 0.0;
   var sourceOffset = row * params.rowByteLength;
   for (var base = 0u; base < params.inputSize; base = base + 32u) {
-    let scale = unpack2x16float(kWeightWords[sourceOffset / 4u]).x;
-    sourceOffset = sourceOffset + 4u;
+    let scale = f16ToF32(kByteAt(sourceOffset), kByteAt(sourceOffset + 1u));
+    sourceOffset = sourceOffset + 2u;
 
     if (params.quantType == 4u) {
       for (var packedIndex = 0u; packedIndex < 16u; packedIndex = packedIndex + 1u) {
@@ -2391,8 +2395,8 @@ fn vDot(row: u32, inputOffset: u32) -> f32 {
   var sum = 0.0;
   var sourceOffset = row * params.rowByteLength;
   for (var base = 0u; base < params.inputSize; base = base + 32u) {
-    let scale = unpack2x16float(vWeightWords[sourceOffset / 4u]).x;
-    sourceOffset = sourceOffset + 4u;
+    let scale = f16ToF32(vByteAt(sourceOffset), vByteAt(sourceOffset + 1u));
+    sourceOffset = sourceOffset + 2u;
 
     if (params.quantType == 4u) {
       for (var packedIndex = 0u; packedIndex < 16u; packedIndex = packedIndex + 1u) {
@@ -2455,7 +2459,6 @@ struct Params {
   quantType: u32,
   hasBias: u32,
   outputBaseOffset: u32,
-  rowsPerDispatch: u32,
 }
 
 @group(0) @binding(0) var<storage, read> weightWords: array<u32>;
@@ -2513,8 +2516,8 @@ fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
   var sourceOffset = row * params.rowByteLength;
   let inputOffset = params.inputBaseOffset + position * params.inputSize;
   for (var base = 0u; base < params.inputSize; base = base + 32u) {
-    let scale = unpack2x16float(weightWords[sourceOffset / 4u]).x;
-    sourceOffset = sourceOffset + 4u;
+    let scale = f16ToF32(byteAt(sourceOffset), byteAt(sourceOffset + 1u));
+    sourceOffset = sourceOffset + 2u;
 
     if (params.quantType == 4u) {
       for (var packedIndex = 0u; packedIndex < 16u; packedIndex = packedIndex + 1u) {
@@ -2533,184 +2536,6 @@ fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
     }
   }
   output[params.outputBaseOffset + index] = sum;
-}
-`;
-
-const qwen2QuantizedMatrixMultiplyTiledShader = `
-struct Params {
-  inputSize: u32,
-  outputSize: u32,
-  sequenceLength: u32,
-  inputBaseOffset: u32,
-  rowByteLength: u32,
-  quantType: u32,
-  hasBias: u32,
-  outputBaseOffset: u32,
-}
-
-@group(0) @binding(0) var<storage, read> weightWords: array<u32>;
-@group(0) @binding(1) var<storage, read> input: array<f32>;
-@group(0) @binding(2) var<storage, read> bias: array<f32>;
-@group(0) @binding(3) var<uniform> params: Params;
-@group(0) @binding(4) var<storage, read_write> output: array<f32>;
-var<workgroup> inputTile: array<f32, 128>;
-
-fn byteAt(byteOffset: u32) -> u32 {
-  let word = weightWords[byteOffset / 4u];
-  let shift = (byteOffset % 4u) * 8u;
-  return (word >> shift) & 0xffu;
-}
-
-fn signedByte(value: u32) -> f32 {
-  return f32(select(i32(value), i32(value) - 256, value > 127u));
-}
-
-@compute @workgroup_size(32)
-fn main(
-  @builtin(local_invocation_id) localId: vec3<u32>,
-  @builtin(workgroup_id) workgroupId: vec3<u32>,
-) {
-  let lane = localId.x;
-  let tokenLocal = lane / 8u;
-  let rowLocal = lane % 8u;
-  let position = workgroupId.y * 4u + tokenLocal;
-  let row = workgroupId.x * 8u + rowLocal;
-  let valid = position < params.sequenceLength && row < params.outputSize;
-  let blockByteLength = select(36u, 20u, params.quantType == 4u);
-  let blockCount = params.inputSize / 32u;
-  var sum = 0.0;
-  if (valid && params.hasBias == 1u) {
-    sum = bias[row];
-  }
-
-  for (var block = 0u; block < blockCount; block = block + 1u) {
-    for (var tileIndex = lane; tileIndex < 128u; tileIndex = tileIndex + 32u) {
-      let loadToken = tileIndex / 32u;
-      let element = tileIndex % 32u;
-      let loadPosition = workgroupId.y * 4u + loadToken;
-      if (loadPosition < params.sequenceLength) {
-        inputTile[tileIndex] =
-          input[params.inputBaseOffset + loadPosition * params.inputSize + block * 32u + element];
-      } else {
-        inputTile[tileIndex] = 0.0;
-      }
-    }
-    workgroupBarrier();
-
-    if (valid) {
-      let sourceOffset = row * params.rowByteLength + block * blockByteLength;
-      let scale = unpack2x16float(weightWords[sourceOffset / 4u]).x;
-      if (params.quantType == 4u) {
-        for (var packedIndex = 0u; packedIndex < 16u; packedIndex = packedIndex + 1u) {
-          let packed = byteAt(sourceOffset + 4u + packedIndex);
-          sum = sum + f32(i32(packed & 0x0fu) - 8) * scale * inputTile[tokenLocal * 32u + packedIndex];
-          sum = sum + f32(i32((packed >> 4u) & 0x0fu) - 8) * scale * inputTile[tokenLocal * 32u + 16u + packedIndex];
-        }
-      } else {
-        for (var element = 0u; element < 32u; element = element + 1u) {
-          sum = sum + signedByte(byteAt(sourceOffset + 4u + element)) * scale * inputTile[tokenLocal * 32u + element];
-        }
-      }
-    }
-    workgroupBarrier();
-  }
-
-  if (valid) {
-    output[params.outputBaseOffset + position * params.outputSize + row] = sum;
-  }
-}
-`;
-
-const qwen2QuantizedMatrixVectorCooperativeShader = `
-struct Params {
-  inputSize: u32,
-  outputSize: u32,
-  sequenceLength: u32,
-  inputBaseOffset: u32,
-  rowByteLength: u32,
-  quantType: u32,
-  hasBias: u32,
-  outputBaseOffset: u32,
-  rowsPerDispatch: u32,
-}
-
-@group(0) @binding(0) var<storage, read> weightWords: array<u32>;
-@group(0) @binding(1) var<storage, read> input: array<f32>;
-@group(0) @binding(2) var<storage, read> bias: array<f32>;
-@group(0) @binding(3) var<uniform> params: Params;
-@group(0) @binding(4) var<storage, read_write> output: array<f32>;
-var<workgroup> partialSums: array<f32, 64>;
-
-fn byteAt(byteOffset: u32) -> u32 {
-  let word = weightWords[byteOffset / 4u];
-  let shift = (byteOffset % 4u) * 8u;
-  return (word >> shift) & 0xffu;
-}
-
-fn signedByte(value: u32) -> f32 {
-  return f32(select(i32(value), i32(value) - 256, value > 127u));
-}
-
-fn f16ToF32(lowByte: u32, highByte: u32) -> f32 {
-  let half = lowByte | (highByte << 8u);
-  let sign = select(1.0, -1.0, (half & 0x8000u) != 0u);
-  let exponent = (half >> 10u) & 0x1fu;
-  let fraction = half & 0x03ffu;
-  if (exponent == 0u) {
-    return select(sign * exp2(-14.0) * (f32(fraction) / 1024.0), sign * 0.0, fraction == 0u);
-  }
-  if (exponent == 0x1fu) {
-    return sign * 3.4028234663852886e38;
-  }
-  return sign * exp2(f32(i32(exponent) - 15)) * (1.0 + f32(fraction) / 1024.0);
-}
-
-@compute @workgroup_size(64)
-fn main(
-  @builtin(local_invocation_id) localId: vec3<u32>,
-  @builtin(workgroup_id) workgroupId: vec3<u32>,
-) {
-  let lane = localId.x;
-  let row = workgroupId.y * params.rowsPerDispatch + workgroupId.x;
-  if (row >= params.outputSize) {
-    return;
-  }
-
-  let blockByteLength = select(36u, 20u, params.quantType == 4u);
-  let blockCount = params.inputSize / 32u;
-  var localSum = 0.0;
-  for (var block = lane; block < blockCount; block = block + 64u) {
-    let sourceOffset = row * params.rowByteLength + block * blockByteLength;
-    let scale = unpack2x16float(weightWords[sourceOffset / 4u]).x;
-    let inputOffset = params.inputBaseOffset + block * 32u;
-    if (params.quantType == 4u) {
-      for (var packedIndex = 0u; packedIndex < 16u; packedIndex = packedIndex + 1u) {
-        let packed = byteAt(sourceOffset + 4u + packedIndex);
-        localSum = localSum + f32(i32(packed & 0x0fu) - 8) * scale * input[inputOffset + packedIndex];
-        localSum = localSum + f32(i32((packed >> 4u) & 0x0fu) - 8) * scale * input[inputOffset + 16u + packedIndex];
-      }
-    } else {
-      for (var element = 0u; element < 32u; element = element + 1u) {
-        localSum = localSum + signedByte(byteAt(sourceOffset + 4u + element)) * scale * input[inputOffset + element];
-      }
-    }
-  }
-
-  partialSums[lane] = localSum;
-  workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride = stride / 2u) {
-    if (lane < stride) {
-      partialSums[lane] = partialSums[lane] + partialSums[lane + stride];
-    }
-    workgroupBarrier();
-  }
-  if (lane == 0u) {
-    var result = partialSums[0];
-    if (params.hasBias == 1u) {
-      result = result + bias[row];
-    }
-    output[params.outputBaseOffset + row] = result;
-  }
 }
 `;
 
