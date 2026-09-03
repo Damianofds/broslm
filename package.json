@@ -39,6 +39,7 @@
     "build": "tsup && tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:webgpu:gemv": "node scripts/test-webgpu-quantized-gemv.mjs",
     "pack:check": "npm pack --dry-run",
     "pack:smoke": "npm run build && node scripts/package-smoke.mjs",
     "prepare": "npm run build"

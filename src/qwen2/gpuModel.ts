@@ -3,6 +3,7 @@ import { resetQwen2ModelKvCache } from "./attentionCache";
 import type { BroslmLogger } from "../logger";
 import type { LoadedQwen2Model, TensorView } from "./loader";
 import { isFloat32TensorView, type QwenTensorView } from "./quantizedTensor";
+import { planQuantizedGemvDispatch } from "./gpuDispatch";
 import { qwen2WebGpuPrefillSafetyError } from "./webgpuSafety";
 import {
   createStaticStorageBuffer,
@@ -1260,6 +1261,12 @@ function encodeQwen2MatrixMultiplySequence(
   }
 
   const rowByteLength = quantizedRowByteLength(options.weight, options.inputSize);
+  const gemvDispatch = options.sequenceLength === 1
+    ? planQuantizedGemvDispatch(
+        options.outputSize,
+        runtime.device.limits.maxComputeWorkgroupsPerDimension,
+      )
+    : undefined;
   const params = paramsBuffer(
     context,
     runtime,
@@ -1272,13 +1279,16 @@ function encodeQwen2MatrixMultiplySequence(
       quantizedTypeCode(options.weight),
       resolvedBias.hasBias ? 1 : 0,
       options.outputBaseOffset ?? 0,
+      gemvDispatch?.rowsPerDispatch ?? 0,
     ]),
   );
   encodeComputeShader(
     runtime,
     context.encoder,
-    options.sequenceLength === 1
-      ? qwen2QuantizedMatrixVectorCooperativeShader
+    gemvDispatch
+      ? gemvDispatch.shader === "cooperative"
+        ? qwen2QuantizedMatrixVectorCooperativeShader
+        : qwen2QuantizedMatrixMultiplySequenceShader
       : qwen2QuantizedMatrixMultiplyTiledShader,
     [
       { binding: 0, resource: { buffer: qwenTensorBuffer(runtime, options.weight) } },
@@ -1287,8 +1297,8 @@ function encodeQwen2MatrixMultiplySequence(
       { binding: 3, resource: params },
       { binding: 4, resource: { buffer: options.output } },
     ],
-    options.sequenceLength === 1
-      ? [options.outputSize]
+    gemvDispatch
+      ? gemvDispatch.workgroups
       : [Math.ceil(options.outputSize / 8), Math.ceil(options.sequenceLength / 4)],
   );
 }
@@ -2445,6 +2455,7 @@ struct Params {
   quantType: u32,
   hasBias: u32,
   outputBaseOffset: u32,
+  rowsPerDispatch: u32,
 }
 
 @group(0) @binding(0) var<storage, read> weightWords: array<u32>;
@@ -2620,6 +2631,7 @@ struct Params {
   quantType: u32,
   hasBias: u32,
   outputBaseOffset: u32,
+  rowsPerDispatch: u32,
 }
 
 @group(0) @binding(0) var<storage, read> weightWords: array<u32>;
@@ -2659,7 +2671,7 @@ fn main(
   @builtin(workgroup_id) workgroupId: vec3<u32>,
 ) {
   let lane = localId.x;
-  let row = workgroupId.x;
+  let row = workgroupId.y * params.rowsPerDispatch + workgroupId.x;
   if (row >= params.outputSize) {
     return;
   }

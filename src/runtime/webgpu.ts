@@ -343,14 +343,39 @@ export function encodeComputeShader(
   constants?: Record<string, number>,
 ): void {
   ensureWebGpuRuntimeInstrumentation(runtime);
+  const dispatchDimensions = validateComputeDispatchDimensions(runtime.device, workgroups);
   const pipeline = getCachedComputePipeline(runtime, shaderCode, constants);
   const bindGroup = getCachedBindGroup(runtime, pipeline, entries);
   const pass = encoder.beginComputePass();
   runtime.diagnostics.computePassesEncoded += 1;
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, bindGroup);
-  pass.dispatchWorkgroups(workgroups[0], workgroups[1] ?? 1, workgroups[2] ?? 1);
+  pass.dispatchWorkgroups(...dispatchDimensions);
   pass.end();
+}
+
+function validateComputeDispatchDimensions(
+  device: GPUDevice,
+  workgroups: readonly [number, number?, number?],
+): [number, number, number] {
+  const dimensions: [number, number, number] = [
+    workgroups[0],
+    workgroups[1] ?? 1,
+    workgroups[2] ?? 1,
+  ];
+  const limit = device.limits.maxComputeWorkgroupsPerDimension;
+  if (
+    dimensions.some(
+      (dimension) =>
+        !Number.isInteger(dimension) || dimension <= 0 || dimension > limit,
+    )
+  ) {
+    throw new RangeError(
+      `Invalid WebGPU compute dispatch [${dimensions.join(", ")}]: every dimension must be ` +
+        `a positive integer no greater than maxComputeWorkgroupsPerDimension (${limit}).`,
+    );
+  }
+  return dimensions;
 }
 
 function getCachedBindGroup(

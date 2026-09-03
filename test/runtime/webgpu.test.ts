@@ -3,6 +3,7 @@ import {
   createWebGpuRuntime,
   createStaticStorageBuffer,
   detectWebGpuSupport,
+  encodeComputeShader,
   isWebGpuApiAvailable,
   runComputeShader,
 } from "../../src/runtime/webgpu";
@@ -195,6 +196,9 @@ describe("compute pipeline cache", () => {
       backend: "webgpu",
       adapter: {},
       device: {
+        limits: {
+          maxComputeWorkgroupsPerDimension: 65_535,
+        },
         createShaderModule,
         createComputePipeline,
         createBindGroup: vi.fn().mockReturnValue({}),
@@ -213,10 +217,50 @@ describe("compute pipeline cache", () => {
     const shader = "@compute @workgroup_size(1) fn main() {}";
 
     await runComputeShader(runtime, shader, [], [1]);
-    await runComputeShader(runtime, shader, [], [1]);
+    await runComputeShader(runtime, shader, [], [65_535, 2, 3]);
 
     expect(createShaderModule).toHaveBeenCalledOnce();
     expect(createComputePipeline).toHaveBeenCalledOnce();
     expect(pass.dispatchWorkgroups).toHaveBeenCalledTimes(2);
+    expect(pass.dispatchWorkgroups).toHaveBeenLastCalledWith(65_535, 2, 3);
   });
 });
+
+describe("compute dispatch validation", () => {
+  const shader = "@compute @workgroup_size(1) fn main() {}";
+  const limit = 65_535;
+
+  it.each<[readonly [number, number?, number?], string]>([
+    [[0], "[0, 1, 1]"],
+    [[1, 0], "[1, 0, 1]"],
+    [[1, 1, 0], "[1, 1, 0]"],
+    [[1.5], "[1.5, 1, 1]"],
+    [[1, 2.5], "[1, 2.5, 1]"],
+    [[limit + 1], `[${limit + 1}, 1, 1]`],
+    [[1, limit + 1], `[1, ${limit + 1}, 1]`],
+    [[1, 1, limit + 1], `[1, 1, ${limit + 1}]`],
+  ])("rejects invalid dispatch dimensions %s", (workgroups, requestedDimensions) => {
+    const runtime = {
+      backend: "webgpu",
+      device: {
+        limits: {
+          maxComputeWorkgroupsPerDimension: limit,
+        },
+      },
+    } as unknown as Parameters<typeof encodeComputeShader>[0];
+
+    expect(() =>
+      encodeComputeShader(
+        runtime,
+        {} as GPUCommandEncoder,
+        shader,
+        [],
+        workgroups,
+      )
+    ).toThrow(new RegExp(`${escapeRegExp(requestedDimensions)}.*${limit}`));
+  });
+});
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
