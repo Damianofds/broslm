@@ -3,6 +3,12 @@ export interface ByteLevelBpeTokenizer {
   eosTokenId: number | null;
   encode(text: string): number[];
   decode(tokenIds: readonly number[]): string;
+  createIncrementalDecoder(): ByteLevelBpeIncrementalDecoder;
+}
+
+export interface ByteLevelBpeIncrementalDecoder {
+  push(tokenId: number): string;
+  finish(): string;
 }
 
 export interface AddedTokenizerToken {
@@ -50,7 +56,6 @@ const GGUF_TOKEN_TYPE_CONTROL = 3;
 const GGUF_TOKEN_TYPE_USER_DEFINED = 4;
 
 const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder("utf-8", { fatal: false });
 
 export async function loadByteLevelBpeTokenizer(
   tokenizerUrl: string,
@@ -135,35 +140,22 @@ export function createByteLevelBpeTokenizerFromParts(
     return tokenIds;
   }
 
-  function decode(tokenIds: readonly number[]): string {
-    const bytes: number[] = [];
-    let decoded = "";
-    const flushBytes = () => {
-      if (bytes.length === 0) {
-        return;
-      }
-      decoded += textDecoder.decode(new Uint8Array(bytes));
-      bytes.length = 0;
-    };
-
-    for (const tokenId of tokenIds) {
+  function tokenContent(tokenId: number): { special?: string; bytes?: Uint8Array } {
       const token = idToToken[tokenId];
       if (token === undefined) {
         throw new RangeError(`Unknown token id: ${tokenId}`);
       }
 
       if (specialTokenContents.has(token)) {
-        flushBytes();
-        decoded += token;
-        continue;
+        return { special: token };
       }
 
       const fallbackByte = parseByteFallbackToken(token);
       if (fallbackByte !== null) {
-        bytes.push(fallbackByte);
-        continue;
+        return { bytes: Uint8Array.of(fallbackByte) };
       }
 
+      const bytes: number[] = [];
       for (const character of Array.from(token)) {
         const byte = byteDecoder.get(character);
         if (byte === undefined) {
@@ -171,10 +163,32 @@ export function createByteLevelBpeTokenizerFromParts(
         }
         bytes.push(byte);
       }
-    }
+      return { bytes: Uint8Array.from(bytes) };
+  }
 
-    flushBytes();
-    return decoded;
+  function createIncrementalDecoder(): ByteLevelBpeIncrementalDecoder {
+    const decoder = new TextDecoder("utf-8", { fatal: false });
+    return {
+      push(tokenId: number): string {
+        const content = tokenContent(tokenId);
+        if (content.special !== undefined) {
+          return decoder.decode() + content.special;
+        }
+        return decoder.decode(content.bytes, { stream: true });
+      },
+      finish(): string {
+        return decoder.decode();
+      },
+    };
+  }
+
+  function decode(tokenIds: readonly number[]): string {
+    const decoder = createIncrementalDecoder();
+    let decoded = "";
+    for (const tokenId of tokenIds) {
+      decoded += decoder.push(tokenId);
+    }
+    return decoded + decoder.finish();
   }
 
   return {
@@ -182,6 +196,7 @@ export function createByteLevelBpeTokenizerFromParts(
     eosTokenId: parts.eosTokenId ?? null,
     encode,
     decode,
+    createIncrementalDecoder,
   };
 }
 

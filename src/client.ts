@@ -2,14 +2,14 @@ import { BroslmError } from "./errors";
 import type { BroslmEnvironment } from "./environment";
 import { createBroslmLogger, type BroslmLogger, type BroslmLogLevel } from "./logger";
 import { modelCatalog, type ModelId } from "./models";
-import { allocateQwen2ModelKvCache, resetQwen2ModelKvCache, type Qwen2ModelKvCache } from "./qwen2/attentionCache";
+import { allocateQwen2ModelKvCache, type Qwen2ModelKvCache } from "./qwen2/attentionCache";
 import type { GgufTensorInfo } from "./qwen2/gguf";
 import {
   loadQwen2Model,
   type LoadedQwen2Model,
   type Qwen2LoaderProgress,
 } from "./qwen2/loader";
-import { qwen2NextTokenWithCacheGpu } from "./qwen2/model";
+import { qwen2DecodeNextTokenGpu, qwen2PrefillNextTokenGpu } from "./qwen2/model";
 import { formatQwen2Prompt } from "./qwen2/chat";
 import { createQwen2TokenizerFromGgufMetadata } from "./qwen2/tokenizer";
 import {
@@ -21,11 +21,13 @@ import {
   createWebGpuRuntime,
   destroyWebGpuRuntime,
   detectWebGpuSupport,
+  snapshotWebGpuRuntimeDiagnostics,
   type WebGpuRuntime,
 } from "./runtime/webgpu";
 import type { ByteLevelBpeTokenizer } from "./tokenizer";
 import type {
   BroslmState,
+  BroslmDiagnostics,
   ChatMessage,
   GenerationChunk,
   GenerationFinishReason,
@@ -45,6 +47,7 @@ export interface BroslmOptions {
 export interface Broslm {
   readonly state: BroslmState;
   readonly loadedModel: LoadedModelSummary | null;
+  readonly diagnostics: BroslmDiagnostics;
   checkModelSupport(modelId: ModelId): Promise<ModelSupport>;
   loadModel(modelId: ModelId, options?: LoadModelOptions): Promise<LoadedModelSummary>;
   countPromptTokens(prompt: string): number;
@@ -60,8 +63,8 @@ export interface BroslmClientDependencies {
   loadQwen2Model: typeof loadQwen2Model;
   createTokenizer: typeof createQwen2TokenizerFromGgufMetadata;
   allocateCache: typeof allocateQwen2ModelKvCache;
-  resetCache: typeof resetQwen2ModelKvCache;
-  nextToken: typeof qwen2NextTokenWithCacheGpu;
+  prefill: typeof qwen2PrefillNextTokenGpu;
+  decodeToken: typeof qwen2DecodeNextTokenGpu;
   detectWebGpuSupport: typeof detectWebGpuSupport;
   createWebGpuRuntime: typeof createWebGpuRuntime;
   destroyWebGpuRuntime: typeof destroyWebGpuRuntime;
@@ -71,8 +74,8 @@ const defaultDependencies: BroslmClientDependencies = {
   loadQwen2Model,
   createTokenizer: createQwen2TokenizerFromGgufMetadata,
   allocateCache: allocateQwen2ModelKvCache,
-  resetCache: resetQwen2ModelKvCache,
-  nextToken: qwen2NextTokenWithCacheGpu,
+  prefill: qwen2PrefillNextTokenGpu,
+  decodeToken: qwen2DecodeNextTokenGpu,
   detectWebGpuSupport,
   createWebGpuRuntime,
   destroyWebGpuRuntime,
@@ -112,6 +115,12 @@ class DefaultBroslmClient implements Broslm {
 
   get loadedModel(): LoadedModelSummary | null {
     return this.summary;
+  }
+
+  get diagnostics(): BroslmDiagnostics {
+    return {
+      runtime: this.runtime ? snapshotWebGpuRuntimeDiagnostics(this.runtime) : null,
+    };
   }
 
   async checkModelSupport(modelId: ModelId): Promise<ModelSupport> {
@@ -306,7 +315,6 @@ class DefaultBroslmClient implements Broslm {
       throw new BroslmError("INVALID_ARGUMENT", "The model context has no room for generated tokens.");
     }
 
-    this.dependencies.resetCache(cache);
     this.emit({
       type: "generation-started",
       modelId,
@@ -315,8 +323,8 @@ class DefaultBroslmClient implements Broslm {
       maxTokens: targetTokens,
     });
 
-    const nextInputIds = [...inputIds];
     const generatedTokenIds: number[] = [];
+    const incrementalDecoder = tokenizer.createIncrementalDecoder();
     let generatedText = "";
     let finishReason: GenerationFinishReason = "max_tokens";
     let completed = false;
@@ -331,17 +339,27 @@ class DefaultBroslmClient implements Broslm {
         if (!runtime) {
           throw new BroslmError("BACKEND_UNAVAILABLE", "The WebGPU runtime is not initialized.");
         }
-        const result = await this.dependencies.nextToken(
-          model,
-          nextInputIds,
-          cache,
-          runtime,
-          this.logger,
-          {
-            temperature: options.temperature ?? 0.95,
-            topK: options.topK ?? 10,
-          },
-        );
+        const samplingOptions = {
+          temperature: options.temperature ?? 0.95,
+          topK: options.topK ?? 10,
+        };
+        const previousTokenId = generatedTokenIds[generatedTokenIds.length - 1];
+        const result = tokenIndex === 0
+          ? await this.dependencies.prefill(
+              model,
+              inputIds,
+              cache,
+              runtime,
+              this.logger,
+              samplingOptions,
+            )
+          : await this.dependencies.decodeToken(
+              model,
+              previousTokenId ?? model.config.eosTokenId,
+              cache,
+              runtime,
+              samplingOptions,
+            );
         throwIfAborted(controller.signal);
         const performance = createPerformance(phase, profiledTokenCount, nowMs() - tokenStartedAt);
         this.emit({
@@ -357,16 +375,22 @@ class DefaultBroslmClient implements Broslm {
           break;
         }
 
-        nextInputIds.push(result.tokenId);
         generatedTokenIds.push(result.tokenId);
-        generatedText = visibleGeneratedText(tokenizer.decode(generatedTokenIds));
+        const delta = visibleGeneratedDelta(
+          incrementalDecoder.push(result.tokenId),
+          generatedText,
+        );
+        generatedText += delta;
         yield {
           tokenId: result.tokenId,
           tokenIndex,
-          text: generatedText,
+          delta,
+          text: delta,
           performance,
         };
       }
+
+      generatedText += visibleGeneratedDelta(incrementalDecoder.finish(), generatedText);
 
       const elapsedMs = nowMs() - startedAt;
       this.lastGenerationResult = {
@@ -551,8 +575,15 @@ function requireModelDescriptor(modelId: ModelId) {
   return descriptor;
 }
 
-function visibleGeneratedText(decodedText: string): string {
-  return decodedText.replace(/<\|[^|]+?\|>/g, "").replace(/\r\n?/g, "\n").replace(/\n+/g, "\n");
+function visibleGeneratedDelta(decodedText: string, existingText: string): string {
+  let delta = decodedText
+    .replace(/<\|[^|]+?\|>/g, "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/\n+/g, "\n");
+  if (existingText.endsWith("\n")) {
+    delta = delta.replace(/^\n+/, "");
+  }
+  return delta;
 }
 
 function resolveMaximumNewTokens(value: number | undefined): number {

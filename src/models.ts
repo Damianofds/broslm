@@ -24,7 +24,7 @@ export const modelCatalog: Readonly<Record<ModelId, ModelDescriptor>> = Object.f
     backend: "webgpu",
     source:
       "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_0.gguf",
-    minimumStorageBufferBindingSize: 144_643_072,
+    minimumStorageBufferBindingSize: 153_151_488,
   }),
 });
 

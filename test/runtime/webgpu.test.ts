@@ -107,6 +107,27 @@ describe("WebGPU runtime detection", () => {
     });
   });
 
+  it("enables shader-f16 when the adapter supports it", async () => {
+    const requestDevice = vi.fn().mockResolvedValue({ destroy: vi.fn() });
+    const navigatorWithGpu = {
+      gpu: {
+        requestAdapter: vi.fn().mockResolvedValue({
+          features: new Set(["shader-f16"]),
+          limits: {
+            maxBufferSize: 268_435_456,
+            maxStorageBufferBindingSize: 2_147_483_644,
+          },
+          requestDevice,
+        }),
+      },
+    } as unknown as Navigator;
+
+    const runtime = await createWebGpuRuntime(navigatorWithGpu);
+
+    expect(requestDevice).toHaveBeenCalledWith({ requiredFeatures: ["shader-f16"] });
+    expect(runtime.shaderF16).toBe(true);
+  });
+
   it("rejects runtime creation when the adapter storage binding limit is too low", async () => {
     const navigatorWithGpu = {
       gpu: {

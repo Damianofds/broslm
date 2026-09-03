@@ -51,6 +51,44 @@ export function sampleTokenFromLogits(
   return candidates[candidates.length - 1]?.tokenId ?? 0;
 }
 
+export function sampleTokenFromCandidates(
+  tokenIds: Uint32Array,
+  logits: Float32Array,
+  options: SamplingOptions = {},
+): number {
+  if (tokenIds.length === 0 || tokenIds.length !== logits.length) {
+    throw new Error("sampleTokenFromCandidates requires matching non-empty candidate arrays");
+  }
+  const temperature = options.temperature ?? 0;
+  if (!Number.isFinite(temperature) || temperature <= 0 || tokenIds.length === 1) {
+    return tokenIds[0] ?? 0;
+  }
+
+  const scale = 1 / temperature;
+  const maximum = logits[0] ?? 0;
+  const weights = new Float64Array(logits.length);
+  let totalWeight = 0;
+  for (let index = 0; index < logits.length; index += 1) {
+    const weight = Math.exp(((logits[index] ?? 0) - maximum) * scale);
+    weights[index] = weight;
+    totalWeight += weight;
+  }
+  if (!Number.isFinite(totalWeight) || totalWeight <= 0) {
+    return tokenIds[0] ?? 0;
+  }
+
+  const random = options.random ?? Math.random;
+  const sample = Math.max(0, Math.min(0.999999999999, random())) * totalWeight;
+  let cumulative = 0;
+  for (let index = 0; index < weights.length; index += 1) {
+    cumulative += weights[index] ?? 0;
+    if (sample < cumulative) {
+      return tokenIds[index] ?? tokenIds[0] ?? 0;
+    }
+  }
+  return tokenIds[tokenIds.length - 1] ?? 0;
+}
+
 function clampTopK(topK: number, vocabularySize: number): number {
   if (!Number.isFinite(topK)) {
     return 1;

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>broSLM WebGPU benchmark</title>
+    <style>
+      body { font: 14px/1.45 system-ui, sans-serif; margin: 2rem auto; max-width: 960px; padding: 0 1rem; }
+      button { font: inherit; padding: .6rem 1rem; }
+      pre { background: #111; color: #ddd; min-height: 24rem; overflow: auto; padding: 1rem; }
+    </style>
+  </head>
+  <body>
+    <h1>broSLM WebGPU benchmark</h1>
+    <p>Build the package, serve the repository over HTTP, then run this page on the reference browser/GPU.</p>
+    <button id="run">Run benchmark</button>
+    <pre id="output"></pre>
+    <script type="module" src="./benchmark.js"></script>
+  </body>
+</html>

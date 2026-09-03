@@ -1,4 +1,5 @@
 import type { InferenceBackend, ModelId } from "./models";
+import type { WebGpuRuntimeDiagnostics } from "./runtime/webgpu";
 
 export type BroslmState = "idle" | "loading" | "ready" | "generating" | "error" | "disposed";
 export type GenerationPhase = "prefill" | "decode";
@@ -72,6 +73,7 @@ export interface GenerationPerformance {
 export interface GenerationChunk {
   tokenId: number;
   tokenIndex: number;
+  delta: string;
   text: string;
   performance: GenerationPerformance;
 }
@@ -82,4 +84,8 @@ export interface GenerationResult {
   inputTokenCount: number;
   finishReason: GenerationFinishReason;
   elapsedMs: number;
+}
+
+export interface BroslmDiagnostics {
+  runtime: Readonly<WebGpuRuntimeDiagnostics> | null;
 }

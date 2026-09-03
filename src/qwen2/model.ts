@@ -1,23 +1,22 @@
 import type { BroslmLogger } from "../logger";
-import { sampleTokenFromLogits, type SamplingOptions } from "../sampling";
+import { sampleTokenFromCandidates, type SamplingOptions } from "../sampling";
 import type { WebGpuRuntime } from "../runtime/webgpu";
-import {
-  cachePrefixMatches,
-  type Qwen2ModelKvCache,
-} from "./attentionCache";
+import { cachePrefixMatches, type Qwen2ModelKvCache } from "./attentionCache";
 import {
   hasQwen2ResidentGpuCache,
   qwen2DecodeTokenLogitsResidentGpu,
   qwen2PrefillLogitsResidentGpu,
+  type Qwen2GpuTopKResult,
 } from "./gpuModel";
 import type { LoadedQwen2Model } from "./loader";
+import { qwen2WebGpuSafetyLimits } from "./webgpuSafety";
 
 export interface NextQwen2TokenResult {
   tokenId: number;
   logits: Float32Array;
 }
 
-export async function qwen2NextTokenWithCacheGpu(
+export async function qwen2PrefillNextTokenGpu(
   model: LoadedQwen2Model,
   inputIds: readonly number[],
   cache: Qwen2ModelKvCache,
@@ -33,26 +32,126 @@ export async function qwen2NextTokenWithCacheGpu(
     );
   }
 
-  let logits: Float32Array;
-  if (
-    !cachePrefixMatches(cache.inputIds, inputIds) ||
-    cache.inputIds.length === inputIds.length ||
-    !hasQwen2ResidentGpuCache(model, cache, runtime)
-  ) {
-    logits = await qwen2PrefillLogitsResidentGpu(model, inputIds, cache, runtime, logger);
+  const topK = resolveTopK(options.topK);
+  let candidates: Qwen2GpuTopKResult | null = null;
+  const reusablePrefix =
+    cache.inputIds.length > 0 &&
+    cache.inputIds.length < inputIds.length &&
+    cachePrefixMatches(cache.inputIds, inputIds) &&
+    hasQwen2ResidentGpuCache(model, cache, runtime);
+
+  if (reusablePrefix) {
+    for (
+      let position = cache.inputIds.length;
+      position < inputIds.length;
+      position += qwen2WebGpuSafetyLimits.prefillChunkTokens
+    ) {
+      const chunk = inputIds.slice(
+        position,
+        Math.min(inputIds.length, position + qwen2WebGpuSafetyLimits.prefillChunkTokens),
+      );
+      const isFinalChunk = position + chunk.length === inputIds.length;
+      candidates = await qwen2PrefillLogitsResidentGpu(
+        model,
+        chunk,
+        cache,
+        runtime,
+        logger,
+        isFinalChunk ? topK : null,
+        position,
+      );
+      logPrefillProgress(logger, position + chunk.length, inputIds.length);
+    }
   } else {
-    logits = new Float32Array(model.config.vocabularySize);
-    for (let position = cache.inputIds.length; position < inputIds.length; position += 1) {
-      const tokenId = inputIds[position] ?? 0;
-      logits = await qwen2DecodeTokenLogitsResidentGpu(model, tokenId, position, cache, runtime);
-      cache.inputIds.push(tokenId);
+    const chunkLength = Math.min(inputIds.length, qwen2WebGpuSafetyLimits.prefillChunkTokens);
+    const firstChunk = inputIds.slice(0, chunkLength);
+    candidates = await qwen2PrefillLogitsResidentGpu(
+      model,
+      firstChunk,
+      cache,
+      runtime,
+      logger,
+      chunkLength === inputIds.length ? topK : null,
+    );
+    logPrefillProgress(logger, chunkLength, inputIds.length);
+
+    for (
+      let position = chunkLength;
+      position < inputIds.length;
+      position += qwen2WebGpuSafetyLimits.prefillChunkTokens
+    ) {
+      const chunk = inputIds.slice(
+        position,
+        Math.min(inputIds.length, position + qwen2WebGpuSafetyLimits.prefillChunkTokens),
+      );
+      const isFinalChunk = position + chunk.length === inputIds.length;
+      candidates = await qwen2PrefillLogitsResidentGpu(
+        model,
+        chunk,
+        cache,
+        runtime,
+        logger,
+        isFinalChunk ? topK : null,
+        position,
+      );
+      logPrefillProgress(logger, position + chunk.length, inputIds.length);
     }
   }
+  return sampleCandidates(requireCandidates(candidates), options);
+}
 
+export async function qwen2DecodeNextTokenGpu(
+  model: LoadedQwen2Model,
+  previousTokenId: number,
+  cache: Qwen2ModelKvCache,
+  runtime: WebGpuRuntime,
+  options: SamplingOptions = {},
+): Promise<NextQwen2TokenResult> {
+  validateQwen2ModelKvCache(model, cache);
+  validateTokenId(model, previousTokenId, "previousTokenId");
+  const position = cache.inputIds.length;
+  if (position >= cache.maximumSequenceLength) {
+    throw new Error(`decode position ${position} exceeds the cache capacity`);
+  }
+  const candidates = await qwen2DecodeTokenLogitsResidentGpu(
+    model,
+    previousTokenId,
+    position,
+    cache,
+    runtime,
+    resolveTopK(options.topK),
+  );
+  cache.inputIds.push(previousTokenId);
+  return sampleCandidates(requireCandidates(candidates), options);
+}
+
+export const qwen2NextTokenWithCacheGpu = qwen2PrefillNextTokenGpu;
+
+function sampleCandidates(
+  candidates: Qwen2GpuTopKResult,
+  options: SamplingOptions,
+): NextQwen2TokenResult {
   return {
-    tokenId: sampleTokenFromLogits(logits, options),
-    logits,
+    tokenId: sampleTokenFromCandidates(candidates.tokenIds, candidates.logits, options),
+    logits: candidates.logits,
   };
+}
+
+function requireCandidates(candidates: Qwen2GpuTopKResult | null): Qwen2GpuTopKResult {
+  if (!candidates) {
+    throw new Error("Qwen2 WebGPU prefill completed without producing sampling candidates");
+  }
+  return candidates;
+}
+
+function logPrefillProgress(logger: BroslmLogger, processedTokens: number, totalTokens: number): void {
+  if (processedTokens === totalTokens || processedTokens % 256 === 0) {
+    logger.debug("webgpu-prefill-progress", { processedTokens, totalTokens });
+  }
+}
+
+function resolveTopK(value: number | undefined): number {
+  return Math.max(1, Math.min(64, Math.round(value ?? 1)));
 }
 
 function validateQwen2ModelKvCache(
@@ -88,14 +187,24 @@ function validateInputIds(model: LoadedQwen2Model, inputIds: readonly number[]):
         `${model.config.maximumSequenceLength}`,
     );
   }
-
   for (let index = 0; index < inputIds.length; index += 1) {
-    const tokenId = inputIds[index];
-    if (!Number.isInteger(tokenId) || tokenId < 0 || tokenId >= model.config.vocabularySize) {
-      throw new RangeError(
-        `inputIds[${index}] must be an integer in [0, ${model.config.vocabularySize}), ` +
-          `got ${String(tokenId)}`,
-      );
-    }
+    validateTokenId(model, inputIds[index], `inputIds[${index}]`);
+  }
+}
+
+function validateTokenId(
+  model: LoadedQwen2Model,
+  tokenId: number | undefined,
+  name: string,
+): asserts tokenId is number {
+  if (
+    typeof tokenId !== "number" ||
+    !Number.isInteger(tokenId) ||
+    tokenId < 0 ||
+    tokenId >= model.config.vocabularySize
+  ) {
+    throw new RangeError(
+      `${name} must be an integer in [0, ${model.config.vocabularySize}), got ${String(tokenId)}`,
+    );
   }
 }

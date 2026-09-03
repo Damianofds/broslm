@@ -30,4 +30,20 @@ describe("ByteLevel BPE tokenizer", () => {
     expect(tokenIds).toEqual([0, 1]);
     expect(qwenTokenizer.decode(tokenIds)).toBe("é");
   });
+
+  it("streams UTF-8 only after a complete multi-token code point is available", () => {
+    const qwenTokenizer = createQwen2ByteLevelBpeTokenizer({
+      tokens: ["<0xF0>", "<0x9F>", "<0x98>", "<0x80>"],
+      merges: [],
+      tokenTypes: [6, 6, 6, 6],
+      eosTokenId: null,
+    });
+    const decoder = qwenTokenizer.createIncrementalDecoder();
+
+    expect(decoder.push(0)).toBe("");
+    expect(decoder.push(1)).toBe("");
+    expect(decoder.push(2)).toBe("");
+    expect(decoder.push(3)).toBe("😀");
+    expect(decoder.finish()).toBe("");
+  });
 });

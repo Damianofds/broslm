@@ -7,7 +7,7 @@ The browser testbed lives in [Damianofds/broslm-fe-testbed](https://github.com/D
 ## Requirements
 
 - A browser with WebGPU support and a compatible GPU adapter.
-- `maxStorageBufferBindingSize` of at least 144,643,072 bytes.
+- `maxStorageBufferBindingSize` of at least 153,151,488 bytes.
 - A Web Worker is strongly recommended so inference does not block the UI thread.
 
 broSLM has no CPU fallback and does not support server-side or Node.js inference.
@@ -38,13 +38,13 @@ for await (const update of broslm.stream("Explain grouped-query attention.", {
   temperature: 0.95,
   topK: 10,
 })) {
-  console.log(update.text);
+  console.log(update.delta);
 }
 
 broslm.dispose();
 ```
 
-Use `generate` instead of `stream` when only the completed result is needed. Loading and generation accept an `AbortSignal`.
+Use `generate` instead of `stream` when only the completed result is needed. Stream chunks expose text deltas through both `delta` and `text`; consumers should append them. Loading and generation accept an `AbortSignal`.
 
 Prompts can also be structured as Qwen ChatML conversations. The final message must be from the user.
 
@@ -90,6 +90,11 @@ npm run pack:smoke
 ```
 
 The published package is ESM-only and exposes a single browser runtime.
+
+For GPU performance work, build the package and serve the repository as static files, then open
+`benchmark/index.html`. The benchmark reports TTFT, prefill and decode throughput, p50/p95 decode
+latency, allocation/readback counters, adapter features and peak tracked GPU-buffer memory through
+contexts up to 32,752 cached tokens.
 
 ## License
 

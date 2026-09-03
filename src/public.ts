@@ -10,6 +10,7 @@ export {
 } from "./models";
 export type {
   BroslmState,
+  BroslmDiagnostics,
   ChatMessage,
   ChatRole,
   GenerationChunk,
@@ -25,4 +26,5 @@ export type {
   TensorSummary,
   WebGpuLimitSummary,
 } from "./types";
+export type { WebGpuRuntimeDiagnostics } from "./runtime/webgpu";
 export type { Broslm, BroslmOptions } from "./client";

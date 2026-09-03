@@ -7,9 +7,11 @@ import { qwen2WebGpuPrefillSafetyError } from "./webgpuSafety";
 import {
   createStaticStorageBuffer,
   createStorageBuffer,
+  clearWebGpuBindGroupCache,
   destroyBuffers,
   encodeComputeShader,
-  readFloat32Buffer,
+  readMappedGpuBuffer,
+  submitWebGpuCommands,
   type WebGpuRuntime,
   webGpuBufferUsage,
 } from "../runtime/webgpu";
@@ -18,6 +20,36 @@ interface ResidentQwen2GpuContext {
   temps: GPUBuffer[];
   encoder: GPUCommandEncoder;
   dummyBias: GPUBuffer;
+  uniformArena?: GPUBuffer;
+  uniformOffset: number;
+  decodeScratch?: ResidentQwen2GpuDecodeScratch;
+}
+
+interface ResidentQwen2GpuDecodeScratch {
+  tokenId: GPUBuffer;
+  hiddenA: GPUBuffer;
+  hiddenB: GPUBuffer;
+  normed: GPUBuffer;
+  q: GPUBuffer;
+  k: GPUBuffer;
+  v: GPUBuffer;
+  attentionOutput: GPUBuffer;
+  gate: GPUBuffer;
+  up: GPUBuffer;
+  gated: GPUBuffer;
+  mlpOutput: GPUBuffer;
+  finalHidden: GPUBuffer;
+  logits: GPUBuffer;
+  attentionPartialStats: GPUBuffer;
+  attentionPartialValues: GPUBuffer;
+  topKLocalIds: GPUBuffer;
+  topKLocalLogits: GPUBuffer;
+  topKIds: GPUBuffer;
+  topKLogits: GPUBuffer;
+  topKReadback: GPUBuffer;
+  dummyBias: GPUBuffer;
+  uniformArena: GPUBuffer;
+  buffers: GPUBuffer[];
 }
 
 interface ResidentQwen2GpuLayerCache {
@@ -33,12 +65,22 @@ interface ResidentQwen2GpuModelCache {
   keyValueHiddenSize: number;
   inputIds: number[];
   layers: ResidentQwen2GpuLayerCache[];
+  ropeTable: GPUBuffer;
+  kvPrecision: "f16" | "f32";
+  decodeScratch: ResidentQwen2GpuDecodeScratch;
+}
+
+export interface Qwen2GpuTopKResult {
+  tokenIds: Uint32Array;
+  logits: Float32Array;
 }
 
 const residentQwen2GpuCacheByMetadata = new WeakMap<
   Qwen2ModelKvCache,
   ResidentQwen2GpuModelCache
 >();
+const qkvBiasDataByQueryBias = new WeakMap<object, Float32Array>();
+const quantizedTensorGpuBuffers = new WeakMap<object, WeakMap<WebGpuRuntime, GPUBuffer>>();
 
 type Qwen2PrefillProfileStep =
   | "embedding"
@@ -72,19 +114,32 @@ export async function qwen2PrefillLogitsResidentGpu(
   cache: Qwen2ModelKvCache,
   runtime: WebGpuRuntime,
   logger: BroslmLogger,
-): Promise<Float32Array> {
+  topK: number | null,
+  basePosition = 0,
+): Promise<Qwen2GpuTopKResult | null> {
   const safetyError = qwen2WebGpuPrefillSafetyError(inputIds.length);
   if (safetyError) {
     throw new Error(safetyError);
   }
 
-  resetQwen2ModelKvCache(cache);
-  const gpuCache = resetResidentQwen2GpuCache(model, cache, runtime);
+  let gpuCache: ResidentQwen2GpuModelCache;
+  if (basePosition === 0) {
+    resetQwen2ModelKvCache(cache);
+    gpuCache = resetResidentQwen2GpuCache(model, cache, runtime);
+  } else {
+    gpuCache = requireResidentQwen2GpuCache(model, cache, runtime);
+    if (cache.inputIds.length !== basePosition) {
+      throw new Error(
+        `Qwen2 prefill chunk starts at ${basePosition}, but cache contains ${cache.inputIds.length} tokens`,
+      );
+    }
+  }
 
   const sequenceLength = inputIds.length;
   const hiddenSize = model.config.hiddenSize;
   const hiddenElements = sequenceLength * hiddenSize;
   const intermediateElements = sequenceLength * model.config.intermediateSize;
+  const keyValueElements = sequenceLength * model.config.keyValueHiddenSize;
   const context = createResidentQwen2GpuContext(runtime);
   const profile = createQwen2PrefillProfile(model, sequenceLength);
 
@@ -93,14 +148,15 @@ export async function qwen2PrefillLogitsResidentGpu(
   const hiddenB = tempBuffer(context, runtime, hiddenElements * Float32Array.BYTES_PER_ELEMENT);
   const normed = tempBuffer(context, runtime, hiddenElements * Float32Array.BYTES_PER_ELEMENT);
   const q = tempBuffer(context, runtime, hiddenElements * Float32Array.BYTES_PER_ELEMENT);
+  const projectedK = gpuCache.kvPrecision === "f16"
+    ? tempBuffer(context, runtime, keyValueElements * Float32Array.BYTES_PER_ELEMENT)
+    : null;
+  const projectedV = gpuCache.kvPrecision === "f16"
+    ? tempBuffer(context, runtime, keyValueElements * Float32Array.BYTES_PER_ELEMENT)
+    : null;
   const attentionOutput = tempBuffer(context, runtime, hiddenElements * Float32Array.BYTES_PER_ELEMENT);
   const gate = tempBuffer(context, runtime, intermediateElements * Float32Array.BYTES_PER_ELEMENT);
   const up = tempBuffer(context, runtime, intermediateElements * Float32Array.BYTES_PER_ELEMENT);
-  const activatedGate = tempBuffer(
-    context,
-    runtime,
-    intermediateElements * Float32Array.BYTES_PER_ELEMENT,
-  );
   const gated = tempBuffer(context, runtime, intermediateElements * Float32Array.BYTES_PER_ELEMENT);
   const mlpOutput = tempBuffer(context, runtime, hiddenElements * Float32Array.BYTES_PER_ELEMENT);
   const finalHidden = tempBuffer(context, runtime, hiddenSize * Float32Array.BYTES_PER_ELEMENT);
@@ -151,8 +207,10 @@ export async function qwen2PrefillLogitsResidentGpu(
           vWeight: layerWeights.attention.vProjWeight,
           vBias: layerWeights.attention.vProjBias,
           qOutput: q,
-          kOutput: layerCache.keys,
-          vOutput: layerCache.values,
+          kOutput: projectedK ?? layerCache.keys,
+          vOutput: projectedV ?? layerCache.values,
+          kOutputBaseOffset: projectedK ? 0 : basePosition * model.config.keyValueHiddenSize,
+          vOutputBaseOffset: projectedV ? 0 : basePosition * model.config.keyValueHiddenSize,
           inputSize: hiddenSize,
           qOutputSize: hiddenSize,
           keyValueOutputSize: model.config.keyValueHiddenSize,
@@ -165,22 +223,39 @@ export async function qwen2PrefillLogitsResidentGpu(
     profileQwen2PrefillStep(profile, "rope", () => {
       encodeRoPESequence(context, runtime, {
         values: q,
+        ropeTable: gpuCache.ropeTable,
         sequenceLength,
         hiddenSize,
         numberOfHeads: model.config.numberOfHeads,
         headDimension: model.config.headDimension,
-        basePosition: 0,
+        basePosition,
         theta: model.config.ropeTheta,
       });
       encodeRoPESequence(context, runtime, {
-        values: layerCache.keys,
+        values: projectedK ?? layerCache.keys,
+        ropeTable: gpuCache.ropeTable,
+        valuesBaseOffset: projectedK ? 0 : basePosition * model.config.keyValueHiddenSize,
         sequenceLength,
         hiddenSize: model.config.keyValueHiddenSize,
         numberOfHeads: model.config.numberOfKeyValueHeads,
         headDimension: model.config.headDimension,
-        basePosition: 0,
+        basePosition,
         theta: model.config.ropeTheta,
       });
+      if (projectedK && projectedV) {
+        encodeF32ToF16(context, runtime, {
+          input: projectedK,
+          output: layerCache.keys,
+          outputOffset: basePosition * model.config.keyValueHiddenSize,
+          length: keyValueElements,
+        });
+        encodeF32ToF16(context, runtime, {
+          input: projectedV,
+          output: layerCache.values,
+          outputOffset: basePosition * model.config.keyValueHiddenSize,
+          length: keyValueElements,
+        });
+      }
     });
     profileQwen2PrefillStep(profile, "attention", () => {
       encodeCausalGqaAttention(context, runtime, {
@@ -194,6 +269,8 @@ export async function qwen2PrefillLogitsResidentGpu(
         numberOfKeyValueHeads: model.config.numberOfKeyValueHeads,
         headDimension: model.config.headDimension,
         keyValueHiddenSize: model.config.keyValueHiddenSize,
+        basePosition,
+        kvPrecision: gpuCache.kvPrecision,
       });
     });
     profileQwen2PrefillStep(profile, "attentionOutputProjection", () => {
@@ -246,14 +323,9 @@ export async function qwen2PrefillLogitsResidentGpu(
       });
     });
     profileQwen2PrefillStep(profile, "mlpActivation", () => {
-      encodeSilu(context, runtime, {
+      encodeSiluMultiply(context, runtime, {
         input: gate,
-        output: activatedGate,
-        length: intermediateElements,
-      });
-      encodeElementwiseMultiply(context, runtime, {
-        left: activatedGate,
-        right: up,
+        multiplier: up,
         output: gated,
         length: intermediateElements,
       });
@@ -281,34 +353,40 @@ export async function qwen2PrefillLogitsResidentGpu(
     });
   }
 
-  profileQwen2PrefillStep(profile, "finalNorm", () => {
-    encodeRmsNormSequence(context, runtime, {
-      input: layerInput,
-      inputOffset: (sequenceLength - 1) * hiddenSize,
-      weight: tensorBuffer(runtime, model.weights.finalNorm.weight),
-      output: finalHidden,
-      sequenceLength: 1,
-      featureSize: hiddenSize,
-      epsilon: model.config.rmsNormEpsilon,
+  let sampler: Qwen2TopKBuffers | undefined;
+  if (topK !== null) {
+    profileQwen2PrefillStep(profile, "finalNorm", () => {
+      encodeRmsNormSequence(context, runtime, {
+        input: layerInput,
+        inputOffset: (sequenceLength - 1) * hiddenSize,
+        weight: tensorBuffer(runtime, model.weights.finalNorm.weight),
+        output: finalHidden,
+        sequenceLength: 1,
+        featureSize: hiddenSize,
+        epsilon: model.config.rmsNormEpsilon,
+      });
     });
-  });
-  profileQwen2PrefillStep(profile, "logitsProjection", () => {
-    encodeQwen2MatrixMultiplySequence(context, runtime, {
-      input: finalHidden,
-      weight: model.weights.lmHead,
-      output: logits,
-      inputSize: hiddenSize,
-      outputSize: model.config.vocabularySize,
-      sequenceLength: 1,
+    profileQwen2PrefillStep(profile, "logitsProjection", () => {
+      encodeQwen2MatrixMultiplySequence(context, runtime, {
+        input: finalHidden,
+        weight: model.weights.lmHead,
+        output: logits,
+        inputSize: hiddenSize,
+        outputSize: model.config.vocabularySize,
+        sequenceLength: 1,
+      });
     });
-  });
+    sampler = encodeTopK(context, runtime, logits, model.config.vocabularySize, topK);
+  }
 
   profileQwen2PrefillStep(profile, "submit", () => {
     submitResidentQwen2GpuContext(runtime, context);
   });
-  const logitsResult = await profileQwen2PrefillAsyncStep(profile, "logitsReadback", () =>
-    readFloat32Buffer(runtime, logits, model.config.vocabularySize),
-  );
+  const topKResult = sampler && topK !== null
+    ? await profileQwen2PrefillAsyncStep(profile, "logitsReadback", () =>
+        readTopKResult(runtime, sampler, topK),
+      )
+    : null;
 
   for (let layerIndex = 0; layerIndex < cache.layers.length; layerIndex += 1) {
     const layerMetadata = cache.layers[layerIndex];
@@ -316,14 +394,15 @@ export async function qwen2PrefillLogitsResidentGpu(
     if (!layerMetadata || !gpuLayerCache) {
       throw new Error(`missing Qwen2 cache at layer ${layerIndex}`);
     }
-    layerMetadata.length = sequenceLength;
-    gpuLayerCache.length = sequenceLength;
+    layerMetadata.length = basePosition + sequenceLength;
+    gpuLayerCache.length = basePosition + sequenceLength;
   }
   cache.inputIds.push(...inputIds);
   gpuCache.inputIds.push(...inputIds);
   destroyBuffers(...context.temps);
+  clearWebGpuBindGroupCache(runtime);
   logQwen2PrefillProfile(profile, logger);
-  return logitsResult;
+  return topKResult;
 }
 
 export async function qwen2DecodeTokenLogitsResidentGpu(
@@ -332,7 +411,8 @@ export async function qwen2DecodeTokenLogitsResidentGpu(
   position: number,
   cache: Qwen2ModelKvCache,
   runtime: WebGpuRuntime,
-): Promise<Float32Array> {
+  topK: number | null,
+): Promise<Qwen2GpuTopKResult | null> {
   const gpuCache = requireResidentQwen2GpuCache(model, cache, runtime);
   if (cache.inputIds.length !== position) {
     throw new Error(`cache input length is ${cache.inputIds.length}, expected position ${position}`);
@@ -341,26 +421,23 @@ export async function qwen2DecodeTokenLogitsResidentGpu(
   const hiddenSize = model.config.hiddenSize;
   const keyValueHiddenSize = model.config.keyValueHiddenSize;
   const intermediateSize = model.config.intermediateSize;
-  const context = createResidentQwen2GpuContext(runtime);
-  const tokenIdsBuffer = tempBuffer(context, runtime, Uint32Array.of(tokenId));
-  const hiddenA = tempBuffer(context, runtime, hiddenSize * Float32Array.BYTES_PER_ELEMENT);
-  const hiddenB = tempBuffer(context, runtime, hiddenSize * Float32Array.BYTES_PER_ELEMENT);
-  const normed = tempBuffer(context, runtime, hiddenSize * Float32Array.BYTES_PER_ELEMENT);
-  const q = tempBuffer(context, runtime, hiddenSize * Float32Array.BYTES_PER_ELEMENT);
-  const k = tempBuffer(context, runtime, keyValueHiddenSize * Float32Array.BYTES_PER_ELEMENT);
-  const v = tempBuffer(context, runtime, keyValueHiddenSize * Float32Array.BYTES_PER_ELEMENT);
-  const attentionOutput = tempBuffer(context, runtime, hiddenSize * Float32Array.BYTES_PER_ELEMENT);
-  const gate = tempBuffer(context, runtime, intermediateSize * Float32Array.BYTES_PER_ELEMENT);
-  const up = tempBuffer(context, runtime, intermediateSize * Float32Array.BYTES_PER_ELEMENT);
-  const activatedGate = tempBuffer(context, runtime, intermediateSize * Float32Array.BYTES_PER_ELEMENT);
-  const gated = tempBuffer(context, runtime, intermediateSize * Float32Array.BYTES_PER_ELEMENT);
-  const mlpOutput = tempBuffer(context, runtime, hiddenSize * Float32Array.BYTES_PER_ELEMENT);
-  const finalHidden = tempBuffer(context, runtime, hiddenSize * Float32Array.BYTES_PER_ELEMENT);
-  const logits = tempBuffer(
-    context,
-    runtime,
-    model.config.vocabularySize * Float32Array.BYTES_PER_ELEMENT,
-  );
+  const scratch = gpuCache.decodeScratch;
+  const context = createResidentQwen2GpuContext(runtime, scratch);
+  runtime.device.queue.writeBuffer(scratch.tokenId, 0, Uint32Array.of(tokenId));
+  const tokenIdsBuffer = scratch.tokenId;
+  const hiddenA = scratch.hiddenA;
+  const hiddenB = scratch.hiddenB;
+  const normed = scratch.normed;
+  const q = scratch.q;
+  const projectedK = scratch.k;
+  const projectedV = scratch.v;
+  const attentionOutput = scratch.attentionOutput;
+  const gate = scratch.gate;
+  const up = scratch.up;
+  const gated = scratch.gated;
+  const mlpOutput = scratch.mlpOutput;
+  const finalHidden = scratch.finalHidden;
+  const logits = scratch.logits;
 
   encodeQwen2EmbeddingSequence(context, runtime, {
     tokenIds: tokenIdsBuffer,
@@ -404,8 +481,10 @@ export async function qwen2DecodeTokenLogitsResidentGpu(
       vWeight: layerWeights.attention.vProjWeight,
       vBias: layerWeights.attention.vProjBias,
       qOutput: q,
-      kOutput: k,
-      vOutput: v,
+      kOutput: gpuCache.kvPrecision === "f16" ? projectedK : gpuLayerCache.keys,
+      vOutput: gpuCache.kvPrecision === "f16" ? projectedV : gpuLayerCache.values,
+      kOutputBaseOffset: gpuCache.kvPrecision === "f16" ? 0 : position * keyValueHiddenSize,
+      vOutputBaseOffset: gpuCache.kvPrecision === "f16" ? 0 : position * keyValueHiddenSize,
       inputSize: hiddenSize,
       qOutputSize: hiddenSize,
       keyValueOutputSize: keyValueHiddenSize,
@@ -413,6 +492,7 @@ export async function qwen2DecodeTokenLogitsResidentGpu(
     });
     encodeRoPESequence(context, runtime, {
       values: q,
+      ropeTable: gpuCache.ropeTable,
       sequenceLength: 1,
       hiddenSize,
       numberOfHeads: model.config.numberOfHeads,
@@ -421,7 +501,9 @@ export async function qwen2DecodeTokenLogitsResidentGpu(
       theta: model.config.ropeTheta,
     });
     encodeRoPESequence(context, runtime, {
-      values: k,
+      values: gpuCache.kvPrecision === "f16" ? projectedK : gpuLayerCache.keys,
+      ropeTable: gpuCache.ropeTable,
+      valuesBaseOffset: gpuCache.kvPrecision === "f16" ? 0 : position * keyValueHiddenSize,
       sequenceLength: 1,
       hiddenSize: keyValueHiddenSize,
       numberOfHeads: model.config.numberOfKeyValueHeads,
@@ -429,11 +511,20 @@ export async function qwen2DecodeTokenLogitsResidentGpu(
       basePosition: position,
       theta: model.config.ropeTheta,
     });
-
-    const cacheByteOffset = position * keyValueHiddenSize * Float32Array.BYTES_PER_ELEMENT;
-    const tokenByteLength = keyValueHiddenSize * Float32Array.BYTES_PER_ELEMENT;
-    context.encoder.copyBufferToBuffer(k, 0, gpuLayerCache.keys, cacheByteOffset, tokenByteLength);
-    context.encoder.copyBufferToBuffer(v, 0, gpuLayerCache.values, cacheByteOffset, tokenByteLength);
+    if (gpuCache.kvPrecision === "f16") {
+      encodeF32ToF16(context, runtime, {
+        input: projectedK,
+        output: gpuLayerCache.keys,
+        outputOffset: position * keyValueHiddenSize,
+        length: keyValueHiddenSize,
+      });
+      encodeF32ToF16(context, runtime, {
+        input: projectedV,
+        output: gpuLayerCache.values,
+        outputOffset: position * keyValueHiddenSize,
+        length: keyValueHiddenSize,
+      });
+    }
 
     encodeCausalGqaAttentionDecode(context, runtime, {
       q,
@@ -446,6 +537,7 @@ export async function qwen2DecodeTokenLogitsResidentGpu(
       numberOfKeyValueHeads: model.config.numberOfKeyValueHeads,
       headDimension: model.config.headDimension,
       keyValueHiddenSize,
+      kvPrecision: gpuCache.kvPrecision,
     });
     encodeQwen2MatrixMultiplySequence(context, runtime, {
       input: attentionOutput,
@@ -486,14 +578,9 @@ export async function qwen2DecodeTokenLogitsResidentGpu(
       outputSize: intermediateSize,
       sequenceLength: 1,
     });
-    encodeSilu(context, runtime, {
+    encodeSiluMultiply(context, runtime, {
       input: gate,
-      output: activatedGate,
-      length: intermediateSize,
-    });
-    encodeElementwiseMultiply(context, runtime, {
-      left: activatedGate,
-      right: up,
+      multiplier: up,
       output: gated,
       length: intermediateSize,
     });
@@ -513,25 +600,29 @@ export async function qwen2DecodeTokenLogitsResidentGpu(
     });
   }
 
-  encodeRmsNormSequence(context, runtime, {
-    input: layerInput,
-    weight: tensorBuffer(runtime, model.weights.finalNorm.weight),
-    output: finalHidden,
-    sequenceLength: 1,
-    featureSize: hiddenSize,
-    epsilon: model.config.rmsNormEpsilon,
-  });
-  encodeQwen2MatrixMultiplySequence(context, runtime, {
-    input: finalHidden,
-    weight: model.weights.lmHead,
-    output: logits,
-    inputSize: hiddenSize,
-    outputSize: model.config.vocabularySize,
-    sequenceLength: 1,
-  });
+  let sampler: Qwen2TopKBuffers | undefined;
+  if (topK !== null) {
+    encodeRmsNormSequence(context, runtime, {
+      input: layerInput,
+      weight: tensorBuffer(runtime, model.weights.finalNorm.weight),
+      output: finalHidden,
+      sequenceLength: 1,
+      featureSize: hiddenSize,
+      epsilon: model.config.rmsNormEpsilon,
+    });
+    encodeQwen2MatrixMultiplySequence(context, runtime, {
+      input: finalHidden,
+      weight: model.weights.lmHead,
+      output: logits,
+      inputSize: hiddenSize,
+      outputSize: model.config.vocabularySize,
+      sequenceLength: 1,
+    });
+    sampler = encodeTopK(context, runtime, logits, model.config.vocabularySize, topK);
+  }
 
-  runtime.device.queue.submit([context.encoder.finish()]);
-  const result = await readFloat32Buffer(runtime, logits, model.config.vocabularySize);
+  submitWebGpuCommands(runtime, [context.encoder.finish()]);
+  const result = sampler && topK !== null ? await readTopKResult(runtime, sampler, topK) : null;
 
   for (let layerIndex = 0; layerIndex < cache.layers.length; layerIndex += 1) {
     const layerMetadata = cache.layers[layerIndex];
@@ -556,12 +647,18 @@ export function hasQwen2ResidentGpuCache(
   return Boolean(gpuCache && residentQwen2GpuCacheMatches(model, cache, runtime, gpuCache));
 }
 
-function createResidentQwen2GpuContext(runtime: WebGpuRuntime): ResidentQwen2GpuContext {
-  const dummyBias = createStorageBuffer(runtime, Float32Array.of(0));
+function createResidentQwen2GpuContext(
+  runtime: WebGpuRuntime,
+  decodeScratch?: ResidentQwen2GpuDecodeScratch,
+): ResidentQwen2GpuContext {
+  const dummyBias = decodeScratch?.dummyBias ?? createStorageBuffer(runtime, Float32Array.of(0));
   return {
-    temps: [dummyBias],
+    temps: decodeScratch ? [] : [dummyBias],
     encoder: runtime.device.createCommandEncoder(),
     dummyBias,
+    uniformArena: decodeScratch?.uniformArena,
+    uniformOffset: 0,
+    decodeScratch,
   };
 }
 
@@ -569,7 +666,7 @@ function submitResidentQwen2GpuContext(
   runtime: WebGpuRuntime,
   context: ResidentQwen2GpuContext,
 ): void {
-  runtime.device.queue.submit([context.encoder.finish()]);
+  submitWebGpuCommands(runtime, [context.encoder.finish()]);
   context.encoder = runtime.device.createCommandEncoder();
 }
 
@@ -664,8 +761,10 @@ function getOrCreateResidentQwen2GpuCache(
     destroyResidentQwen2GpuCache(existing);
   }
 
+  const kvPrecision = runtime.shaderF16 === true ? "f16" : "f32";
   const layerByteLength =
-    cache.maximumSequenceLength * model.config.keyValueHiddenSize * Float32Array.BYTES_PER_ELEMENT;
+    cache.maximumSequenceLength * model.config.keyValueHiddenSize *
+    (kvPrecision === "f16" ? Uint16Array.BYTES_PER_ELEMENT : Float32Array.BYTES_PER_ELEMENT);
   const gpuCache: ResidentQwen2GpuModelCache = {
     runtime,
     maximumSequenceLength: cache.maximumSequenceLength,
@@ -677,6 +776,9 @@ function getOrCreateResidentQwen2GpuCache(
       values: createStorageBuffer(runtime, layerByteLength),
       length: 0,
     })),
+    ropeTable: createQwen2RoPETable(model, cache, runtime),
+    kvPrecision,
+    decodeScratch: createResidentQwen2GpuDecodeScratch(model, cache, runtime),
   };
   residentQwen2GpuCacheByMetadata.set(cache, gpuCache);
   return gpuCache;
@@ -753,6 +855,84 @@ function destroyResidentQwen2GpuCache(gpuCache: ResidentQwen2GpuModelCache): voi
   for (const layer of gpuCache.layers) {
     destroyBuffers(layer.keys, layer.values);
   }
+  destroyBuffers(gpuCache.ropeTable);
+  destroyBuffers(...gpuCache.decodeScratch.buffers);
+}
+
+function createQwen2RoPETable(
+  model: LoadedQwen2Model,
+  cache: Qwen2ModelKvCache,
+  runtime: WebGpuRuntime,
+): GPUBuffer {
+  const halfDimension = model.config.headDimension / 2;
+  const values = new Float32Array(cache.maximumSequenceLength * halfDimension * 2);
+  for (let position = 0; position < cache.maximumSequenceLength; position += 1) {
+    for (let pair = 0; pair < halfDimension; pair += 1) {
+      const angle = position / Math.pow(model.config.ropeTheta, (2 * pair) / model.config.headDimension);
+      const offset = (position * halfDimension + pair) * 2;
+      values[offset] = Math.cos(angle);
+      values[offset + 1] = Math.sin(angle);
+    }
+  }
+  return createStorageBuffer(runtime, values);
+}
+
+function createResidentQwen2GpuDecodeScratch(
+  model: LoadedQwen2Model,
+  cache: Qwen2ModelKvCache,
+  runtime: WebGpuRuntime,
+): ResidentQwen2GpuDecodeScratch {
+  const buffers: GPUBuffer[] = [];
+  const allocate = (
+    byteLength: number,
+    usage?: GPUBufferUsageFlags,
+  ): GPUBuffer => {
+    const buffer = createStorageBuffer(runtime, byteLength, usage);
+    buffers.push(buffer);
+    return buffer;
+  };
+  const floatBytes = Float32Array.BYTES_PER_ELEMENT;
+  const hiddenBytes = model.config.hiddenSize * floatBytes;
+  const keyValueBytes = model.config.keyValueHiddenSize * floatBytes;
+  const intermediateBytes = model.config.intermediateSize * floatBytes;
+  const maximumTiles = Math.ceil(cache.maximumSequenceLength / 256);
+  const maximumTopK = 64;
+  const localTopKElements = 256 * maximumTopK;
+
+  const scratch: Omit<ResidentQwen2GpuDecodeScratch, "buffers"> = {
+    tokenId: allocate(Uint32Array.BYTES_PER_ELEMENT),
+    hiddenA: allocate(hiddenBytes),
+    hiddenB: allocate(hiddenBytes),
+    normed: allocate(hiddenBytes),
+    q: allocate(hiddenBytes),
+    k: allocate(keyValueBytes),
+    v: allocate(keyValueBytes),
+    attentionOutput: allocate(hiddenBytes),
+    gate: allocate(intermediateBytes),
+    up: allocate(intermediateBytes),
+    gated: allocate(intermediateBytes),
+    mlpOutput: allocate(hiddenBytes),
+    finalHidden: allocate(hiddenBytes),
+    logits: allocate(model.config.vocabularySize * floatBytes),
+    attentionPartialStats: allocate(model.config.numberOfHeads * maximumTiles * 2 * floatBytes),
+    attentionPartialValues: allocate(
+      model.config.numberOfHeads * maximumTiles * model.config.headDimension * floatBytes,
+    ),
+    topKLocalIds: allocate(localTopKElements * Uint32Array.BYTES_PER_ELEMENT),
+    topKLocalLogits: allocate(localTopKElements * floatBytes),
+    topKIds: allocate(maximumTopK * Uint32Array.BYTES_PER_ELEMENT),
+    topKLogits: allocate(maximumTopK * floatBytes),
+    topKReadback: allocate(
+      maximumTopK * (Uint32Array.BYTES_PER_ELEMENT + floatBytes),
+      webGpuBufferUsage.copyDst | webGpuBufferUsage.mapRead,
+    ),
+    dummyBias: allocate(floatBytes),
+    uniformArena: allocate(
+      256 * 512,
+      webGpuBufferUsage.uniform | webGpuBufferUsage.copyDst,
+    ),
+  };
+  return { ...scratch, buffers };
 }
 
 function tensorBuffer(runtime: WebGpuRuntime, tensor: TensorView): GPUBuffer {
@@ -760,7 +940,32 @@ function tensorBuffer(runtime: WebGpuRuntime, tensor: TensorView): GPUBuffer {
 }
 
 function qwenTensorBuffer(runtime: WebGpuRuntime, tensor: QwenTensorView): GPUBuffer {
-  return createStaticStorageBuffer(runtime, tensor.data);
+  if (isFloat32TensorView(tensor)) {
+    return createStaticStorageBuffer(runtime, tensor.data);
+  }
+  let buffersByRuntime = quantizedTensorGpuBuffers.get(tensor);
+  const existing = buffersByRuntime?.get(runtime);
+  if (existing) {
+    return existing;
+  }
+  const sourceBlockBytes = tensor.type === "q4_0" ? 18 : 34;
+  const destinationBlockBytes = tensor.type === "q4_0" ? 20 : 36;
+  const blockCount = tensor.data.byteLength / sourceBlockBytes;
+  const repacked = new Uint8Array(blockCount * destinationBlockBytes);
+  for (let block = 0; block < blockCount; block += 1) {
+    const sourceOffset = block * sourceBlockBytes;
+    const destinationOffset = block * destinationBlockBytes;
+    repacked.set(tensor.data.subarray(sourceOffset, sourceOffset + 2), destinationOffset);
+    repacked.set(
+      tensor.data.subarray(sourceOffset + 2, sourceOffset + sourceBlockBytes),
+      destinationOffset + 4,
+    );
+  }
+  const buffer = createStorageBuffer(runtime, repacked);
+  buffersByRuntime ??= new WeakMap();
+  buffersByRuntime.set(runtime, buffer);
+  quantizedTensorGpuBuffers.set(tensor, buffersByRuntime);
+  return buffer;
 }
 
 function biasBuffer(
@@ -781,8 +986,156 @@ function paramsBuffer(
   context: ResidentQwen2GpuContext,
   runtime: WebGpuRuntime,
   data: Float32Array | Uint32Array,
-): GPUBuffer {
-  return tempBuffer(context, runtime, data, webGpuBufferUsage.uniform | webGpuBufferUsage.copyDst);
+): GPUBufferBinding {
+  if (!context.uniformArena) {
+    return {
+      buffer: tempBuffer(
+        context,
+        runtime,
+        data,
+        webGpuBufferUsage.uniform | webGpuBufferUsage.copyDst,
+      ),
+    };
+  }
+  const offset = Math.ceil(context.uniformOffset / 256) * 256;
+  if (offset + data.byteLength > 256 * 512) {
+    throw new Error("Qwen2 decode uniform arena is exhausted.");
+  }
+  runtime.device.queue.writeBuffer(context.uniformArena, offset, data);
+  context.uniformOffset = offset + 256;
+  return { buffer: context.uniformArena, offset, size: data.byteLength };
+}
+
+interface Qwen2TopKBuffers {
+  tokenIds: GPUBuffer;
+  logits: GPUBuffer;
+  readback: GPUBuffer;
+  readbackByteLength: number;
+  logitsReadbackOffset?: number;
+}
+
+function encodeTopK(
+  context: ResidentQwen2GpuContext,
+  runtime: WebGpuRuntime,
+  logits: GPUBuffer,
+  vocabularySize: number,
+  requestedTopK: number,
+): Qwen2TopKBuffers {
+  const topK = Math.max(1, Math.min(64, Math.round(requestedTopK)));
+  const laneCount = 256;
+  const tokenIds = context.decodeScratch?.topKIds ??
+    tempBuffer(context, runtime, topK * Uint32Array.BYTES_PER_ELEMENT);
+  const selectedLogits = context.decodeScratch?.topKLogits ??
+    tempBuffer(context, runtime, topK * Float32Array.BYTES_PER_ELEMENT);
+  const readback = context.decodeScratch?.topKReadback ?? tempBuffer(
+    context,
+    runtime,
+    64 * (Uint32Array.BYTES_PER_ELEMENT + Float32Array.BYTES_PER_ELEMENT),
+    webGpuBufferUsage.copyDst | webGpuBufferUsage.mapRead,
+  );
+  const params = paramsBuffer(
+    context,
+    runtime,
+    new Uint32Array([vocabularySize, topK, laneCount * topK, 0]),
+  );
+  if (topK === 1) {
+    encodeComputeShader(
+      runtime,
+      context.encoder,
+      qwen2ArgmaxShader,
+      [
+        { binding: 0, resource: { buffer: logits } },
+        { binding: 1, resource: params },
+        { binding: 2, resource: { buffer: tokenIds } },
+        { binding: 3, resource: { buffer: selectedLogits } },
+      ],
+      [1],
+    );
+    context.encoder.copyBufferToBuffer(
+      tokenIds,
+      0,
+      readback,
+      0,
+      Uint32Array.BYTES_PER_ELEMENT,
+    );
+    return {
+      tokenIds,
+      logits: selectedLogits,
+      readback,
+      readbackByteLength: Uint32Array.BYTES_PER_ELEMENT,
+    };
+  }
+  const localIds = context.decodeScratch?.topKLocalIds ??
+    tempBuffer(context, runtime, laneCount * topK * Uint32Array.BYTES_PER_ELEMENT);
+  const localLogits = context.decodeScratch?.topKLocalLogits ??
+    tempBuffer(context, runtime, laneCount * topK * Float32Array.BYTES_PER_ELEMENT);
+  encodeComputeShader(
+    runtime,
+    context.encoder,
+    qwen2TopKLocalShader,
+    [
+      { binding: 0, resource: { buffer: logits } },
+      { binding: 1, resource: params },
+      { binding: 2, resource: { buffer: localIds } },
+      { binding: 3, resource: { buffer: localLogits } },
+    ],
+    [1],
+  );
+  encodeComputeShader(
+    runtime,
+    context.encoder,
+    qwen2TopKMergeShader,
+    [
+      { binding: 0, resource: { buffer: localIds } },
+      { binding: 1, resource: { buffer: localLogits } },
+      { binding: 2, resource: params },
+      { binding: 3, resource: { buffer: tokenIds } },
+      { binding: 4, resource: { buffer: selectedLogits } },
+    ],
+    [1],
+  );
+  const idsByteLength = topK * Uint32Array.BYTES_PER_ELEMENT;
+  const logitsByteLength = topK * Float32Array.BYTES_PER_ELEMENT;
+  context.encoder.copyBufferToBuffer(tokenIds, 0, readback, 0, idsByteLength);
+  context.encoder.copyBufferToBuffer(
+    selectedLogits,
+    0,
+    readback,
+    idsByteLength,
+    logitsByteLength,
+  );
+  return {
+    tokenIds,
+    logits: selectedLogits,
+    readback,
+    readbackByteLength: idsByteLength + logitsByteLength,
+    logitsReadbackOffset: idsByteLength,
+  };
+}
+
+async function readTopKResult(
+  runtime: WebGpuRuntime,
+  buffers: Qwen2TopKBuffers,
+  requestedTopK: number,
+): Promise<Qwen2GpuTopKResult> {
+  const topK = Math.max(1, Math.min(64, Math.round(requestedTopK)));
+  if (buffers.readback) {
+    const idsByteLength = topK * Uint32Array.BYTES_PER_ELEMENT;
+    const data = await readMappedGpuBuffer(runtime, buffers.readback, buffers.readbackByteLength);
+    if (topK === 1) {
+      return {
+        tokenIds: new Uint32Array(data),
+        logits: Float32Array.of(0),
+      };
+    }
+    const logitsOffset = buffers.logitsReadbackOffset ?? idsByteLength;
+    const logitsByteLength = topK * Float32Array.BYTES_PER_ELEMENT;
+    return {
+      tokenIds: new Uint32Array(data.slice(0, idsByteLength)),
+      logits: new Float32Array(data.slice(logitsOffset, logitsOffset + logitsByteLength)),
+    };
+  }
+  throw new Error("Qwen2 top-k readback buffer is unavailable");
 }
 
 function encodeQwen2EmbeddingSequence(
@@ -814,7 +1167,7 @@ function encodeQwen2EmbeddingSequence(
       [
         { binding: 0, resource: { buffer: options.tokenIds } },
         { binding: 1, resource: { buffer: qwenTensorBuffer(runtime, options.embedding) } },
-        { binding: 2, resource: { buffer: params } },
+        { binding: 2, resource: params },
         { binding: 3, resource: { buffer: options.output } },
       ],
       [Math.ceil((options.sequenceLength * embeddingSize) / 128)],
@@ -844,7 +1197,7 @@ function encodeQwen2EmbeddingSequence(
     [
       { binding: 0, resource: { buffer: options.tokenIds } },
       { binding: 1, resource: { buffer: qwenTensorBuffer(runtime, options.embedding) } },
-      { binding: 2, resource: { buffer: params } },
+      { binding: 2, resource: params },
       { binding: 3, resource: { buffer: options.output } },
     ],
     [Math.ceil((options.sequenceLength * embeddingSize) / 128)],
@@ -860,6 +1213,7 @@ function encodeQwen2MatrixMultiplySequence(
     weight: QwenTensorView;
     bias?: TensorView | Float32Array;
     output: GPUBuffer;
+    outputBaseOffset?: number;
     inputSize: number;
     outputSize: number;
     sequenceLength: number;
@@ -886,7 +1240,7 @@ function encodeQwen2MatrixMultiplySequence(
         resolvedBias.hasBias ? 1 : 0,
         0,
         0,
-        0,
+        options.outputBaseOffset ?? 0,
       ]),
     );
     encodeComputeShader(
@@ -897,7 +1251,7 @@ function encodeQwen2MatrixMultiplySequence(
         { binding: 0, resource: { buffer: qwenTensorBuffer(runtime, options.weight) } },
         { binding: 1, resource: { buffer: options.input } },
         { binding: 2, resource: { buffer: resolvedBias.buffer } },
-        { binding: 3, resource: { buffer: params } },
+        { binding: 3, resource: params },
         { binding: 4, resource: { buffer: options.output } },
       ],
       [Math.ceil((options.sequenceLength * options.outputSize) / 64)],
@@ -917,21 +1271,25 @@ function encodeQwen2MatrixMultiplySequence(
       rowByteLength,
       quantizedTypeCode(options.weight),
       resolvedBias.hasBias ? 1 : 0,
-      0,
+      options.outputBaseOffset ?? 0,
     ]),
   );
   encodeComputeShader(
     runtime,
     context.encoder,
-    qwen2QuantizedMatrixMultiplySequenceShader,
+    options.sequenceLength === 1
+      ? qwen2QuantizedMatrixVectorCooperativeShader
+      : qwen2QuantizedMatrixMultiplyTiledShader,
     [
       { binding: 0, resource: { buffer: qwenTensorBuffer(runtime, options.weight) } },
       { binding: 1, resource: { buffer: options.input } },
       { binding: 2, resource: { buffer: resolvedBias.buffer } },
-      { binding: 3, resource: { buffer: params } },
+      { binding: 3, resource: params },
       { binding: 4, resource: { buffer: options.output } },
     ],
-    [Math.ceil((options.sequenceLength * options.outputSize) / 64)],
+    options.sequenceLength === 1
+      ? [options.outputSize]
+      : [Math.ceil(options.outputSize / 8), Math.ceil(options.sequenceLength / 4)],
   );
 }
 
@@ -950,6 +1308,9 @@ function encodeQwen2QkvProjectionSequence(
     qOutput: GPUBuffer;
     kOutput: GPUBuffer;
     vOutput: GPUBuffer;
+    qOutputBaseOffset?: number;
+    kOutputBaseOffset?: number;
+    vOutputBaseOffset?: number;
     inputSize: number;
     qOutputSize: number;
     keyValueOutputSize: number;
@@ -957,13 +1318,24 @@ function encodeQwen2QkvProjectionSequence(
   },
 ): boolean {
   validateQkvProjectionShapes(options);
-  if (!canFuseQwen2QkvProjection(options.qWeight, options.kWeight, options.vWeight)) {
+  // The fused sequence kernel maps one invocation to one output scalar. During
+  // decode, three cooperative GEMV dispatches expose much more parallelism for
+  // each dot product than that prefill-oriented layout.
+  if (
+    options.sequenceLength === 1 ||
+    options.sequenceLength > 1 ||
+    (options.qOutputBaseOffset ?? 0) !== 0 ||
+    (options.kOutputBaseOffset ?? 0) !== 0 ||
+    (options.vOutputBaseOffset ?? 0) !== 0 ||
+    !canFuseQwen2QkvProjection(options.qWeight, options.kWeight, options.vWeight)
+  ) {
     encodeQwen2MatrixMultiplySequence(context, runtime, {
       input: options.input,
       inputBaseOffset: options.inputBaseOffset,
       weight: options.qWeight,
       bias: options.qBias,
       output: options.qOutput,
+      outputBaseOffset: options.qOutputBaseOffset,
       inputSize: options.inputSize,
       outputSize: options.qOutputSize,
       sequenceLength: options.sequenceLength,
@@ -974,6 +1346,7 @@ function encodeQwen2QkvProjectionSequence(
       weight: options.kWeight,
       bias: options.kBias,
       output: options.kOutput,
+      outputBaseOffset: options.kOutputBaseOffset,
       inputSize: options.inputSize,
       outputSize: options.keyValueOutputSize,
       sequenceLength: options.sequenceLength,
@@ -984,6 +1357,7 @@ function encodeQwen2QkvProjectionSequence(
       weight: options.vWeight,
       bias: options.vBias,
       output: options.vOutput,
+      outputBaseOffset: options.vOutputBaseOffset,
       inputSize: options.inputSize,
       outputSize: options.keyValueOutputSize,
       sequenceLength: options.sequenceLength,
@@ -1024,7 +1398,7 @@ function encodeQwen2QkvProjectionSequence(
         { binding: 2, resource: { buffer: qwenTensorBuffer(runtime, options.vWeight) } },
         { binding: 3, resource: { buffer: options.input } },
         { binding: 4, resource: { buffer: qkvBias } },
-        { binding: 5, resource: { buffer: params } },
+        { binding: 5, resource: params },
         { binding: 6, resource: { buffer: options.qOutput } },
         { binding: 7, resource: { buffer: options.kOutput } },
         { binding: 8, resource: { buffer: options.vOutput } },
@@ -1074,7 +1448,7 @@ function encodeQwen2QkvProjectionSequence(
       { binding: 2, resource: { buffer: qwenTensorBuffer(runtime, options.vWeight) } },
       { binding: 3, resource: { buffer: options.input } },
       { binding: 4, resource: { buffer: qkvBias } },
-      { binding: 5, resource: { buffer: params } },
+      { binding: 5, resource: params },
       { binding: 6, resource: { buffer: options.qOutput } },
       { binding: 7, resource: { buffer: options.kOutput } },
       { binding: 8, resource: { buffer: options.vOutput } },
@@ -1120,10 +1494,10 @@ function encodeRmsNormSequence(
     [
       { binding: 0, resource: { buffer: options.input } },
       { binding: 1, resource: { buffer: options.weight } },
-      { binding: 2, resource: { buffer: params } },
+      { binding: 2, resource: params },
       { binding: 3, resource: { buffer: options.output } },
     ],
-    [Math.ceil(options.sequenceLength / 64)],
+    [options.sequenceLength],
   );
 }
 
@@ -1132,6 +1506,8 @@ function encodeRoPESequence(
   runtime: WebGpuRuntime,
   options: {
     values: GPUBuffer;
+    ropeTable: GPUBuffer;
+    valuesBaseOffset?: number;
     sequenceLength: number;
     hiddenSize: number;
     numberOfHeads: number;
@@ -1150,7 +1526,7 @@ function encodeRoPESequence(
       options.numberOfHeads,
       options.headDimension,
       options.basePosition,
-      0,
+      options.valuesBaseOffset ?? 0,
       0,
     ]),
   );
@@ -1160,7 +1536,8 @@ function encodeRoPESequence(
     qwen2RoPESequenceShader,
     [
       { binding: 0, resource: { buffer: options.values } },
-      { binding: 1, resource: { buffer: params } },
+      { binding: 1, resource: params },
+      { binding: 2, resource: { buffer: options.ropeTable } },
     ],
     [Math.ceil((options.sequenceLength * options.numberOfHeads * (options.headDimension / 2)) / 128)],
   );
@@ -1180,8 +1557,13 @@ function encodeCausalGqaAttention(
     numberOfKeyValueHeads: number;
     headDimension: number;
     keyValueHiddenSize: number;
+    basePosition?: number;
+    kvPrecision: "f16" | "f32";
   },
 ): void {
+  if (options.headDimension !== 64) {
+    throw new Error(`prefill attention requires Qwen2.5 headDimension 64, got ${options.headDimension}`);
+  }
   const params = paramsBuffer(
     context,
     runtime,
@@ -1192,22 +1574,24 @@ function encodeCausalGqaAttention(
       options.numberOfKeyValueHeads,
       options.headDimension,
       options.keyValueHiddenSize,
-      0,
+      options.basePosition ?? 0,
       0,
     ]),
   );
   encodeComputeShader(
     runtime,
     context.encoder,
-    qwen2CausalGqaAttentionShader,
+    options.kvPrecision === "f16"
+      ? qwen2CausalGqaAttentionF16Shader
+      : qwen2CausalGqaAttentionShader,
     [
       { binding: 0, resource: { buffer: options.q } },
       { binding: 1, resource: { buffer: options.k } },
       { binding: 2, resource: { buffer: options.v } },
-      { binding: 3, resource: { buffer: params } },
+      { binding: 3, resource: params },
       { binding: 4, resource: { buffer: options.output } },
     ],
-    [Math.ceil((options.sequenceLength * options.hiddenSize) / 128)],
+    [options.sequenceLength, options.numberOfHeads],
   );
 }
 
@@ -1225,42 +1609,74 @@ function encodeCausalGqaAttentionDecode(
     numberOfKeyValueHeads: number;
     headDimension: number;
     keyValueHiddenSize: number;
+    kvPrecision: "f16" | "f32";
   },
 ): void {
+  if (options.headDimension !== 64) {
+    throw new Error(`split-KV decode requires Qwen2.5 headDimension 64, got ${options.headDimension}`);
+  }
+  const tileSize = 256;
+  const tileCount = Math.ceil((options.position + 1) / tileSize);
+  const partialStats = context.decodeScratch?.attentionPartialStats ?? tempBuffer(
+    context,
+    runtime,
+    options.numberOfHeads * tileCount * 2 * Float32Array.BYTES_PER_ELEMENT,
+  );
+  const partialValues = context.decodeScratch?.attentionPartialValues ?? tempBuffer(
+    context,
+    runtime,
+    options.numberOfHeads * tileCount * options.headDimension * Float32Array.BYTES_PER_ELEMENT,
+  );
   const params = paramsBuffer(
     context,
     runtime,
     new Uint32Array([
       options.position,
-      options.hiddenSize,
       options.numberOfHeads,
       options.numberOfKeyValueHeads,
       options.headDimension,
       options.keyValueHiddenSize,
-      0,
+      tileSize,
+      tileCount,
       0,
     ]),
   );
   encodeComputeShader(
     runtime,
     context.encoder,
-    qwen2CausalGqaAttentionDecodeShader,
+    options.kvPrecision === "f16"
+      ? qwen2CausalGqaAttentionDecodeF16Shader
+      : qwen2CausalGqaAttentionDecodeShader,
     [
       { binding: 0, resource: { buffer: options.q } },
       { binding: 1, resource: { buffer: options.k } },
       { binding: 2, resource: { buffer: options.v } },
-      { binding: 3, resource: { buffer: params } },
-      { binding: 4, resource: { buffer: options.output } },
+      { binding: 3, resource: params },
+      { binding: 4, resource: { buffer: partialStats } },
+      { binding: 5, resource: { buffer: partialValues } },
     ],
-    [Math.ceil(options.hiddenSize / 128)],
+    [tileCount, options.numberOfHeads],
+  );
+  encodeComputeShader(
+    runtime,
+    context.encoder,
+    qwen2CausalGqaAttentionDecodeMergeShader,
+    [
+      { binding: 0, resource: { buffer: partialStats } },
+      { binding: 1, resource: { buffer: partialValues } },
+      { binding: 2, resource: params },
+      { binding: 3, resource: { buffer: options.output } },
+    ],
+    [options.numberOfHeads],
   );
 }
 
-function encodeSilu(
+function encodeSiluMultiply(
   context: ResidentQwen2GpuContext,
   runtime: WebGpuRuntime,
   options: {
     input: GPUBuffer;
+    multiplier: GPUBuffer;
     output: GPUBuffer;
     length: number;
   },
@@ -1272,33 +1688,43 @@ function encodeSilu(
     qwen2SiluShader,
     [
       { binding: 0, resource: { buffer: options.input } },
-      { binding: 1, resource: { buffer: params } },
-      { binding: 2, resource: { buffer: options.output } },
+      { binding: 1, resource: { buffer: options.multiplier } },
+      { binding: 2, resource: params },
+      { binding: 3, resource: { buffer: options.output } },
     ],
     [Math.ceil(options.length / 128)],
   );
 }
 
-function encodeElementwiseMultiply(
+function encodeF32ToF16(
   context: ResidentQwen2GpuContext,
   runtime: WebGpuRuntime,
   options: {
-    left: GPUBuffer;
-    right: GPUBuffer;
+    input: GPUBuffer;
     output: GPUBuffer;
+    inputOffset?: number;
+    outputOffset?: number;
     length: number;
   },
 ): void {
-  const params = paramsBuffer(context, runtime, new Uint32Array([options.length, 0, 0, 0]));
+  const params = paramsBuffer(
+    context,
+    runtime,
+    new Uint32Array([
+      options.length,
+      options.inputOffset ?? 0,
+      options.outputOffset ?? 0,
+      0,
+    ]),
+  );
   encodeComputeShader(
     runtime,
     context.encoder,
-    qwen2ElementwiseMultiplyShader,
+    qwen2F32ToF16Shader,
     [
-      { binding: 0, resource: { buffer: options.left } },
-      { binding: 1, resource: { buffer: options.right } },
-      { binding: 2, resource: { buffer: params } },
-      { binding: 3, resource: { buffer: options.output } },
+      { binding: 0, resource: { buffer: options.input } },
+      { binding: 1, resource: params },
+      { binding: 2, resource: { buffer: options.output } },
     ],
     [Math.ceil(options.length / 128)],
   );
@@ -1322,7 +1748,7 @@ function encodeResidualAdd(
     [
       { binding: 0, resource: { buffer: options.left } },
       { binding: 1, resource: { buffer: options.right } },
-      { binding: 2, resource: { buffer: params } },
+      { binding: 2, resource: params },
       { binding: 3, resource: { buffer: options.output } },
     ],
     [Math.ceil(options.length / 128)],
@@ -1370,7 +1796,7 @@ function canFuseQwen2QkvProjection(
 }
 
 function qkvBiasBuffer(
-  context: ResidentQwen2GpuContext,
+  _context: ResidentQwen2GpuContext,
   runtime: WebGpuRuntime,
   options: {
     qBias?: TensorView | Float32Array;
@@ -1380,6 +1806,11 @@ function qkvBiasBuffer(
     keyValueOutputSize: number;
   },
 ): GPUBuffer {
+  const cacheKey = options.qBias && typeof options.qBias === "object" ? options.qBias : undefined;
+  const cached = cacheKey ? qkvBiasDataByQueryBias.get(cacheKey) : undefined;
+  if (cached) {
+    return createStaticStorageBuffer(runtime, cached);
+  }
   const bias = new Float32Array(options.qOutputSize + 2 * options.keyValueOutputSize);
   copyBiasValues(options.qBias, bias, 0, options.qOutputSize, "qBias");
   copyBiasValues(
@@ -1396,7 +1827,10 @@ function qkvBiasBuffer(
     options.keyValueOutputSize,
     "vBias",
   );
-  return tempBuffer(context, runtime, bias);
+  if (cacheKey) {
+    qkvBiasDataByQueryBias.set(cacheKey, bias);
+  }
+  return createStaticStorageBuffer(runtime, bias);
 }
 
 function copyBiasValues(
@@ -1435,12 +1869,187 @@ function quantizedRowByteLength(
   if (!Number.isInteger(inputSize) || inputSize <= 0 || inputSize % 32 !== 0) {
     throw new Error(`${tensor.type} length must be a positive multiple of 32, got ${inputSize}`);
   }
-  return tensor.type === "q4_0" ? (inputSize / 32) * 18 : (inputSize / 32) * 34;
+  return tensor.type === "q4_0" ? (inputSize / 32) * 20 : (inputSize / 32) * 36;
 }
 
 function quantizedTypeCode(tensor: Exclude<QwenTensorView, TensorView>): number {
   return tensor.type === "q4_0" ? 4 : 8;
 }
+
+const qwen2ArgmaxShader = `
+struct Params {
+  vocabularySize: u32,
+  topK: u32,
+  candidateCount: u32,
+  _padding0: u32,
+}
+
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read_write> selectedIds: array<u32>;
+@group(0) @binding(3) var<storage, read_write> selectedLogits: array<f32>;
+var<workgroup> bestIds: array<u32, 256>;
+var<workgroup> bestLogits: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) localId: vec3<u32>) {
+  let lane = localId.x;
+  var bestId = 0u;
+  var bestLogit = -3.4028234663852886e38;
+  for (var tokenId = lane; tokenId < params.vocabularySize; tokenId = tokenId + 256u) {
+    let value = logits[tokenId];
+    if (value > bestLogit || (value == bestLogit && tokenId < bestId)) {
+      bestId = tokenId;
+      bestLogit = value;
+    }
+  }
+  bestIds[lane] = bestId;
+  bestLogits[lane] = bestLogit;
+  workgroupBarrier();
+
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      let other = lane + stride;
+      if (
+        bestLogits[other] > bestLogits[lane] ||
+        (bestLogits[other] == bestLogits[lane] && bestIds[other] < bestIds[lane])
+      ) {
+        bestIds[lane] = bestIds[other];
+        bestLogits[lane] = bestLogits[other];
+      }
+    }
+    workgroupBarrier();
+  }
+  if (lane == 0u) {
+    selectedIds[0] = bestIds[0];
+    selectedLogits[0] = bestLogits[0];
+  }
+}
+`;
+
+const qwen2TopKLocalShader = `
+struct Params {
+  vocabularySize: u32,
+  topK: u32,
+  candidateCount: u32,
+  _padding0: u32,
+}
+
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read_write> candidateIds: array<u32>;
+@group(0) @binding(3) var<storage, read_write> candidateLogits: array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) localId: vec3<u32>) {
+  let lane = localId.x;
+  var bestIds: array<u32, 64>;
+  var bestLogits: array<f32, 64>;
+  for (var rank = 0u; rank < params.topK; rank = rank + 1u) {
+    bestIds[rank] = 0u;
+    bestLogits[rank] = -3.4028234663852886e38;
+  }
+
+  for (var tokenId = lane; tokenId < params.vocabularySize; tokenId = tokenId + 256u) {
+    let value = logits[tokenId];
+    var insertion = params.topK;
+    for (var rank = 0u; rank < params.topK; rank = rank + 1u) {
+      if (value > bestLogits[rank]) {
+        insertion = rank;
+        break;
+      }
+    }
+    if (insertion < params.topK) {
+      var rank = params.topK - 1u;
+      loop {
+        if (rank <= insertion) {
+          break;
+        }
+        bestIds[rank] = bestIds[rank - 1u];
+        bestLogits[rank] = bestLogits[rank - 1u];
+        rank = rank - 1u;
+      }
+      bestIds[insertion] = tokenId;
+      bestLogits[insertion] = value;
+    }
+  }
+
+  for (var rank = 0u; rank < params.topK; rank = rank + 1u) {
+    let outputIndex = lane * params.topK + rank;
+    candidateIds[outputIndex] = bestIds[rank];
+    candidateLogits[outputIndex] = bestLogits[rank];
+  }
+}
+`;
+
+const qwen2TopKMergeShader = `
+struct Params {
+  vocabularySize: u32,
+  topK: u32,
+  candidateCount: u32,
+  _padding0: u32,
+}
+
+@group(0) @binding(0) var<storage, read> candidateIds: array<u32>;
+@group(0) @binding(1) var<storage, read> candidateLogits: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> selectedIds: array<u32>;
+@group(0) @binding(4) var<storage, read_write> selectedLogits: array<f32>;
+
+var<workgroup> laneRanks: array<u32, 256>;
+var<workgroup> reductionIds: array<u32, 256>;
+var<workgroup> reductionLogits: array<f32, 256>;
+var<workgroup> reductionLanes: array<u32, 256>;
+
+fn better(leftLogit: f32, leftId: u32, rightLogit: f32, rightId: u32) -> bool {
+  return leftLogit > rightLogit || (leftLogit == rightLogit && leftId < rightId);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) localId: vec3<u32>) {
+  let lane = localId.x;
+  laneRanks[lane] = 0u;
+  workgroupBarrier();
+
+  for (var outputRank = 0u; outputRank < params.topK; outputRank = outputRank + 1u) {
+    let candidateIndex = lane * params.topK + laneRanks[lane];
+    reductionIds[lane] = candidateIds[candidateIndex];
+    reductionLogits[lane] = candidateLogits[candidateIndex];
+    reductionLanes[lane] = lane;
+    workgroupBarrier();
+
+    var stride = 128u;
+    loop {
+      if (lane < stride) {
+        let other = lane + stride;
+        if (better(
+          reductionLogits[other],
+          reductionIds[other],
+          reductionLogits[lane],
+          reductionIds[lane],
+        )) {
+          reductionIds[lane] = reductionIds[other];
+          reductionLogits[lane] = reductionLogits[other];
+          reductionLanes[lane] = reductionLanes[other];
+        }
+      }
+      workgroupBarrier();
+      if (stride == 1u) {
+        break;
+      }
+      stride = stride / 2u;
+    }
+
+    if (lane == 0u) {
+      selectedIds[outputRank] = reductionIds[0];
+      selectedLogits[outputRank] = reductionLogits[0];
+      let winningLane = reductionLanes[0];
+      laneRanks[winningLane] = laneRanks[winningLane] + 1u;
+    }
+    workgroupBarrier();
+  }
+}
+`;
 
 const qwen2F32EmbeddingSequenceShader = `
 struct Params {
@@ -1532,15 +2141,15 @@ fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
   let rowOffset = tokenId * params.rowByteLength;
   let block = dimension / 32u;
   let blockIndex = dimension % 32u;
-  let blockOffset = rowOffset + block * select(18u, 34u, params.quantType == 8u);
-  let scale = f16ToF32(byteAt(blockOffset), byteAt(blockOffset + 1u));
+  let blockOffset = rowOffset + block * select(20u, 36u, params.quantType == 8u);
+  let scale = unpack2x16float(words[blockOffset / 4u]).x;
 
   if (params.quantType == 4u) {
-    let packed = byteAt(blockOffset + 2u + (blockIndex % 16u));
+    let packed = byteAt(blockOffset + 4u + (blockIndex % 16u));
     let quantized = select((packed >> 4u) & 0x0fu, packed & 0x0fu, blockIndex < 16u);
     output[index] = f32(i32(quantized) - 8) * scale;
   } else {
-    output[index] = signedByteAt(blockOffset + 2u + blockIndex) * scale;
+    output[index] = signedByteAt(blockOffset + 4u + blockIndex) * scale;
   }
 }
 `;
@@ -1554,7 +2163,7 @@ struct Params {
   hasBias: u32,
   _padding0: u32,
   _padding1: u32,
-  _padding2: u32,
+  outputBaseOffset: u32,
 }
 
 @group(0) @binding(0) var<storage, read> weight: array<f32>;
@@ -1581,7 +2190,7 @@ fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
   for (var column = 0u; column < params.inputSize; column = column + 1u) {
     sum = sum + weight[weightOffset + column] * input[inputOffset + column];
   }
-  output[index] = sum;
+  output[params.outputBaseOffset + index] = sum;
 }
 `;
 
@@ -1720,8 +2329,8 @@ fn qDot(row: u32, inputOffset: u32) -> f32 {
   var sum = 0.0;
   var sourceOffset = row * params.rowByteLength;
   for (var base = 0u; base < params.inputSize; base = base + 32u) {
-    let scale = f16ToF32(qByteAt(sourceOffset), qByteAt(sourceOffset + 1u));
-    sourceOffset = sourceOffset + 2u;
+    let scale = unpack2x16float(qWeightWords[sourceOffset / 4u]).x;
+    sourceOffset = sourceOffset + 4u;
 
     if (params.quantType == 4u) {
       for (var packedIndex = 0u; packedIndex < 16u; packedIndex = packedIndex + 1u) {
@@ -1746,8 +2355,8 @@ fn kDot(row: u32, inputOffset: u32) -> f32 {
   var sum = 0.0;
   var sourceOffset = row * params.rowByteLength;
   for (var base = 0u; base < params.inputSize; base = base + 32u) {
-    let scale = f16ToF32(kByteAt(sourceOffset), kByteAt(sourceOffset + 1u));
-    sourceOffset = sourceOffset + 2u;
+    let scale = unpack2x16float(kWeightWords[sourceOffset / 4u]).x;
+    sourceOffset = sourceOffset + 4u;
 
     if (params.quantType == 4u) {
       for (var packedIndex = 0u; packedIndex < 16u; packedIndex = packedIndex + 1u) {
@@ -1772,8 +2381,8 @@ fn vDot(row: u32, inputOffset: u32) -> f32 {
   var sum = 0.0;
   var sourceOffset = row * params.rowByteLength;
   for (var base = 0u; base < params.inputSize; base = base + 32u) {
-    let scale = f16ToF32(vByteAt(sourceOffset), vByteAt(sourceOffset + 1u));
-    sourceOffset = sourceOffset + 2u;
+    let scale = unpack2x16float(vWeightWords[sourceOffset / 4u]).x;
+    sourceOffset = sourceOffset + 4u;
 
     if (params.quantType == 4u) {
       for (var packedIndex = 0u; packedIndex < 16u; packedIndex = packedIndex + 1u) {
@@ -1835,7 +2444,7 @@ struct Params {
   rowByteLength: u32,
   quantType: u32,
   hasBias: u32,
-  _padding0: u32,
+  outputBaseOffset: u32,
 }
 
 @group(0) @binding(0) var<storage, read> weightWords: array<u32>;
@@ -1893,8 +2502,8 @@ fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
   var sourceOffset = row * params.rowByteLength;
   let inputOffset = params.inputBaseOffset + position * params.inputSize;
   for (var base = 0u; base < params.inputSize; base = base + 32u) {
-    let scale = f16ToF32(byteAt(sourceOffset), byteAt(sourceOffset + 1u));
-    sourceOffset = sourceOffset + 2u;
+    let scale = unpack2x16float(weightWords[sourceOffset / 4u]).x;
+    sourceOffset = sourceOffset + 4u;
 
     if (params.quantType == 4u) {
       for (var packedIndex = 0u; packedIndex < 16u; packedIndex = packedIndex + 1u) {
@@ -1912,7 +2521,184 @@ fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
       sourceOffset = sourceOffset + 32u;
     }
   }
-  output[index] = sum;
+  output[params.outputBaseOffset + index] = sum;
+}
+`;
+
+const qwen2QuantizedMatrixMultiplyTiledShader = `
+struct Params {
+  inputSize: u32,
+  outputSize: u32,
+  sequenceLength: u32,
+  inputBaseOffset: u32,
+  rowByteLength: u32,
+  quantType: u32,
+  hasBias: u32,
+  outputBaseOffset: u32,
+}
+
+@group(0) @binding(0) var<storage, read> weightWords: array<u32>;
+@group(0) @binding(1) var<storage, read> input: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+var<workgroup> inputTile: array<f32, 128>;
+
+fn byteAt(byteOffset: u32) -> u32 {
+  let word = weightWords[byteOffset / 4u];
+  let shift = (byteOffset % 4u) * 8u;
+  return (word >> shift) & 0xffu;
+}
+
+fn signedByte(value: u32) -> f32 {
+  return f32(select(i32(value), i32(value) - 256, value > 127u));
+}
+
+@compute @workgroup_size(32)
+fn main(
+  @builtin(local_invocation_id) localId: vec3<u32>,
+  @builtin(workgroup_id) workgroupId: vec3<u32>,
+) {
+  let lane = localId.x;
+  let tokenLocal = lane / 8u;
+  let rowLocal = lane % 8u;
+  let position = workgroupId.y * 4u + tokenLocal;
+  let row = workgroupId.x * 8u + rowLocal;
+  let valid = position < params.sequenceLength && row < params.outputSize;
+  let blockByteLength = select(36u, 20u, params.quantType == 4u);
+  let blockCount = params.inputSize / 32u;
+  var sum = 0.0;
+  if (valid && params.hasBias == 1u) {
+    sum = bias[row];
+  }
+
+  for (var block = 0u; block < blockCount; block = block + 1u) {
+    for (var tileIndex = lane; tileIndex < 128u; tileIndex = tileIndex + 32u) {
+      let loadToken = tileIndex / 32u;
+      let element = tileIndex % 32u;
+      let loadPosition = workgroupId.y * 4u + loadToken;
+      if (loadPosition < params.sequenceLength) {
+        inputTile[tileIndex] =
+          input[params.inputBaseOffset + loadPosition * params.inputSize + block * 32u + element];
+      } else {
+        inputTile[tileIndex] = 0.0;
+      }
+    }
+    workgroupBarrier();
+
+    if (valid) {
+      let sourceOffset = row * params.rowByteLength + block * blockByteLength;
+      let scale = unpack2x16float(weightWords[sourceOffset / 4u]).x;
+      if (params.quantType == 4u) {
+        for (var packedIndex = 0u; packedIndex < 16u; packedIndex = packedIndex + 1u) {
+          let packed = byteAt(sourceOffset + 4u + packedIndex);
+          sum = sum + f32(i32(packed & 0x0fu) - 8) * scale * inputTile[tokenLocal * 32u + packedIndex];
+          sum = sum + f32(i32((packed >> 4u) & 0x0fu) - 8) * scale * inputTile[tokenLocal * 32u + 16u + packedIndex];
+        }
+      } else {
+        for (var element = 0u; element < 32u; element = element + 1u) {
+          sum = sum + signedByte(byteAt(sourceOffset + 4u + element)) * scale * inputTile[tokenLocal * 32u + element];
+        }
+      }
+    }
+    workgroupBarrier();
+  }
+
+  if (valid) {
+    output[params.outputBaseOffset + position * params.outputSize + row] = sum;
+  }
+}
+`;
+
+const qwen2QuantizedMatrixVectorCooperativeShader = `
+struct Params {
+  inputSize: u32,
+  outputSize: u32,
+  sequenceLength: u32,
+  inputBaseOffset: u32,
+  rowByteLength: u32,
+  quantType: u32,
+  hasBias: u32,
+  outputBaseOffset: u32,
+}
+
+@group(0) @binding(0) var<storage, read> weightWords: array<u32>;
+@group(0) @binding(1) var<storage, read> input: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+var<workgroup> partialSums: array<f32, 64>;
+
+fn byteAt(byteOffset: u32) -> u32 {
+  let word = weightWords[byteOffset / 4u];
+  let shift = (byteOffset % 4u) * 8u;
+  return (word >> shift) & 0xffu;
+}
+
+fn signedByte(value: u32) -> f32 {
+  return f32(select(i32(value), i32(value) - 256, value > 127u));
+}
+
+fn f16ToF32(lowByte: u32, highByte: u32) -> f32 {
+  let half = lowByte | (highByte << 8u);
+  let sign = select(1.0, -1.0, (half & 0x8000u) != 0u);
+  let exponent = (half >> 10u) & 0x1fu;
+  let fraction = half & 0x03ffu;
+  if (exponent == 0u) {
+    return select(sign * exp2(-14.0) * (f32(fraction) / 1024.0), sign * 0.0, fraction == 0u);
+  }
+  if (exponent == 0x1fu) {
+    return sign * 3.4028234663852886e38;
+  }
+  return sign * exp2(f32(i32(exponent) - 15)) * (1.0 + f32(fraction) / 1024.0);
+}
+
+@compute @workgroup_size(64)
+fn main(
+  @builtin(local_invocation_id) localId: vec3<u32>,
+  @builtin(workgroup_id) workgroupId: vec3<u32>,
+) {
+  let lane = localId.x;
+  let row = workgroupId.x;
+  if (row >= params.outputSize) {
+    return;
+  }
+
+  let blockByteLength = select(36u, 20u, params.quantType == 4u);
+  let blockCount = params.inputSize / 32u;
+  var localSum = 0.0;
+  for (var block = lane; block < blockCount; block = block + 64u) {
+    let sourceOffset = row * params.rowByteLength + block * blockByteLength;
+    let scale = unpack2x16float(weightWords[sourceOffset / 4u]).x;
+    let inputOffset = params.inputBaseOffset + block * 32u;
+    if (params.quantType == 4u) {
+      for (var packedIndex = 0u; packedIndex < 16u; packedIndex = packedIndex + 1u) {
+        let packed = byteAt(sourceOffset + 4u + packedIndex);
+        localSum = localSum + f32(i32(packed & 0x0fu) - 8) * scale * input[inputOffset + packedIndex];
+        localSum = localSum + f32(i32((packed >> 4u) & 0x0fu) - 8) * scale * input[inputOffset + 16u + packedIndex];
+      }
+    } else {
+      for (var element = 0u; element < 32u; element = element + 1u) {
+        localSum = localSum + signedByte(byteAt(sourceOffset + 4u + element)) * scale * input[inputOffset + element];
+      }
+    }
+  }
+
+  partialSums[lane] = localSum;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      partialSums[lane] = partialSums[lane] + partialSums[lane + stride];
+    }
+    workgroupBarrier();
+  }
+  if (lane == 0u) {
+    var result = partialSums[0];
+    if (params.hasBias == 1u) {
+      result = result + bias[row];
+    }
+    output[params.outputBaseOffset + row] = result;
+  }
 }
 `;
 
@@ -1928,10 +2714,14 @@ struct Params {
 @group(0) @binding(1) var<storage, read> weight: array<f32>;
 @group(0) @binding(2) var<uniform> params: Params;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
+var<workgroup> partialSquares: array<f32, 128>;
 
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
-  let position = globalId.x;
+@compute @workgroup_size(128)
+fn main(
+  @builtin(local_invocation_id) localId: vec3<u32>,
+  @builtin(workgroup_id) workgroupId: vec3<u32>,
+) {
+  let position = workgroupId.x;
   let sequenceLength = u32(params.sequenceLength);
   let featureSize = u32(params.featureSize);
   if (position >= sequenceLength) {
@@ -1940,15 +2730,26 @@ fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
 
   let inputBase = u32(params.inputOffset) + position * featureSize;
   let outputBase = position * featureSize;
-  var meanSquare = 0.0;
-  for (var index = 0u; index < featureSize; index = index + 1u) {
+  let lane = localId.x;
+  var localSquare = 0.0;
+  for (var index = lane; index < featureSize; index = index + 128u) {
     let value = input[inputBase + index];
-    meanSquare = meanSquare + value * value;
+    localSquare = localSquare + value * value;
   }
-  meanSquare = meanSquare / f32(featureSize);
+  partialSquares[lane] = localSquare;
+  workgroupBarrier();
+
+  for (var stride = 64u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      partialSquares[lane] = partialSquares[lane] + partialSquares[lane + stride];
+    }
+    workgroupBarrier();
+  }
+
+  let meanSquare = partialSquares[0] / f32(featureSize);
   let scale = inverseSqrt(meanSquare + params.epsilon);
 
-  for (var index = 0u; index < featureSize; index = index + 1u) {
+  for (var index = lane; index < featureSize; index = index + 128u) {
     output[outputBase + index] = input[inputBase + index] * scale * weight[index];
   }
 }
@@ -1962,12 +2763,13 @@ struct Params {
   numberOfHeads: f32,
   headDimension: f32,
   basePosition: f32,
-  _padding0: f32,
+  valuesBaseOffset: f32,
   _padding1: f32,
 }
 
 @group(0) @binding(0) var<storage, read_write> values: array<f32>;
 @group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read> ropeTable: array<f32>;
 
 @compute @workgroup_size(128)
 fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
@@ -1987,13 +2789,13 @@ fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
   let headPairIndex = pairGlobalIndex % pairsPerPosition;
   let head = headPairIndex / halfDimension;
   let pairIndex = headPairIndex % halfDimension;
-  let base = position * hiddenSize + head * headDimension;
+  let base = u32(params.valuesBaseOffset) + position * hiddenSize + head * headDimension;
   let firstIndex = base + pairIndex;
   let secondIndex = base + halfDimension + pairIndex;
   let absolutePosition = params.basePosition + f32(position);
-  let angle = absolutePosition / pow(params.theta, (2.0 * f32(pairIndex)) / params.headDimension);
-  let cosine = cos(angle);
-  let sine = sin(angle);
+  let tableIndex = (u32(absolutePosition) * halfDimension + pairIndex) * 2u;
+  let cosine = ropeTable[tableIndex];
+  let sine = ropeTable[tableIndex + 1u];
   let firstValue = values[firstIndex];
   let secondValue = values[secondIndex];
   values[firstIndex] = firstValue * cosine - secondValue * sine;
@@ -2009,7 +2811,7 @@ struct Params {
   numberOfKeyValueHeads: u32,
   headDimension: u32,
   keyValueHiddenSize: u32,
-  _padding0: u32,
+  basePosition: u32,
   _padding1: u32,
 }
 
@@ -2018,77 +2820,87 @@ struct Params {
 @group(0) @binding(2) var<storage, read> v: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
-
-fn hiddenIndex(position: u32, head: u32, dimension: u32) -> u32 {
-  return position * params.hiddenSize + head * params.headDimension + dimension;
-}
+var<workgroup> dotProducts: array<f32, 64>;
+var<workgroup> softmaxState: array<f32, 4>;
 
 fn kvHiddenIndex(position: u32, keyValueHead: u32, dimension: u32) -> u32 {
   return position * params.keyValueHiddenSize + keyValueHead * params.headDimension + dimension;
 }
 
-@compute @workgroup_size(128)
-fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
-  let outputIndex = globalId.x;
-  let outputLength = params.sequenceLength * params.hiddenSize;
-  if (outputIndex >= outputLength) {
+@compute @workgroup_size(64)
+fn main(
+  @builtin(local_invocation_id) localId: vec3<u32>,
+  @builtin(workgroup_id) workgroupId: vec3<u32>,
+) {
+  let dimension = localId.x;
+  let queryPosition = workgroupId.x;
+  let head = workgroupId.y;
+  if (queryPosition >= params.sequenceLength || head >= params.numberOfHeads) {
     return;
   }
-
-  let queryPosition = outputIndex / params.hiddenSize;
-  let hiddenOffset = outputIndex % params.hiddenSize;
-  let head = hiddenOffset / params.headDimension;
-  let dimension = hiddenOffset % params.headDimension;
+  let absoluteQueryPosition = params.basePosition + queryPosition;
   let groupSize = params.numberOfHeads / params.numberOfKeyValueHeads;
   let keyValueHead = head / groupSize;
   let scale = inverseSqrt(f32(params.headDimension));
+  let queryIndex = queryPosition * params.hiddenSize + head * params.headDimension + dimension;
 
-  var maxScore = -3.4028234663852886e38;
-  for (var keyPosition = 0u; keyPosition <= queryPosition; keyPosition = keyPosition + 1u) {
-    var score = 0.0;
-    for (var scoreDimension = 0u; scoreDimension < params.headDimension; scoreDimension = scoreDimension + 1u) {
-      score = score +
-        q[hiddenIndex(queryPosition, head, scoreDimension)] *
-        k[kvHiddenIndex(keyPosition, keyValueHead, scoreDimension)];
+  var numerator = 0.0;
+  if (dimension == 0u) {
+    softmaxState[0] = -3.4028234663852886e38;
+    softmaxState[1] = 0.0;
+  }
+  workgroupBarrier();
+
+  for (var keyPosition = 0u; keyPosition <= absoluteQueryPosition; keyPosition = keyPosition + 1u) {
+    dotProducts[dimension] = q[queryIndex] * k[kvHiddenIndex(keyPosition, keyValueHead, dimension)];
+    workgroupBarrier();
+    for (var stride = 32u; stride > 0u; stride = stride / 2u) {
+      if (dimension < stride) {
+        dotProducts[dimension] = dotProducts[dimension] + dotProducts[dimension + stride];
+      }
+      workgroupBarrier();
     }
-    maxScore = max(maxScore, score * scale);
+
+    if (dimension == 0u) {
+      let score = dotProducts[0] * scale;
+      let nextMaximum = max(softmaxState[0], score);
+      let rescale = exp(softmaxState[0] - nextMaximum);
+      let weight = exp(score - nextMaximum);
+      softmaxState[0] = nextMaximum;
+      softmaxState[1] = softmaxState[1] * rescale + weight;
+      softmaxState[2] = rescale;
+      softmaxState[3] = weight;
+    }
+    workgroupBarrier();
+    numerator = numerator * softmaxState[2] +
+      softmaxState[3] * v[kvHiddenIndex(keyPosition, keyValueHead, dimension)];
+    workgroupBarrier();
   }
 
-  var sum = 0.0;
-  var weightedValue = 0.0;
-  for (var valuePosition = 0u; valuePosition <= queryPosition; valuePosition = valuePosition + 1u) {
-    var score = 0.0;
-    for (var scoreDimension = 0u; scoreDimension < params.headDimension; scoreDimension = scoreDimension + 1u) {
-      score = score +
-        q[hiddenIndex(queryPosition, head, scoreDimension)] *
-        k[kvHiddenIndex(valuePosition, keyValueHead, scoreDimension)];
-    }
-    let probabilityNumerator = exp(score * scale - maxScore);
-    sum = sum + probabilityNumerator;
-    weightedValue = weightedValue + probabilityNumerator * v[kvHiddenIndex(valuePosition, keyValueHead, dimension)];
-  }
-
-  output[outputIndex] = weightedValue / sum;
+  output[queryIndex] = numerator / softmaxState[1];
 }
 `;
 
 const qwen2CausalGqaAttentionDecodeShader = `
 struct Params {
   position: u32,
-  hiddenSize: u32,
   numberOfHeads: u32,
   numberOfKeyValueHeads: u32,
   headDimension: u32,
   keyValueHiddenSize: u32,
+  tileSize: u32,
+  tileCount: u32,
   _padding0: u32,
-  _padding1: u32,
 }
 
 @group(0) @binding(0) var<storage, read> q: array<f32>;
 @group(0) @binding(1) var<storage, read> k: array<f32>;
 @group(0) @binding(2) var<storage, read> v: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
-@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<storage, read_write> partialStats: array<f32>;
+@group(0) @binding(5) var<storage, read_write> partialValues: array<f32>;
+var<workgroup> dotProducts: array<f32, 64>;
+var<workgroup> softmaxState: array<f32, 4>;
 
 fn qHiddenIndex(head: u32, dimension: u32) -> u32 {
   return head * params.headDimension + dimension;
@@ -2098,45 +2910,137 @@ fn kvHiddenIndex(position: u32, keyValueHead: u32, dimension: u32) -> u32 {
   return position * params.keyValueHiddenSize + keyValueHead * params.headDimension + dimension;
 }
 
-@compute @workgroup_size(128)
-fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
-  let outputIndex = globalId.x;
-  if (outputIndex >= params.hiddenSize) {
-    return;
-  }
-
-  let head = outputIndex / params.headDimension;
-  let dimension = outputIndex % params.headDimension;
+@compute @workgroup_size(64)
+fn main(
+  @builtin(local_invocation_id) localId: vec3<u32>,
+  @builtin(workgroup_id) workgroupId: vec3<u32>,
+) {
+  let dimension = localId.x;
+  let tile = workgroupId.x;
+  let head = workgroupId.y;
   let groupSize = params.numberOfHeads / params.numberOfKeyValueHeads;
   let keyValueHead = head / groupSize;
   let scale = inverseSqrt(f32(params.headDimension));
-
-  var maxScore = -3.4028234663852886e38;
-  for (var keyPosition = 0u; keyPosition <= params.position; keyPosition = keyPosition + 1u) {
-    var score = 0.0;
-    for (var scoreDimension = 0u; scoreDimension < params.headDimension; scoreDimension = scoreDimension + 1u) {
-      score = score +
-        q[qHiddenIndex(head, scoreDimension)] *
-        k[kvHiddenIndex(keyPosition, keyValueHead, scoreDimension)];
-    }
-    maxScore = max(maxScore, score * scale);
-  }
-
-  var sum = 0.0;
+  let tileStart = tile * params.tileSize;
+  let tileEnd = min(tileStart + params.tileSize, params.position + 1u);
+  var maximum = -3.4028234663852886e38;
+  var denominator = 0.0;
   var weightedValue = 0.0;
-  for (var valuePosition = 0u; valuePosition <= params.position; valuePosition = valuePosition + 1u) {
-    var score = 0.0;
-    for (var scoreDimension = 0u; scoreDimension < params.headDimension; scoreDimension = scoreDimension + 1u) {
-      score = score +
-        q[qHiddenIndex(head, scoreDimension)] *
-        k[kvHiddenIndex(valuePosition, keyValueHead, scoreDimension)];
+
+  for (var keyPosition = tileStart; keyPosition < tileEnd; keyPosition = keyPosition + 1u) {
+    dotProducts[dimension] =
+      q[qHiddenIndex(head, dimension)] *
+      k[kvHiddenIndex(keyPosition, keyValueHead, dimension)];
+    workgroupBarrier();
+    for (var stride = 32u; stride > 0u; stride = stride / 2u) {
+      if (dimension < stride) {
+        dotProducts[dimension] = dotProducts[dimension] + dotProducts[dimension + stride];
+      }
+      workgroupBarrier();
     }
-    let probabilityNumerator = exp(score * scale - maxScore);
-    sum = sum + probabilityNumerator;
-    weightedValue = weightedValue + probabilityNumerator * v[kvHiddenIndex(valuePosition, keyValueHead, dimension)];
+    if (dimension == 0u) {
+      let score = dotProducts[0] * scale;
+      let nextMaximum = max(maximum, score);
+      let previousScale = exp(maximum - nextMaximum);
+      let valueScale = exp(score - nextMaximum);
+      maximum = nextMaximum;
+      denominator = denominator * previousScale + valueScale;
+      softmaxState[0] = maximum;
+      softmaxState[1] = denominator;
+      softmaxState[2] = previousScale;
+      softmaxState[3] = valueScale;
+    }
+    workgroupBarrier();
+    maximum = softmaxState[0];
+    denominator = softmaxState[1];
+    weightedValue =
+      weightedValue * softmaxState[2] +
+      softmaxState[3] * v[kvHiddenIndex(keyPosition, keyValueHead, dimension)];
+    workgroupBarrier();
   }
 
-  output[outputIndex] = weightedValue / sum;
+  let partialIndex = head * params.tileCount + tile;
+  if (dimension == 0u) {
+    partialStats[partialIndex * 2u] = maximum;
+    partialStats[partialIndex * 2u + 1u] = denominator;
+  }
+  partialValues[partialIndex * params.headDimension + dimension] = weightedValue;
+}
+`;
+
+const qwen2CausalGqaAttentionDecodeMergeShader = `
+struct Params {
+  position: u32,
+  numberOfHeads: u32,
+  numberOfKeyValueHeads: u32,
+  headDimension: u32,
+  keyValueHiddenSize: u32,
+  tileSize: u32,
+  tileCount: u32,
+  _padding0: u32,
+}
+
+@group(0) @binding(0) var<storage, read> partialStats: array<f32>;
+@group(0) @binding(1) var<storage, read> partialValues: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+var<workgroup> mergedState: array<f32, 2>;
+
+@compute @workgroup_size(64)
+fn main(
+  @builtin(local_invocation_id) localId: vec3<u32>,
+  @builtin(workgroup_id) workgroupId: vec3<u32>,
+) {
+  let dimension = localId.x;
+  let head = workgroupId.x;
+  if (dimension == 0u) {
+    var maximum = -3.4028234663852886e38;
+    for (var tile = 0u; tile < params.tileCount; tile = tile + 1u) {
+      maximum = max(maximum, partialStats[(head * params.tileCount + tile) * 2u]);
+    }
+    var denominator = 0.0;
+    for (var tile = 0u; tile < params.tileCount; tile = tile + 1u) {
+      let partialIndex = head * params.tileCount + tile;
+      denominator = denominator +
+        partialStats[partialIndex * 2u + 1u] *
+        exp(partialStats[partialIndex * 2u] - maximum);
+    }
+    mergedState[0] = maximum;
+    mergedState[1] = denominator;
+  }
+  workgroupBarrier();
+
+  var numerator = 0.0;
+  for (var tile = 0u; tile < params.tileCount; tile = tile + 1u) {
+    let partialIndex = head * params.tileCount + tile;
+    numerator = numerator +
+      partialValues[partialIndex * params.headDimension + dimension] *
+      exp(partialStats[partialIndex * 2u] - mergedState[0]);
+  }
+  output[head * params.headDimension + dimension] = numerator / mergedState[1];
+}
+`;
+
+const qwen2F32ToF16Shader = `
+enable f16;
+
+struct Params {
+  length: u32,
+  inputOffset: u32,
+  outputOffset: u32,
+  _padding0: u32,
+}
+
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read_write> output: array<f16>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
+  let index = globalId.x;
+  if (index < params.length) {
+    output[params.outputOffset + index] = f16(input[params.inputOffset + index]);
+  }
 }
 `;
 
@@ -2149,30 +3053,7 @@ struct Params {
 }
 
 @group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<uniform> params: Params;
-@group(0) @binding(2) var<storage, read_write> output: array<f32>;
-
-@compute @workgroup_size(128)
-fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
-  let index = globalId.x;
-  if (index >= params.length) {
-    return;
-  }
-  let value = input[index];
-  output[index] = value / (1.0 + exp(-value));
-}
-`;
-
-const qwen2ElementwiseMultiplyShader = `
-struct Params {
-  length: u32,
-  _padding0: u32,
-  _padding1: u32,
-  _padding2: u32,
-}
-
-@group(0) @binding(0) var<storage, read> left: array<f32>;
-@group(0) @binding(1) var<storage, read> right: array<f32>;
+@group(0) @binding(1) var<storage, read> multiplier: array<f32>;
 @group(0) @binding(2) var<uniform> params: Params;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 
@@ -2182,7 +3063,8 @@ fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
   if (index >= params.length) {
     return;
   }
-  output[index] = left[index] * right[index];
+  let value = input[index];
+  output[index] = (value / (1.0 + exp(-value))) * multiplier[index];
 }
 `;
 
@@ -2208,3 +3090,16 @@ fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
   output[index] = left[index] + right[index];
 }
 `;
+
+const qwen2CausalGqaAttentionF16Shader = withF16KvStorage(qwen2CausalGqaAttentionShader);
+const qwen2CausalGqaAttentionDecodeF16Shader = withF16KvStorage(
+  qwen2CausalGqaAttentionDecodeShader,
+);
+
+function withF16KvStorage(shader: string): string {
+  return `enable f16;\n${shader}`
+    .replace("var<storage, read> k: array<f32>;", "var<storage, read> k: array<f16>;")
+    .replace("var<storage, read> v: array<f32>;", "var<storage, read> v: array<f16>;")
+    .replace(/k\[kvHiddenIndex\(([^\n]+)\)\]/g, "f32(k[kvHiddenIndex($1)])")
+    .replace(/v\[kvHiddenIndex\(([^\n]+)\)\]/g, "f32(v[kvHiddenIndex($1)])");
+}

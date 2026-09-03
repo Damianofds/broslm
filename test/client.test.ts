@@ -15,10 +15,12 @@ describe("broSLM browser client", () => {
     const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const tokenIds = [3, 9];
     const dependencies = testDependencies();
-    dependencies.nextToken = vi.fn(async () => ({
+    const nextToken = async () => ({
       tokenId: tokenIds.shift() ?? 9,
       logits: new Float32Array([0]),
-    }));
+    });
+    dependencies.prefill = vi.fn(nextToken);
+    dependencies.decodeToken = vi.fn(nextToken);
     const client = createBroslmClient(testEnvironment(), { logLevel: "info" }, dependencies);
 
     const summary = await client.loadModel("qwen");
@@ -38,12 +40,20 @@ describe("broSLM browser client", () => {
       finishReason: "eos",
     });
     expect(dependencies.createWebGpuRuntime).toHaveBeenCalledOnce();
-    expect(dependencies.nextToken).toHaveBeenCalledWith(
+    expect(dependencies.prefill).toHaveBeenCalledWith(
       expect.anything(),
       expect.any(Array),
       expect.anything(),
       expect.objectContaining({ backend: "webgpu" }),
       expect.anything(),
+      expect.objectContaining({ temperature: 0, topK: 1 }),
+    );
+    expect(dependencies.decodeToken).toHaveBeenCalledOnce();
+    expect(dependencies.decodeToken).toHaveBeenCalledWith(
+      expect.anything(),
+      3,
+      expect.anything(),
+      expect.objectContaining({ backend: "webgpu" }),
       expect.objectContaining({ temperature: 0, topK: 1 }),
     );
 
@@ -169,6 +179,10 @@ function testDependencies(
       eosTokenId: 9,
       encode,
       decode: () => "hello",
+      createIncrementalDecoder: () => ({
+        push: () => "hello",
+        finish: () => "",
+      }),
     })),
     allocateCache: vi.fn((config, maximumSequenceLength = config.maximumSequenceLength) => ({
       layers: Array.from({ length: config.numberOfLayers }, () => ({ length: 0 })),
@@ -176,11 +190,8 @@ function testDependencies(
       maximumSequenceLength,
       keyValueHiddenSize: config.keyValueHiddenSize,
     })),
-    resetCache: vi.fn((cache) => {
-      cache.inputIds.length = 0;
-      for (const layer of cache.layers) layer.length = 0;
-    }),
-    nextToken: vi.fn(async () => ({ tokenId: 9, logits: new Float32Array([0]) })),
+    prefill: vi.fn(async () => ({ tokenId: 9, logits: new Float32Array([0]) })),
+    decodeToken: vi.fn(async () => ({ tokenId: 9, logits: new Float32Array([0]) })),
     detectWebGpuSupport: vi.fn(async () => ({
       supported: true,
       apiAvailable: true,
