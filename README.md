@@ -32,6 +32,7 @@ if (!support.supported) {
 }
 
 await broslm.loadModel("qwen");
+await broslm.preloadModel();
 
 for await (const update of broslm.stream("Explain grouped-query attention.", {
   maxTokens: 120,
@@ -43,6 +44,11 @@ for await (const update of broslm.stream("Explain grouped-query attention.", {
 
 broslm.dispose();
 ```
+
+`loadModel` downloads and parses the model and creates the WebGPU runtime. `preloadModel`
+optionally uploads the weights, allocates resident GPU resources, and compiles inference pipelines
+before the first prompt. It is idempotent and returns the loaded model summary on every call. If it
+is omitted, the first `generate` or `stream` call performs GPU initialization lazily as before.
 
 Use `generate` instead of `stream` when only the completed result is needed. Stream chunks expose text deltas through both `delta` and `text`; consumers should append them. Loading and generation accept an `AbortSignal`.
 

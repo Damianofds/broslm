@@ -58,6 +58,10 @@ const bufferAllocations = new WeakMap<
   GPUBuffer,
   { runtime: WebGpuRuntime; byteLength: number; destroyed: boolean }
 >();
+const pendingComputePipelines = new WeakMap<
+  WebGpuRuntime,
+  Map<string, Promise<GPUComputePipeline>>
+>();
 
 export function isWebGpuApiAvailable(target: WebGpuNavigator | undefined = globalNavigator()): boolean {
   return Boolean(target && "gpu" in target && target.gpu);
@@ -354,6 +358,53 @@ export function encodeComputeShader(
   pass.end();
 }
 
+export async function preloadComputeShader(
+  runtime: WebGpuRuntime,
+  shaderCode: string,
+  constants?: Record<string, number>,
+): Promise<void> {
+  ensureWebGpuRuntimeInstrumentation(runtime);
+  const cacheKey = computePipelineCacheKey(shaderCode, constants);
+  if (runtime.computePipelineCache.has(cacheKey)) {
+    return;
+  }
+
+  let pendingByKey = pendingComputePipelines.get(runtime);
+  if (!pendingByKey) {
+    pendingByKey = new Map();
+    pendingComputePipelines.set(runtime, pendingByKey);
+  }
+  const existing = pendingByKey.get(cacheKey);
+  if (existing) {
+    await existing;
+    return;
+  }
+
+  const module = runtime.device.createShaderModule({ code: shaderCode });
+  const descriptor: GPUComputePipelineDescriptor = {
+    layout: "auto",
+    compute: {
+      module,
+      entryPoint: "main",
+      constants,
+    },
+  };
+  const pending = typeof runtime.device.createComputePipelineAsync === "function"
+    ? runtime.device.createComputePipelineAsync(descriptor)
+    : Promise.resolve(runtime.device.createComputePipeline(descriptor));
+  pendingByKey.set(cacheKey, pending);
+  try {
+    const pipeline = await pending;
+    if (!runtime.computePipelineCache.has(cacheKey)) {
+      runtime.computePipelineCache.set(cacheKey, pipeline);
+    }
+  } finally {
+    if (pendingByKey.get(cacheKey) === pending) {
+      pendingByKey.delete(cacheKey);
+    }
+  }
+}
+
 function validateComputeDispatchDimensions(
   device: GPUDevice,
   workgroups: readonly [number, number?, number?],
@@ -531,6 +582,8 @@ function destroyTrackedBuffer(buffer: GPUBuffer): void {
 }
 
 function ensureWebGpuRuntimeInstrumentation(runtime: WebGpuRuntime): void {
+  runtime.staticBufferCache ??= new WeakMap();
+  runtime.computePipelineCache ??= new Map();
   runtime.bindGroupCache ??= new Map();
   runtime.resourceIds ??= new WeakMap();
   runtime.nextResourceId ??= 1;

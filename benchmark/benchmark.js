@@ -34,6 +34,13 @@ async function runBenchmark() {
     const support = await client.checkModelSupport("qwen");
     if (!support.supported) throw new Error(support.reason ?? "Qwen model is unsupported.");
     await client.loadModel("qwen");
+    const preloadStartedAt = performance.now();
+    await client.preloadModel();
+    write({
+      kind: "preload",
+      elapsedMs: performance.now() - preloadStartedAt,
+      runtime: client.diagnostics.runtime,
+    });
 
     for (const targetLength of cachedLengths) {
       const prompt = promptNearTokenCount(client, targetLength);

@@ -15,6 +15,7 @@ import {
   clearWebGpuBindGroupCache,
   destroyBuffers,
   encodeComputeShader,
+  preloadComputeShader,
   readMappedGpuBuffer,
   submitWebGpuCommands,
   type WebGpuRuntime,
@@ -640,6 +641,107 @@ export async function qwen2DecodeTokenLogitsResidentGpu(
   gpuCache.inputIds.push(tokenId);
   destroyBuffers(...context.temps);
   return result;
+}
+
+export async function preloadQwen2ModelGpu(
+  model: LoadedQwen2Model,
+  cache: Qwen2ModelKvCache,
+  runtime: WebGpuRuntime,
+  signal?: AbortSignal,
+): Promise<void> {
+  throwIfPreloadAborted(signal);
+  getOrCreateResidentQwen2GpuCache(model, cache, runtime);
+
+  for (const tensor of model.tensors.values()) {
+    throwIfPreloadAborted(signal);
+    qwenTensorBuffer(runtime, tensor);
+  }
+  for (const layer of model.weights.layers) {
+    throwIfPreloadAborted(signal);
+    qkvBiasBuffer(runtime, {
+      qBias: layer.attention.qProjBias,
+      kBias: layer.attention.kProjBias,
+      vBias: layer.attention.vProjBias,
+      qOutputSize: model.config.hiddenSize,
+      keyValueOutputSize: model.config.keyValueHiddenSize,
+    });
+  }
+
+  await Promise.all(
+    qwen2PreloadShaders(model, runtime).map((shader) => preloadComputeShader(runtime, shader)),
+  );
+  throwIfPreloadAborted(signal);
+  await runtime.device.queue.onSubmittedWorkDone();
+  throwIfPreloadAborted(signal);
+}
+
+function qwen2PreloadShaders(
+  model: LoadedQwen2Model,
+  runtime: WebGpuRuntime,
+): string[] {
+  const shaders = new Set<string>([
+    qwen2ArgmaxShader,
+    qwen2TopKLocalShader,
+    qwen2TopKMergeShader,
+    isFloat32TensorView(model.weights.tokenEmbedding)
+      ? qwen2F32EmbeddingSequenceShader
+      : qwen2QuantizedEmbeddingSequenceShader,
+    qwen2RmsNormSequenceShader,
+    qwen2RoPESequenceShader,
+    runtime.shaderF16
+      ? qwen2CausalGqaAttentionF16Shader
+      : qwen2CausalGqaAttentionShader,
+    runtime.shaderF16
+      ? qwen2CausalGqaAttentionDecodeF16Shader
+      : qwen2CausalGqaAttentionDecodeShader,
+    qwen2CausalGqaAttentionDecodeMergeShader,
+    qwen2SiluShader,
+    qwen2ResidualAddShader,
+  ]);
+  if (runtime.shaderF16) {
+    shaders.add(qwen2F32ToF16Shader);
+  }
+
+  const matrixWeights: QwenTensorView[] = [model.weights.lmHead];
+  for (const layer of model.weights.layers) {
+    matrixWeights.push(
+      layer.attention.outProjWeight,
+      layer.mlp.gateProjWeight,
+      layer.mlp.upProjWeight,
+      layer.mlp.downProjWeight,
+    );
+    const attention = layer.attention;
+    if (canFuseQwen2QkvProjection(
+      attention.qProjWeight,
+      attention.kProjWeight,
+      attention.vProjWeight,
+    )) {
+      shaders.add(
+        isFloat32TensorView(attention.qProjWeight)
+          ? qwen2F32QkvProjectionSequenceShader
+          : qwen2QuantizedQkvProjectionSequenceShader,
+      );
+    } else {
+      matrixWeights.push(
+        attention.qProjWeight,
+        attention.kProjWeight,
+        attention.vProjWeight,
+      );
+    }
+  }
+  if (matrixWeights.some(isFloat32TensorView)) {
+    shaders.add(qwen2F32MatrixMultiplySequenceShader);
+  }
+  if (matrixWeights.some((weight) => !isFloat32TensorView(weight))) {
+    shaders.add(qwen2QuantizedMatrixMultiplySequenceShader);
+  }
+  return [...shaders];
+}
+
+function throwIfPreloadAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw signal.reason ?? new Error("Qwen2 GPU preload was cancelled.");
+  }
 }
 
 export function hasQwen2ResidentGpuCache(
@@ -1347,7 +1449,7 @@ function encodeQwen2QkvProjectionSequence(
     return false;
   }
 
-  const qkvBias = qkvBiasBuffer(context, runtime, {
+  const qkvBias = qkvBiasBuffer(runtime, {
     qBias: options.qBias,
     kBias: options.kBias,
     vBias: options.vBias,
@@ -1810,7 +1912,6 @@ function canFuseQwen2QkvProjection(
 }
 
 function qkvBiasBuffer(
-  _context: ResidentQwen2GpuContext,
   runtime: WebGpuRuntime,
   options: {
     qBias?: TensorView | Float32Array;

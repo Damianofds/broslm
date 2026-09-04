@@ -17,6 +17,7 @@ import {
   qwen2WebGpuPrefillSafetyError,
   qwen2WebGpuSafetyLimits,
 } from "./qwen2/webgpuSafety";
+import { preloadQwen2ModelGpu } from "./qwen2/gpuModel";
 import {
   createWebGpuRuntime,
   destroyWebGpuRuntime,
@@ -50,6 +51,7 @@ export interface Broslm {
   readonly diagnostics: BroslmDiagnostics;
   checkModelSupport(modelId: ModelId): Promise<ModelSupport>;
   loadModel(modelId: ModelId, options?: LoadModelOptions): Promise<LoadedModelSummary>;
+  preloadModel(): Promise<LoadedModelSummary>;
   countPromptTokens(prompt: string): number;
   countPromptTokens(messages: readonly ChatMessage[]): number;
   generate(prompt: string, options?: GenerationOptions): Promise<GenerationResult>;
@@ -63,6 +65,7 @@ export interface BroslmClientDependencies {
   loadQwen2Model: typeof loadQwen2Model;
   createTokenizer: typeof createQwen2TokenizerFromGgufMetadata;
   allocateCache: typeof allocateQwen2ModelKvCache;
+  preloadModelGpu: typeof preloadQwen2ModelGpu;
   prefill: typeof qwen2PrefillNextTokenGpu;
   decodeToken: typeof qwen2DecodeNextTokenGpu;
   detectWebGpuSupport: typeof detectWebGpuSupport;
@@ -74,6 +77,7 @@ const defaultDependencies: BroslmClientDependencies = {
   loadQwen2Model,
   createTokenizer: createQwen2TokenizerFromGgufMetadata,
   allocateCache: allocateQwen2ModelKvCache,
+  preloadModelGpu: preloadQwen2ModelGpu,
   prefill: qwen2PrefillNextTokenGpu,
   decodeToken: qwen2DecodeNextTokenGpu,
   detectWebGpuSupport,
@@ -97,6 +101,8 @@ class DefaultBroslmClient implements Broslm {
   private tokenizer: ByteLevelBpeTokenizer | null = null;
   private cache: Qwen2ModelKvCache | null = null;
   private runtime: WebGpuRuntime | undefined;
+  private gpuPreloadPromise: Promise<LoadedModelSummary> | null = null;
+  private gpuPreloaded = false;
   private readonly logger: BroslmLogger;
   private activeAbortController: AbortController | null = null;
   private lastGenerationResult: GenerationResult | null = null;
@@ -167,7 +173,11 @@ class DefaultBroslmClient implements Broslm {
     options: LoadModelOptions = {},
   ): Promise<LoadedModelSummary> {
     this.ensureNotDisposed();
-    if (this.currentState === "loading" || this.currentState === "generating") {
+    if (
+      this.currentState === "loading" ||
+      this.currentState === "preloading" ||
+      this.currentState === "generating"
+    ) {
       throw new BroslmError("INVALID_STATE", `Cannot load a model while broSLM is ${this.currentState}.`);
     }
 
@@ -244,6 +254,43 @@ class DefaultBroslmClient implements Broslm {
         this.activeAbortController = null;
       }
     }
+  }
+
+  async preloadModel(): Promise<LoadedModelSummary> {
+    this.ensureNotDisposed();
+    if (this.gpuPreloadPromise) {
+      return this.gpuPreloadPromise;
+    }
+    this.ensureReady();
+
+    const model = this.model;
+    const modelId = this.modelId;
+    const cache = this.cache;
+    const runtime = this.runtime;
+    const summary = this.summary;
+    if (!model || !modelId || !cache || !runtime || !summary) {
+      throw new BroslmError("INVALID_STATE", "A model must be loaded before GPU preloading.");
+    }
+    if (this.gpuPreloaded) {
+      return summary;
+    }
+
+    const operationId = createOperationId("preload");
+    const controller = new AbortController();
+    this.activeAbortController = controller;
+    this.currentState = "preloading";
+    this.emit({ type: "model-preload-started", modelId, operationId });
+    const promise = this.runGpuPreload(
+      model,
+      modelId,
+      cache,
+      runtime,
+      summary,
+      controller,
+      operationId,
+    );
+    this.gpuPreloadPromise = promise;
+    return promise;
   }
 
   countPromptTokens(input: PromptInput): number {
@@ -360,6 +407,9 @@ class DefaultBroslmClient implements Broslm {
               runtime,
               samplingOptions,
             );
+        if (tokenIndex === 0) {
+          this.gpuPreloaded = true;
+        }
         throwIfAborted(controller.signal);
         const performance = createPerformance(phase, profiledTokenCount, nowMs() - tokenStartedAt);
         this.emit({
@@ -454,6 +504,47 @@ class DefaultBroslmClient implements Broslm {
     }
   }
 
+  private async runGpuPreload(
+    model: LoadedQwen2Model,
+    modelId: ModelId,
+    cache: Qwen2ModelKvCache,
+    runtime: WebGpuRuntime,
+    summary: LoadedModelSummary,
+    controller: AbortController,
+    operationId: string,
+  ): Promise<LoadedModelSummary> {
+    try {
+      await this.dependencies.preloadModelGpu(model, cache, runtime, controller.signal);
+      throwIfAborted(controller.signal);
+      this.gpuPreloaded = true;
+      this.emit({ type: "model-preloaded", modelId, operationId, summary });
+      return summary;
+    } catch (error: unknown) {
+      if (controller.signal.aborted) {
+        this.emit({ type: "operation-cancelled", modelId, operationId, operation: "preload" });
+        throw new BroslmError("ABORTED", "Model GPU preloading was cancelled.", { cause: error });
+      }
+      const wrapped = asBroslmError(error, "MODEL_PRELOAD_FAILED");
+      this.emit({
+        type: "operation-error",
+        modelId,
+        operationId,
+        operation: "preload",
+        code: wrapped.code,
+        message: wrapped.message,
+      });
+      throw wrapped;
+    } finally {
+      this.gpuPreloadPromise = null;
+      if ((this.currentState as BroslmState) !== "disposed") {
+        this.currentState = "ready";
+      }
+      if (this.activeAbortController === controller) {
+        this.activeAbortController = null;
+      }
+    }
+  }
+
   private ensureNotDisposed(): void {
     if (this.currentState === "disposed") {
       throw new BroslmError("DISPOSED", "broSLM has been disposed.");
@@ -469,6 +560,7 @@ class DefaultBroslmClient implements Broslm {
     this.cache = null;
     this.summary = null;
     this.lastGenerationResult = null;
+    this.gpuPreloaded = false;
   }
 
   private emitLoaderProgress(
@@ -623,7 +715,10 @@ function throwIfAborted(signal: AbortSignal): void {
   }
 }
 
-function asBroslmError(error: unknown, fallbackCode: "MODEL_LOAD_FAILED" | "GENERATION_FAILED") {
+function asBroslmError(
+  error: unknown,
+  fallbackCode: "MODEL_LOAD_FAILED" | "MODEL_PRELOAD_FAILED" | "GENERATION_FAILED",
+) {
   return error instanceof BroslmError
     ? error
     : new BroslmError(fallbackCode, errorMessage(error), { cause: error });

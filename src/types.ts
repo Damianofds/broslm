@@ -1,7 +1,14 @@
 import type { InferenceBackend, ModelId } from "./models";
 import type { WebGpuRuntimeDiagnostics } from "./runtime/webgpu";
 
-export type BroslmState = "idle" | "loading" | "ready" | "generating" | "error" | "disposed";
+export type BroslmState =
+  | "idle"
+  | "loading"
+  | "preloading"
+  | "ready"
+  | "generating"
+  | "error"
+  | "disposed";
 export type GenerationPhase = "prefill" | "decode";
 export type GenerationFinishReason = "eos" | "max_tokens";
 export type ChatRole = "system" | "user" | "assistant";

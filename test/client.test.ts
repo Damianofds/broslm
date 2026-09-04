@@ -40,6 +40,7 @@ describe("broSLM browser client", () => {
       finishReason: "eos",
     });
     expect(dependencies.createWebGpuRuntime).toHaveBeenCalledOnce();
+    expect(dependencies.preloadModelGpu).not.toHaveBeenCalled();
     expect(dependencies.prefill).toHaveBeenCalledWith(
       expect.anything(),
       expect.any(Array),
@@ -63,6 +64,79 @@ describe("broSLM browser client", () => {
     expect(messages).toContain("[broslm] model-ready");
     expect(messages).toContain("[broslm] generation-completed");
     expect(messages).not.toContain("[broslm] generation-progress");
+
+    await expect(client.preloadModel()).resolves.toBe(summary);
+    expect(dependencies.preloadModelGpu).not.toHaveBeenCalled();
+  });
+
+  it("preloads the GPU model once across concurrent and repeated calls", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const dependencies = testDependencies();
+    let finishPreload: (() => void) | undefined;
+    dependencies.preloadModelGpu = vi.fn(
+      () => new Promise<void>((resolve) => {
+        finishPreload = resolve;
+      }),
+    );
+    const client = createBroslmClient(
+      testEnvironment(),
+      { logLevel: "info" },
+      dependencies,
+    );
+    const summary = await client.loadModel("qwen");
+
+    const first = client.preloadModel();
+    const second = client.preloadModel();
+    expect(client.state).toBe("preloading");
+    expect(dependencies.preloadModelGpu).toHaveBeenCalledOnce();
+    finishPreload?.();
+
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    expect(firstResult).toBe(summary);
+    expect(secondResult).toBe(summary);
+    expect(client.state).toBe("ready");
+    await expect(client.preloadModel()).resolves.toBe(summary);
+    expect(dependencies.preloadModelGpu).toHaveBeenCalledOnce();
+
+    const messages = info.mock.calls.map(([message]) => message);
+    expect(messages.filter((message) => message === "[broslm] model-preload-started")).toHaveLength(1);
+    expect(messages.filter((message) => message === "[broslm] model-preloaded")).toHaveLength(1);
+  });
+
+  it("requires a loaded model and permits retry after preload failure", async () => {
+    const dependencies = testDependencies();
+    dependencies.preloadModelGpu = vi.fn()
+      .mockRejectedValueOnce(new Error("pipeline compilation failed"))
+      .mockResolvedValueOnce(undefined);
+    const client = createBroslmClient(testEnvironment(), {}, dependencies);
+
+    await expect(client.preloadModel()).rejects.toMatchObject({ code: "INVALID_STATE" });
+    const summary = await client.loadModel("qwen");
+    await expect(client.preloadModel()).rejects.toMatchObject({
+      code: "MODEL_PRELOAD_FAILED",
+      message: "pipeline compilation failed",
+    });
+    expect(client.state).toBe("ready");
+    await expect(client.preloadModel()).resolves.toBe(summary);
+    expect(dependencies.preloadModelGpu).toHaveBeenCalledTimes(2);
+  });
+
+  it("aborts an in-flight GPU preload when disposed", async () => {
+    const dependencies = testDependencies();
+    dependencies.preloadModelGpu = vi.fn(
+      (_model, _cache, _runtime, signal) => new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      }),
+    );
+    const client = createBroslmClient(testEnvironment(), {}, dependencies);
+    await client.loadModel("qwen");
+
+    const preload = client.preloadModel();
+    client.dispose();
+
+    await expect(preload).rejects.toMatchObject({ code: "ABORTED" });
+    expect(client.state).toBe("disposed");
+    expect(dependencies.destroyWebGpuRuntime).toHaveBeenCalled();
   });
 
   it("defaults to WARN and suppresses lifecycle logs", async () => {
@@ -190,6 +264,7 @@ function testDependencies(
       maximumSequenceLength,
       keyValueHiddenSize: config.keyValueHiddenSize,
     })),
+    preloadModelGpu: vi.fn(async () => undefined),
     prefill: vi.fn(async () => ({ tokenId: 9, logits: new Float32Array([0]) })),
     decodeToken: vi.fn(async () => ({ tokenId: 9, logits: new Float32Array([0]) })),
     detectWebGpuSupport: vi.fn(async () => ({

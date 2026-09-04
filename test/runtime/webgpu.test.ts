@@ -5,6 +5,7 @@ import {
   detectWebGpuSupport,
   encodeComputeShader,
   isWebGpuApiAvailable,
+  preloadComputeShader,
   runComputeShader,
 } from "../../src/runtime/webgpu";
 
@@ -223,6 +224,32 @@ describe("compute pipeline cache", () => {
     expect(createComputePipeline).toHaveBeenCalledOnce();
     expect(pass.dispatchWorkgroups).toHaveBeenCalledTimes(2);
     expect(pass.dispatchWorkgroups).toHaveBeenLastCalledWith(65_535, 2, 3);
+  });
+
+  it("coalesces asynchronous pipeline preloads and reuses the compiled pipeline", async () => {
+    const pipeline = {};
+    const createShaderModule = vi.fn().mockReturnValue({});
+    const createComputePipelineAsync = vi.fn().mockResolvedValue(pipeline);
+    const runtime = {
+      backend: "webgpu",
+      device: {
+        createShaderModule,
+        createComputePipelineAsync,
+      },
+      staticBufferCache: new WeakMap(),
+      computePipelineCache: new Map(),
+    } as unknown as Parameters<typeof preloadComputeShader>[0];
+    const shader = "@compute @workgroup_size(1) fn main() {}";
+
+    await Promise.all([
+      preloadComputeShader(runtime, shader),
+      preloadComputeShader(runtime, shader),
+    ]);
+    await preloadComputeShader(runtime, shader);
+
+    expect(createShaderModule).toHaveBeenCalledOnce();
+    expect(createComputePipelineAsync).toHaveBeenCalledOnce();
+    expect(runtime.computePipelineCache.get(shader)).toBe(pipeline);
   });
 });
 
